@@ -1,14 +1,15 @@
-"""The Starlette application factory (section 8, "Middleware and limits")."""
+"""The Starlette application factory."""
 
 from __future__ import annotations
 
+import logging
 from http.client import responses
 from typing import Final, cast
 
 from starlette.applications import Starlette
 from starlette.exceptions import HTTPException
 from starlette.middleware import Middleware
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from treadle.serialize import error_json
@@ -16,8 +17,8 @@ from treadle.web.api import api_routes
 from treadle.web.dashboard import _Pages, _sentence, dashboard_routes, make_templates
 from treadle.web.hooks import hook_routes
 
-# Design note: WebContext is defined in web.security (see the note there) and re-exported
-# here, so `from treadle.web.app import WebContext` works as section 4 shows.
+# WebContext is defined in web.security (see the comment there) and re-exported here, so
+# `from treadle.web.app import WebContext` works.
 from treadle.web.security import (
     AuthMiddleware,
     HostCheckMiddleware,
@@ -42,12 +43,15 @@ _ERROR_CODES: Final = {
     429: "rate_limited",
 }
 
+_log = logging.getLogger("treadle.web")
+
 
 def create_app(ctx: WebContext) -> Starlette:
     """Build the Starlette application.
 
-    It has every route, the middleware in section 8's order, and
-    `max_body_size=limits.api_body_bytes`. It never runs lifespan handlers.
+    It has every route and `max_body_size=limits.api_body_bytes`, and its middleware runs in
+    this order: the request log, the security headers, the Host check, the origin guard, and
+    authentication. It never runs lifespan handlers.
     """
     templates = make_templates()
     pages = _Pages(ctx, templates)
@@ -76,15 +80,29 @@ def create_app(ctx: WebContext) -> Starlette:
             clock=ctx.clock,
         ),
     ]
-    # Design note: when a declared Content-Length passes the active limit, Starlette answers
-    # with its own plain-text 413 from outside this middleware, so that response alone has
-    # no security headers. A body that grows too large while streaming gets the JSON 413.
+    # When a declared Content-Length passes the active limit, Starlette answers with its own
+    # plain-text 413 from outside this middleware, so that response alone has no security
+    # headers. A body that grows too large while streaming gets the JSON 413.
     return Starlette(
         routes=[*api_routes(ctx), *hook_routes(ctx), *dashboard_routes(ctx, templates)],
         middleware=middleware,
-        exception_handlers={HTTPException: http_error, Exception: _internal_error},
+        exception_handlers={
+            HTTPException: http_error,
+            ClientDisconnect: _client_disconnected,
+            Exception: _internal_error,
+        },
         max_body_size=ctx.settings.limits.api_body_bytes,
     )
+
+
+async def _client_disconnected(request: Request, exc: Exception) -> Response:
+    """End a request whose client went away while sending the body, with a bare 400.
+
+    Nobody receives the answer, but the request log records it, and the server never sees
+    the error, so a dropped connection doesn't log a traceback.
+    """
+    _log.debug("the client disconnected before sending the whole body")
+    return Response(status_code=400)
 
 
 async def _internal_error(request: Request, exc: Exception) -> Response:

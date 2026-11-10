@@ -1,6 +1,7 @@
 """The workflow registry: loads every workflow and hot-reloads changes.
 
-Section 6 ("Hot reload") defines how valid, invalid, and deleted files apply.
+A valid file replaces its workflow's current version, an invalid one keeps the last good
+version, and a deleted one removes the workflow.
 """
 
 from __future__ import annotations
@@ -16,7 +17,16 @@ from typing import Final
 
 from treadle.clock import BlockingRunner, Clock, thread_runner
 from treadle.config import Settings
-from treadle.fswatch import Change, Debouncer, RootUnavailable, Snapshot, TooManyEntries, diff, scan
+from treadle.fswatch import (
+    Change,
+    Debouncer,
+    FileState,
+    RootUnavailable,
+    Snapshot,
+    TooManyEntries,
+    diff,
+    scan,
+)
 from treadle.globs import GlobMatcher
 from treadle.models import RegistryChange, WatchEvent, Workflow, WorkflowEntry
 from treadle.protocols import TriggerSink
@@ -30,9 +40,9 @@ from treadle.yamlio import load_yaml
 _DEBOUNCE: Final = 0.5
 _MAX_WAIT: Final = 60.0
 _MAX_ISSUES: Final = 50
-# Section 2's workflow files: `*.yml` and `*.yaml`, except names that start with "." or "_".
-# Design note: section 6 polls the directory with `fswatch.scan`, which never follows
-# symlinks, so a symlinked workflow file is ignored at startup and on reload alike.
+# Workflow files are `*.yml` and `*.yaml`, except names that start with "." or "_". The
+# directory is polled with `fswatch.scan`, which never follows symlinks, so a symlinked
+# workflow file is ignored at startup and on reload alike.
 _FILES: Final = GlobMatcher(("*.yml", "*.yaml"), (".*", "_*"))
 
 _log = logging.getLogger(__name__)
@@ -42,7 +52,8 @@ class WorkflowRegistry:
     """The current version of every workflow file; implements WorkflowSource.
 
     An invalid edit keeps the last good version (and marks it stale), and a deleted file is
-    removed and reported to `on_removed`. Changes go to every sink synchronously.
+    removed and reported to `on_removed`. Changes go to every sink synchronously. A change
+    that fails to apply, because loading the file or a sink raised, is applied again later.
     """
 
     def __init__(
@@ -67,6 +78,7 @@ class WorkflowRegistry:
         self._blocking = blocking
         self._entries: dict[str, WorkflowEntry] = {}
         self._results: dict[Path, LoadResult] = {}  # the newest load of each file
+        self._failed: dict[str, FileState | None] = {}  # the file state each failed change saw
         self._snapshot: Snapshot = {}
         self._debouncer = Debouncer(_DEBOUNCE, _MAX_WAIT)
         self._reload = asyncio.Event()
@@ -87,9 +99,9 @@ class WorkflowRegistry:
             self._snapshot = {} if snapshot is None else snapshot
             loaded = [await self._load(Path(path)) for path in sorted(self._snapshot)]
             results = [result for result in loaded if result is not None]
-            # Design note: the first file in path order defines a workflow ID, and `_refresh`
-            # logs each duplicate instead of storing E058 on the entry, so a duplicate takes
-            # over cleanly when the first file goes. Only those files go to `cross_check`.
+            # The first file in path order defines a workflow ID, and `_refresh` logs each
+            # duplicate instead of storing E058 on the entry, so a duplicate takes over
+            # cleanly when the first file goes. Only those files go to `cross_check`.
             primaries: dict[str, LoadResult] = {}
             for result in results:
                 primaries.setdefault(_workflow_id(result.path), result)
@@ -111,8 +123,8 @@ class WorkflowRegistry:
     async def run(self, *, interval: float = 1.0) -> None:
         """Poll every `interval` seconds, or at once after `request_reload`, until cancelled.
 
-        Changed files apply after 0.5 seconds without further changes. A failed poll is
-        logged, and polling goes on.
+        Changed files apply after 0.5 seconds without further changes. A failed poll, such
+        as a scan that raised, is logged, and the next poll scans again.
         """
         while True:
             try:
@@ -143,18 +155,28 @@ class WorkflowRegistry:
         """Return every entry, sorted by workflow ID."""
         return [self._entries[workflow_id] for workflow_id in sorted(self._entries)]
 
-    async def version(self, digest: str) -> Workflow | None:
-        """Return a stored workflow version, parsed again, or None when it no longer loads."""
-        # Design note: a digest that a current version has is that version's exact bytes, so
-        # it's returned without parsing the stored source again.
+    async def version(self, digest: str, *, workflow_id: str | None = None) -> Workflow | None:
+        """Return a stored workflow version, parsed again, or None when it no longer loads.
+
+        Files with identical bytes share a digest, so `workflow_id`, when given, picks that
+        workflow's version: a stored source is then parsed as that workflow's file.
+        """
+        # A digest that a current version has is that version's exact bytes, so it's
+        # returned without parsing the stored source again.
         for entry in self._entries.values():
-            if entry.current is not None and entry.current.digest == digest:
-                return entry.current
+            current = entry.current
+            if current is None or current.digest != digest:
+                continue
+            if workflow_id is None or current.id == workflow_id:
+                return current
         stored = await self._store.read(lambda repo: repo.workflow_version(digest))
         if stored is None:
             return None
         loader = self._loader(environment_checks=False)
         path = self._settings.project_dir / stored.path
+        if workflow_id is not None:
+            # The stored path is that of the workflow that stored the digest first.
+            path = path.with_stem(workflow_id)
         result = await self._blocking(loader.load_text, stored.source, path)
         return result.workflow if result.ok else None
 
@@ -179,21 +201,76 @@ class WorkflowRegistry:
         """Reload changed files one at a time: deletions first, then the rest in path order.
 
         Each valid file's webhook names are checked against the current versions of every
-        other workflow, including those that earlier files in the batch changed.
+        other workflow, including those that earlier files in the batch changed. When the
+        batch changes a current version, the files that a webhook name conflict (E305) held
+        back load again, because the name may be free now.
         """
         emitted: list[RegistryChange] = []
         for change in sorted(changes, key=lambda c: (c.event is not WatchEvent.DELETED, c.path)):
-            path = Path(change.path)
+            emitted.extend(await self._apply_change(change))
+        if emitted:
+            emitted.extend(await self._reclaim_hooks())
+        return emitted
+
+    async def _apply_change(self, change: Change) -> list[RegistryChange]:
+        """Reload one file and refresh its workflow. A failure is logged and retried."""
+        path = Path(change.path)
+        try:
             result = None if change.event is WatchEvent.DELETED else await self._load(path)
             if result is None:
                 self._results.pop(path, None)
             else:
                 self._results[path] = self._claim_hooks(result)
-            emitted.extend(await self._refresh(_workflow_id(path)))
+            emitted = await self._refresh(_workflow_id(path))
+        except Exception as exc:
+            self._retry(change, exc)
+            return []
+        self._failed.pop(change.path, None)
         return emitted
 
+    async def _reclaim_hooks(self) -> list[RegistryChange]:
+        """Load the files that E305 holds back again, in path order, until none changes.
+
+        Path order means that a freed name goes to the first file in path order that wants
+        it. A file that loads can free other names in turn, so the rounds repeat while one
+        changes a current version; each such round frees at least one file, so they end.
+        """
+        emitted: list[RegistryChange] = []
+        while True:
+            held = [path for path, result in sorted(self._results.items()) if _held(result)]
+            loaded: list[RegistryChange] = []
+            for path in held:
+                loaded.extend(await self._apply_change(self._reload_of(path)))
+            if not loaded:
+                return emitted
+            emitted.extend(loaded)
+
+    def _retry(self, change: Change, exc: Exception) -> None:
+        """Log a change that failed to apply, and queue it again once per state of its file.
+
+        A file that fails again in the same state waits for its next change, so a loader bug
+        logs one traceback per edit instead of one every second.
+        """
+        display = self._display(Path(change.path))
+        state = self._snapshot.get(change.path)
+        if change.path in self._failed and self._failed[change.path] == state:
+            _log.error("%s: reloading failed again; waiting for the file to change", display)
+            return
+        _log.error("%s: reloading failed; trying again", display, exc_info=exc)
+        self._failed[change.path] = state
+        self._debouncer.add([change], _loop_time())
+
+    def _reload_of(self, path: Path) -> Change:
+        """Return a change that makes `_apply_change` load `path` again."""
+        root = self._settings.workflows_dir
+        return Change(WatchEvent.MODIFIED, str(path), str(root), path.name)
+
     async def _refresh(self, workflow_id: str) -> list[RegistryChange]:
-        """Rebuild one workflow's entry from its newest file, and emit the change it makes."""
+        """Rebuild one workflow's entry from its newest file, and emit the change it makes.
+
+        The sinks get the change before the entry does, so when a sink raises, the entry
+        keeps its old version, and applying the file again sends the change again.
+        """
         old = self._entries.get(workflow_id)
         old_current = None if old is None else old.current
         paths = sorted(path for path in self._results if _workflow_id(path) == workflow_id)
@@ -209,6 +286,10 @@ class WorkflowRegistry:
             )
         current = primary.workflow if primary.ok else old_current
         stale = not primary.ok and current is not None
+        self._log_issues(primary, stale=stale)
+        changes = []
+        if not _same_version(old_current, current):
+            changes.append(self._emit(RegistryChange(workflow_id, old_current, current)))
         self._entries[workflow_id] = WorkflowEntry(
             workflow_id=workflow_id,
             path=primary.path,
@@ -218,21 +299,21 @@ class WorkflowRegistry:
             stale=stale,
             loaded_at=self._clock.now(),
         )
-        self._log_issues(primary, stale=stale)
-        if _same_version(old_current, current):
-            return []
-        return [self._emit(RegistryChange(workflow_id, old_current, current))]
+        return changes
 
     async def _remove(self, workflow_id: str, old: WorkflowEntry | None) -> list[RegistryChange]:
-        """Drop a workflow whose files are gone, and report it to `on_removed`."""
-        # Design note: `on_removed` runs even for a workflow that never had a current version,
-        # because queued runs of an earlier session may still exist for it.
+        """Drop a workflow whose files are gone, and report it to `on_removed`.
+
+        Like `_refresh`, it emits the change before it drops the entry.
+        """
+        # `on_removed` runs even for a workflow that never had a current version, because
+        # queued runs of an earlier session may still exist for it.
         if old is None:
             return []
-        del self._entries[workflow_id]
         changes = []
         if old.current is not None:
             changes.append(self._emit(RegistryChange(workflow_id, old.current, None)))
+        del self._entries[workflow_id]
         _log.info("workflow %s was removed", workflow_id)
         if self._on_removed is not None:
             try:
@@ -242,12 +323,12 @@ class WorkflowRegistry:
         return changes
 
     def _emit(self, change: RegistryChange) -> RegistryChange:
+        for sink in self._sinks:
+            sink.apply(change)
         if change.new is not None:
             _log.info(
                 "workflow %s: version %s is current", change.workflow_id, change.new.short_digest
             )
-        for sink in self._sinks:
-            sink.apply(change)
         return change
 
     def _claim_hooks(self, result: LoadResult) -> LoadResult:
@@ -272,8 +353,8 @@ class WorkflowRegistry:
 
     async def _load(self, path: Path) -> LoadResult | None:
         """Load one file, or return None when it vanished or can't be read."""
-        # Design note: an unreadable file counts as deleted, as the loader's OSError contract
-        # suggests; the warning tells the user why the workflow went away.
+        # An unreadable file counts as deleted, as the loader's OSError contract suggests; the
+        # warning tells the user why the workflow went away.
         try:
             return await self._blocking(self._loader().load_file, path)
         except FileNotFoundError:
@@ -298,8 +379,8 @@ class WorkflowRegistry:
 
     async def _scan(self) -> Snapshot | None:
         """Scan the workflows directory, or return None (logged once) when it can't be read."""
-        # Design note: like a watch root, an unreadable workflows directory emits no
-        # deletions; the loaded workflows stay until a scan works again.
+        # Like a watch root, an unreadable workflows directory emits no deletions; the loaded
+        # workflows stay until a scan works again.
         scan_dir = functools.partial(
             scan,
             self._settings.workflows_dir,
@@ -366,8 +447,13 @@ class WorkflowRegistry:
 
 def _workflow_id(path: Path) -> str:
     """Return the workflow ID of a file; a file with an invalid ID is keyed by its stem."""
-    # Design note: keying such a file by its stem lists it, with its E057, in `entries()`.
+    # Keying such a file by its stem lists it, with its E057, in `entries()`.
     return workflow_id_for(path) or path.stem
+
+
+def _held(result: LoadResult) -> bool:
+    """True when a webhook name that another workflow uses (E305) holds the file back."""
+    return any(issue.code == "E305" for issue in result.issues)
 
 
 def _same_version(old: Workflow | None, new: Workflow | None) -> bool:

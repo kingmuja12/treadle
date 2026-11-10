@@ -1,4 +1,4 @@
-"""The `POST /hooks/{name}` route (section 6, "Webhooks")."""
+"""The `POST /hooks/{name}` route."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from treadle.web.security import WebContext, _media_type, read_body_capped
 def hook_routes(ctx: WebContext) -> list[BaseRoute]:
     """Return the webhook route, with `max_body_size` set to `limits.webhook_body_bytes`.
 
-    The route runs steps 1 to 5 of section 6's webhook table: the handler's precheck, then
+    The route runs the checks that come before the signature: the handler's precheck, then
     the hook's body limit, by `Content-Length` before reading and by size while streaming.
     The handler verifies and submits what's left.
     """

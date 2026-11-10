@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import logging
 import os
 import shutil
@@ -13,6 +14,7 @@ from tests.support.builders import DEFAULT_LIMITS, make_run, make_watch, make_wo
 from tests.support.fakes import FakeSubmitter
 from tests.unit.triggers.helpers import running, write
 
+from treadle import fswatch
 from treadle.clock import inline_runner
 from treadle.config import Limits
 from treadle.errors import WorkflowInvalidError
@@ -62,6 +64,18 @@ def service_for(
 def events(request: RunRequest) -> list[tuple[str, str]]:
     changes: Any = request.trigger["changes"]
     return [(change["event"], change["rel"]) for change in changes]
+
+
+def unmount(root: Path, drive: Path) -> None:
+    """Move the tree at `root` to `drive` and leave an empty directory, as an unmount does."""
+    root.rename(drive)
+    root.mkdir()
+
+
+def remount(drive: Path, root: Path) -> None:
+    """Put the tree at `drive` back at `root`, as mounting the drive again does."""
+    root.rmdir()
+    drive.rename(root)
 
 
 class TestPayload:
@@ -214,6 +228,51 @@ class TestPolling:
 
         assert fired == [start + 11.5]
 
+    async def test_a_batch_fires_only_after_a_scan_confirms_the_quiet_period(
+        self, root: Path
+    ) -> None:
+        loop = asyncio.get_running_loop()
+        fired: list[float] = []
+
+        def record(request: RunRequest) -> Submission:
+            fired.append(loop.time())
+            return Submission(SubmitOutcome.QUEUED, make_run())
+
+        trigger = watch(root, debounce=2.0, poll_interval=10.0)
+        service, submitter = service_for(trigger, submitter=FakeSubmitter(handler=record))
+        start = loop.time()
+
+        async with running(service.run):
+            await asyncio.sleep(5.5)
+            target = write(root / "big.iso")
+            for size in range(2, 27):  # a copy that keeps growing for 25 seconds
+                await asyncio.sleep(1)
+                target.write_text("x" * size)
+            await asyncio.sleep(30)
+
+        [request] = submitter.requests
+        assert events(request) == [("created", "big.iso")]
+        assert fired == [start + 34]
+
+    async def test_a_zero_debounce_fires_on_the_poll_that_sees_the_change(self, root: Path) -> None:
+        loop = asyncio.get_running_loop()
+        fired: list[float] = []
+
+        def record(request: RunRequest) -> Submission:
+            fired.append(loop.time())
+            return Submission(SubmitOutcome.QUEUED, make_run())
+
+        trigger = watch(root, debounce=0.0, poll_interval=2.0)
+        service, _ = service_for(trigger, submitter=FakeSubmitter(handler=record))
+        start = loop.time()
+
+        async with running(service.run):
+            await asyncio.sleep(3)
+            write(root / "a.txt")
+            await asyncio.sleep(10)
+
+        assert fired == [start + 4]
+
     async def test_unwatched_events_never_start_a_run(self, root: Path) -> None:
         write(root / "keep.txt")
         write(root / "drop.txt")
@@ -303,6 +362,175 @@ class TestDegradedRoots:
 
         [request] = submitter.requests
         assert events(request) == [("created", "a.txt")]
+
+    async def test_a_root_replaced_by_another_directory_takes_a_silent_baseline(
+        self, root: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        for name in ("a.txt", "b.txt"):
+            write(root / name)
+        drive = tmp_path / "drive"
+        service, submitter = service_for(watch(root))
+
+        async with running(service.run):
+            await asyncio.sleep(5)
+            unmount(root, drive)
+            await asyncio.sleep(10)
+            assert submitter.requests == []
+            assert service.states()[0].error is None
+            remount(drive, root)
+            await asyncio.sleep(10)
+            assert submitter.requests == []
+            write(root / "c.txt")
+            await asyncio.sleep(10)
+
+        [request] = submitter.requests
+        assert events(request) == [("created", "c.txt")]
+        message = f"{root} is a different directory now; taking a new baseline"
+        assert caplog.text.count(message) == 2
+
+    async def test_a_repointed_root_symlink_takes_a_silent_baseline(self, tmp_path: Path) -> None:
+        first, second = tmp_path / "release-1", tmp_path / "release-2"
+        write(first / "a.txt")
+        write(second / "b.txt")
+        current = tmp_path / "current"
+        current.symlink_to(first, target_is_directory=True)
+        service, submitter = service_for(watch(current))
+
+        async with running(service.run):
+            await asyncio.sleep(5)
+            current.unlink()
+            current.symlink_to(second, target_is_directory=True)
+            await asyncio.sleep(10)
+            assert submitter.requests == []
+            write(second / "c.txt")
+            await asyncio.sleep(10)
+
+        [request] = submitter.requests
+        assert events(request) == [("created", "c.txt")]
+
+    async def test_a_scan_during_which_the_root_is_replaced_is_discarded(
+        self, root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        write(root / "sub" / "a.txt")
+        drive = tmp_path / "drive"
+        real_list_dir = fswatch._list_dir
+        replace_during_scan = False
+
+        def list_dir(directory: str) -> list[os.DirEntry[str]]:
+            nonlocal replace_during_scan
+            entries = real_list_dir(directory)
+            if replace_during_scan and directory == str(root):
+                replace_during_scan = False
+                unmount(root, drive)  # after the root was listed, before its subdirectory
+            return entries
+
+        monkeypatch.setattr(fswatch, "_list_dir", list_dir)
+        service, submitter = service_for(watch(root, recursive=True))
+
+        async with running(service.run):
+            await asyncio.sleep(5)
+            replace_during_scan = True
+            await asyncio.sleep(10)
+            assert submitter.requests == []
+            write(root / "b.txt")
+            await asyncio.sleep(10)
+
+        [request] = submitter.requests
+        assert events(request) == [("created", "b.txt")]
+
+    @needs_permissions
+    async def test_files_under_an_unreadable_subdirectory_keep_their_baseline(
+        self, root: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        for name in ("a.txt", "b.txt"):
+            write(root / "2026" / name)
+        locked = root / "2026"
+        service, submitter = service_for(watch(root, recursive=True))
+
+        try:
+            async with running(service.run):
+                await asyncio.sleep(5)
+                locked.chmod(0)
+                await asyncio.sleep(10)
+                assert submitter.requests == []
+                locked.chmod(0o755)
+                await asyncio.sleep(10)
+                assert submitter.requests == []
+                write(root / "2026" / "c.txt")
+                await asyncio.sleep(10)
+        finally:
+            locked.chmod(0o755)
+
+        [request] = submitter.requests
+        assert events(request) == [("created", "2026/c.txt")]
+        assert caplog.text.count("skipping unreadable directories, such as") == 1
+        assert service.states()[0].error is None
+
+    async def test_a_subdirectory_that_fails_to_list_keeps_its_baseline(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        nas = root / "nas"
+        for name in ("a.txt", "b.txt"):
+            write(nas / name)
+        real_list_dir = fswatch._list_dir
+        failing = False
+
+        def list_dir(directory: str) -> list[os.DirEntry[str]]:
+            if failing and directory == str(nas):
+                raise OSError(errno.ESTALE, "Stale file handle")
+            return real_list_dir(directory)
+
+        monkeypatch.setattr(fswatch, "_list_dir", list_dir)
+        service, submitter = service_for(watch(root, recursive=True))
+
+        async with running(service.run):
+            await asyncio.sleep(5)
+            failing = True
+            await asyncio.sleep(10)
+            failing = False
+            await asyncio.sleep(10)
+
+        assert submitter.requests == []
+        assert f"skipping unreadable directories, such as {nas}" in caplog.text
+
+    async def test_a_subdirectory_unreadable_at_the_baseline_joins_it_silently(
+        self, root: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        write(root / "old" / "a.txt")
+        real_list_dir = fswatch._list_dir
+        failing = True
+
+        def list_dir(directory: str) -> list[os.DirEntry[str]]:
+            if failing and directory == str(root / "old"):
+                raise PermissionError(13, "Permission denied")
+            return real_list_dir(directory)
+
+        monkeypatch.setattr(fswatch, "_list_dir", list_dir)
+        service, submitter = service_for(watch(root, recursive=True, initial_scan=True))
+
+        async with running(service.run):
+            await asyncio.sleep(5)
+            failing = False
+            await asyncio.sleep(10)
+            assert submitter.requests == []
+            write(root / "old" / "b.txt")
+            await asyncio.sleep(10)
+
+        [request] = submitter.requests
+        assert events(request) == [("created", "old/b.txt")]
+
+    async def test_a_removed_subdirectory_reports_its_files_as_deleted(self, root: Path) -> None:
+        for name in ("a.txt", "b.txt"):
+            write(root / "sub" / name)
+        service, submitter = service_for(watch(root, recursive=True))
+
+        async with running(service.run):
+            await asyncio.sleep(5)
+            shutil.rmtree(root / "sub")
+            await asyncio.sleep(10)
+
+        [request] = submitter.requests
+        assert events(request) == [("deleted", "sub/a.txt"), ("deleted", "sub/b.txt")]
 
     async def test_too_many_entries_degrades_and_rebaselines_silently(self, root: Path) -> None:
         write(root / "a.txt")

@@ -6,7 +6,9 @@ from collections.abc import Awaitable, Callable
 import httpx
 import pytest
 from starlette.applications import Starlette
+from starlette.types import ASGIApp, Message, Scope
 from tests.support.fakes import FakeRunControl, FakeWebhookHandler, MemoryRunReader
+from tests.support.project import ProjectFactory
 from tests.unit.web.helpers import FORM, TOKEN, MakeWeb, Web
 
 from treadle.models import HookResponse
@@ -105,6 +107,81 @@ async def test_an_unexpected_error_is_raised_for_logging(make_web: MakeWeb) -> N
 
     with pytest.raises(RuntimeError, match="bug"):
         await web.client.post("/api/v1/runs/1/rerun", json={})
+
+
+async def send_part_of_a_body(app: ASGIApp, path: str, content_type: str) -> list[int]:
+    """POST part of a body, then disconnect, as a sender that drops the connection does.
+
+    Returns the status of each response that the application started.
+    """
+    messages: list[Message] = [
+        {"type": "http.request", "body": b"partial=", "more_body": True},
+        {"type": "http.disconnect"},
+    ]
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        return messages.pop(0)
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    headers = [
+        (b"host", b"127.0.0.1:8765"),
+        (b"content-type", content_type.encode()),
+        (b"content-length", b"100"),
+    ]
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": headers,
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 8765),
+    }
+    await app(scope, receive, send)
+    return [message["status"] for message in sent if message["type"] == "http.response.start"]
+
+
+@pytest.mark.parametrize(
+    ("path", "content_type"),
+    [
+        ("/hooks/x", "application/json"),
+        ("/api/v1/workflows/wf/runs", "application/json"),
+        ("/runs/1/cancel", "application/x-www-form-urlencoded"),
+    ],
+)
+async def test_a_client_that_disconnects_mid_body_ends_the_request_quietly(
+    make_web: MakeWeb, caplog: pytest.LogCaptureFixture, path: str, content_type: str
+) -> None:
+    caplog.set_level(logging.DEBUG, logger="treadle.web")
+    web = make_web(hooks=FakeWebhookHandler(precheck=1024))
+
+    statuses = await send_part_of_a_body(create_app(web.ctx), path, content_type)
+
+    assert statuses == [400]
+    assert [record for record in caplog.records if record.levelno >= logging.ERROR] == []
+    lines = [record.getMessage() for record in caplog.records if record.levelno == logging.INFO]
+    assert [line.rsplit(" ", 1)[0] for line in lines] == [f"POST {path} 400"]
+    assert "the client disconnected before sending the whole body" in caplog.text
+
+
+async def test_a_loopback_bind_answers_the_host_of_its_own_address_only(
+    make_web: MakeWeb, project: ProjectFactory
+) -> None:
+    web = make_web(settings=project.settings(host="127.0.0.2"), base_url="http://127.0.0.2:8765")
+
+    own = await web.client.get("/api/v1/health")
+    neighbor = await web.client.get("/api/v1/health", headers={"Host": "127.0.0.3:8765"})
+    rebound = await web.client.get("/api/v1/health", headers={"Host": "evil.example:8765"})
+
+    assert (own.status_code, neighbor.status_code, rebound.status_code) == (200, 400, 400)
 
 
 async def test_requests_are_logged(web: Web, caplog: pytest.LogCaptureFixture) -> None:

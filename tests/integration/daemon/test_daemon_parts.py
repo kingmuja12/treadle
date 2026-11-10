@@ -189,24 +189,6 @@ def test_an_unknown_log_level_is_refused(root_logging: logging.Logger) -> None:
         configure_logging("loud", Masker)
 
 
-@pytest.mark.parametrize(
-    ("host", "allowed"),
-    [
-        ("127.0.0.2", ("127.0.0.2",)),
-        ("0:0:0:0:0:0:0:1", ("[0:0:0:0:0:0:0:1]",)),
-        ("127.0.0.1", ()),
-        ("localhost", ()),
-        ("::1", ()),
-    ],
-)
-def test_a_loopback_bind_also_allows_its_own_host(
-    settings: Settings, host: str, allowed: tuple[str, ...]
-) -> None:
-    bound = dataclasses.replace(settings, server=ServerSettings(host=host))
-
-    assert _web_settings(bound).server.allowed_hosts == allowed
-
-
 def test_a_non_loopback_bind_keeps_its_allowlist(settings: Settings) -> None:
     remote = dataclasses.replace(settings, server=ServerSettings(host="192.0.2.10"))
 

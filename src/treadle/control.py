@@ -8,33 +8,14 @@ from datetime import timedelta
 from typing import Final
 
 from treadle.clock import Clock, to_ms
-from treadle.errors import (
-    BusyError,
-    ConflictError,
-    InputError,
-    NotFoundError,
-    ShuttingDownError,
-    TreadleError,
-    WorkflowInvalidError,
-)
+from treadle.errors import InputError, TreadleError
 from treadle.models import CancelReason, ControlRequest, Origin, RunRequest, TriggerKind
 from treadle.protocols import RunControl
-from treadle.serialize import error_json
+from treadle.serialize import _error_status, error_json
 from treadle.store.async_store import AsyncStore
 from treadle.types import JSONObject, JSONValue
 
 CONTROL_EXPIRY: Final = 60.0
-
-_BATCH: Final = 50
-# The API error code of each refusal, most specific class first (section 8, "JSON shapes").
-_ERROR_CODES: Final[tuple[tuple[type[TreadleError], str], ...]] = (
-    (NotFoundError, "not_found"),
-    (WorkflowInvalidError, "workflow_invalid"),
-    (InputError, "invalid_inputs"),
-    (ConflictError, "conflict"),
-    (ShuttingDownError, "shutting_down"),
-    (BusyError, "busy"),
-)
 
 _log = logging.getLogger(__name__)
 
@@ -65,21 +46,22 @@ class ControlPoller:
         self._clock = clock
         self._accept_runs = accept_runs
         self._interval = interval
+        self._kept: dict[int, JSONObject] = {}  # results not stored yet, by request ID
 
     async def process_once(self) -> int:
         """Handle every pending request and return how many were handled.
 
-        Requests are claimed in ID order and answered one at a time, each result committed
-        as soon as it's known.
+        Requests are claimed one at a time in ID order, so a failure strands at most the
+        request in hand, and each result is committed as soon as it's known. A result that
+        can't be stored is kept and stored first on the next pass. A cancellation waits until
+        the request in hand has its result stored, so a run it created is never unreported.
         """
+        await self._store_kept()
         handled = 0
-        while True:
-            batch = await self._claim()
-            for request in batch:
-                await self._complete(request.id, await self._answer(request))
-                handled += 1
-            if len(batch) < _BATCH:
-                return handled
+        while (request := await self._claim()) is not None:
+            await self._handle(request)
+            handled += 1
+        return handled
 
     async def run(self) -> None:
         """Process requests every `interval` seconds until cancelled."""
@@ -89,6 +71,39 @@ class ControlPoller:
             except Exception:
                 _log.exception("handling control requests failed; trying again")
             await asyncio.sleep(self._interval)
+
+    async def _handle(self, request: ControlRequest) -> None:
+        """Answer one claimed request and store its result, even when cancelled meanwhile.
+
+        The run manager acts on a request whether or not its caller still waits, so the
+        answer and its result run in a task of their own that a cancellation doesn't stop.
+        """
+        handling = asyncio.create_task(self._answer_and_store(request))
+        try:
+            await asyncio.shield(handling)
+        except asyncio.CancelledError:
+            await handling
+            raise
+
+    async def _answer_and_store(self, request: ControlRequest) -> None:
+        """Answer one request, and keep its result for the next pass when storing it fails."""
+        result = await self._answer(request)
+        try:
+            await self._complete(request.id, result)
+        except Exception as exc:
+            _log.warning(
+                "control request %d: storing the result failed (%s); trying again",
+                request.id,
+                exc,
+                exc_info=not isinstance(exc, TreadleError),
+            )
+            self._kept[request.id] = result
+
+    async def _store_kept(self) -> None:
+        """Store the results that a failed write kept; a failure ends the pass."""
+        for request_id, result in list(self._kept.items()):
+            await self._complete(request_id, result)
+            del self._kept[request_id]
 
     async def _answer(self, request: ControlRequest) -> JSONObject:
         """Return the result of one request: its outcome, or an error in the API shape."""
@@ -129,7 +144,7 @@ class ControlPoller:
                 kind=TriggerKind.MANUAL,
                 trigger={"kind": TriggerKind.MANUAL.value, "origin": origin.value},
                 inputs=inputs,
-                # Design note: the CLI sends `-i KEY=VALUE` text, so the string rules apply.
+                # The CLI sends `-i KEY=VALUE` text, so the string rules apply.
                 inputs_are_strings=True,
             )
             submission = await self._control.submit(request)
@@ -150,9 +165,11 @@ class ControlPoller:
             "forced": outcome.forced,
         }
 
-    async def _claim(self) -> list[ControlRequest]:
+    async def _claim(self) -> ControlRequest | None:
+        """Claim the oldest pending request, or return None when none is pending."""
         now_ms = to_ms(self._clock.now())
-        return await self._store.write(lambda repo: repo.claim_controls(at_ms=now_ms, limit=_BATCH))
+        claimed = await self._store.write(lambda repo: repo.claim_controls(at_ms=now_ms, limit=1))
+        return claimed[0] if claimed else None
 
     async def _complete(self, request_id: int, result: JSONObject) -> None:
         at_ms = to_ms(self._clock.now())
@@ -161,9 +178,10 @@ class ControlPoller:
 
 def _refusal(exc: TreadleError) -> JSONObject:
     """Map a Treadle error to the API error shape; input problems carry their details."""
-    # Design note: only `invalid_inputs` carries details. The poller has no workflow paths
-    # to render issues with, so the CLI gets `workflow_invalid` with the message alone.
-    code = next((code for kind, code in _ERROR_CODES if isinstance(exc, kind)), "internal")
+    # Only `invalid_inputs` carries details. The poller has no workflow paths to render issues
+    # with, so the CLI gets `workflow_invalid` with the message alone.
+    mapped = _error_status(exc)
+    code = "internal" if mapped is None else mapped[1]
     details: JSONValue = dict[str, JSONValue](exc.errors) if isinstance(exc, InputError) else None
     return error_json(code, str(exc), details)
 

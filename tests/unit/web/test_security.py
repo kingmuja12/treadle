@@ -71,6 +71,17 @@ def test_constant_time_equals(a: str, b: str, equal: bool) -> None:
             ["127.0.0.1", "localhost", "[::1]", "treadle.lan"],
         ),
         (ServerSettings(host="::1"), ["127.0.0.1", "localhost", "[::1]"]),
+        (ServerSettings(host="[::1]"), ["127.0.0.1", "localhost", "[::1]"]),
+        (ServerSettings(host="LocalHost"), ["127.0.0.1", "localhost", "[::1]"]),
+        (ServerSettings(host="127.0.0.2"), ["127.0.0.1", "localhost", "[::1]", "127.0.0.2"]),
+        (
+            ServerSettings(host="0:0:0:0:0:0:0:1"),
+            ["127.0.0.1", "localhost", "[::1]", "[0:0:0:0:0:0:0:1]"],
+        ),
+        (
+            ServerSettings(host="127.0.0.2", allowed_hosts=("127.0.0.2", "treadle.lan")),
+            ["127.0.0.1", "localhost", "[::1]", "127.0.0.2", "treadle.lan"],
+        ),
         (ServerSettings(host="192.168.1.20"), ["*"]),
         (ServerSettings(host="192.168.1.20", allowed_hosts=("treadle.lan",)), ["treadle.lan"]),
     ],

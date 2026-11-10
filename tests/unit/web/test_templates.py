@@ -98,7 +98,7 @@ def test_templates_have_no_inline_scripts_styles_or_safe_filters(name: str) -> N
     assert "javascript:" not in source
 
 
-def test_the_design_lists_every_template() -> None:
+def test_the_package_ships_exactly_these_templates() -> None:
     assert TEMPLATE_NAMES == [
         "base.html",
         "error.html",

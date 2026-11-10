@@ -1,4 +1,4 @@
-"""The JSON API under `/api/v1` (section 8, "Routes")."""
+"""The JSON API under `/api/v1`."""
 
 from __future__ import annotations
 
@@ -12,15 +12,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 from starlette.routing import BaseRoute, Route
 
-from treadle.errors import (
-    BusyError,
-    ConflictError,
-    InputError,
-    NotFoundError,
-    ShuttingDownError,
-    TreadleError,
-    WorkflowInvalidError,
-)
+from treadle.errors import InputError, NotFoundError, TreadleError, WorkflowInvalidError
 from treadle.models import (
     CancelOutcome,
     CancelReason,
@@ -36,6 +28,7 @@ from treadle.models import (
 )
 from treadle.serialize import (
     _display_path,
+    _error_status,
     error_json,
     log_json,
     run_detail_json,
@@ -51,14 +44,6 @@ _E = TypeVar("_E", bound=StrEnum)
 
 _RETRY_AFTER: Final = {"Retry-After": "30"}
 _MAX_ID: Final = 2**63 - 1  # SQLite's largest integer
-_ERRORS: Final[tuple[tuple[type[TreadleError], int, str], ...]] = (
-    (NotFoundError, 404, "not_found"),
-    (WorkflowInvalidError, 409, "workflow_invalid"),
-    (InputError, 422, "invalid_inputs"),
-    (ConflictError, 409, "conflict"),
-    (ShuttingDownError, 503, "shutting_down"),
-    (BusyError, 503, "busy"),
-)
 
 
 class _ApiError(Exception):
@@ -121,7 +106,7 @@ class _Api:
         stats = self.ctx.runs.stats()
         entries = self.ctx.workflows.entries()
         valid = sum(entry.valid for entry in entries)
-        # Design note: `uptime_s` counts whole seconds.
+        # `uptime_s` counts whole seconds.
         uptime = (self.ctx.clock.now() - self.ctx.started_at).total_seconds()
         body: JSONObject = {
             "version": self.ctx.version,
@@ -255,7 +240,7 @@ class _Api:
         if _media_type(request.headers.get("content-type")) != "application/json":
             raise _ApiError(415, "unsupported_media_type", "send the body as application/json")
         body = await read_body_capped(request, self.ctx.settings.limits.api_body_bytes)
-        # Design note: a POST without a body (curl -X POST) means "no options", like `{}`.
+        # A POST without a body (curl -X POST) means "no options", like `{}`.
         if not body.strip():
             return {}
         try:
@@ -264,8 +249,8 @@ class _Api:
             raise _ApiError(400, "bad_request", "the request body isn't valid JSON") from exc
         if not isinstance(value, dict):
             raise _ApiError(400, "bad_request", "the request body must be a JSON object")
-        # Design note: unknown keys are refused, as in workflow files and treadle.toml, so a
-        # typo such as "input" fails loudly instead of running without inputs.
+        # Unknown keys are refused, as in workflow files and treadle.toml, so a typo such as
+        # "input" fails loudly instead of running without inputs.
         unknown = sorted(set(value) - set(allowed))
         if unknown:
             raise _ApiError(400, "bad_request", f"unknown key '{unknown[0]}' in the request body")
@@ -321,14 +306,6 @@ def _int_param(params: QueryParams, name: str, low: int, high: int = _MAX_ID) ->
         return int(raw)
     bounds = f"from {low} to {high}" if high < _MAX_ID else f"of at least {low}"
     raise ValueError(f"'{name}' must be an integer {bounds}")
-
-
-def _error_status(exc: TreadleError) -> tuple[int, str] | None:
-    """Return the HTTP status and error code for a Treadle error, or None when it's internal."""
-    for kind, status, code in _ERRORS:
-        if isinstance(exc, kind):
-            return status, code
-    return None
 
 
 def _refusal(outcome: CancelOutcome) -> str:

@@ -34,13 +34,15 @@ class Change:
 
 Snapshot: TypeAlias = dict[str, FileState]
 
-# How a later event for the same path merges into an earlier one (section 6). None drops the
-# path from the batch; any pair not listed keeps the later event.
+# How a later event for the same path merges into an earlier one. None drops the path from
+# the batch; any pair not listed keeps the later event.
 _MERGED: Final[dict[tuple[WatchEvent, WatchEvent], WatchEvent | None]] = {
     (WatchEvent.CREATED, WatchEvent.MODIFIED): WatchEvent.CREATED,
     (WatchEvent.CREATED, WatchEvent.DELETED): None,
     (WatchEvent.DELETED, WatchEvent.CREATED): WatchEvent.MODIFIED,
 }
+# The errors that mean a directory is gone, so the files under it really were deleted.
+_VANISHED: Final = (FileNotFoundError, NotADirectoryError)
 
 
 class RootUnavailable(Exception):
@@ -61,13 +63,14 @@ def scan(
 ) -> Snapshot:
     """Snapshot the regular files under `root` that `matcher` includes, by absolute path.
 
-    Symlinks are never followed, vanished entries are skipped, and unreadable subdirectories
-    are skipped; their paths are appended to `skipped` when it is given. Directories are
+    Symlinks are never followed, and entries that vanish during the scan are skipped. A
+    subdirectory that can't be listed for another reason, such as a permission or I/O error,
+    is skipped too, and its path is appended to `skipped` when it is given. Directories are
     entered only when `recursive` is true and `matcher` doesn't prune them. Raises
     RootUnavailable or TooManyEntries.
     """
-    # Design note: `max_entries` counts every directory entry the scan visits, not only the
-    # files it keeps, so the limit bounds the cost of each poll as well as its memory.
+    # `max_entries` counts every directory entry the scan visits, not only the files it
+    # keeps, so the limit bounds the cost of each poll as well as its memory.
     snapshot: Snapshot = {}
     visited = 0
     pending = [("", str(root))]
@@ -78,7 +81,7 @@ def scan(
         except OSError as exc:
             if not rel_dir:
                 raise RootUnavailable(_unavailable(directory, exc)) from exc
-            if isinstance(exc, PermissionError) and skipped is not None:
+            if skipped is not None and not isinstance(exc, _VANISHED):
                 skipped.append(directory)
             continue
         visited += len(entries)
@@ -124,7 +127,9 @@ def diff(old: Snapshot, new: Snapshot, root: Path) -> list[Change]:
 class Debouncer:
     """Batches changes until `quiet` seconds pass without one, or `max_wait` since the first.
 
-    Events for one path coalesce by the table in section 6.
+    Events for one path coalesce: created then modified stays created, created then deleted
+    drops the path, deleted then created becomes modified, and any other pair keeps the later
+    event.
     """
 
     def __init__(self, quiet: float, max_wait: float) -> None:

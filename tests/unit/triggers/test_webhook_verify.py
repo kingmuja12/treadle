@@ -28,7 +28,7 @@ GITHUB_HEX = "757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17"
 RECEIVED = datetime(2026, 11, 9, 10, 15, 2, 120000, tzinfo=UTC)
 
 
-def test_the_constants_match_the_design() -> None:
+def test_the_redacted_headers_delivery_headers_and_secret_minimum() -> None:
     assert sorted(REDACTED_HEADERS) == ["authorization", "cookie", "proxy-authorization"]
     assert DELIVERY_HEADERS[0] == "x-github-delivery"
     assert MIN_SECRET_LENGTH == 16

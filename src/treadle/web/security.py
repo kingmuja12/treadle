@@ -1,4 +1,4 @@
-"""Web security: sessions, CSRF tokens, body limits, and the security middleware (section 8).
+"""Web security: sessions, CSRF tokens, body limits, and the security middleware.
 
 This module also defines `WebContext`, the dependencies every route module receives.
 """
@@ -60,9 +60,10 @@ _SECURITY_HEADERS: Final = {
 _log = logging.getLogger("treadle.web")
 
 
-# Design note: section 4 places WebContext in web/app.py, but web.api, web.dashboard, and
-# web.hooks take it and come before web.app in layer L8, and the architecture test counts
-# TYPE_CHECKING imports. It lives here, the first L8 module, and web.app re-exports it.
+# WebContext belongs with the application factory in web.app, but web.api, web.dashboard,
+# and web.hooks take it and come before web.app in layer 8, and the architecture test
+# counts TYPE_CHECKING imports. So it lives here, in the first layer-8 module, and web.app
+# re-exports it.
 @dataclass(frozen=True, slots=True)
 class WebContext:
     """Everything the web application needs. The daemon creates and owns each resource."""
@@ -90,11 +91,17 @@ def constant_time_equals(a: str, b: str) -> bool:
 def allowed_hosts_for(server: ServerSettings) -> list[str]:
     """Return the Host allowlist.
 
-    On a loopback bind it's the loopback names plus `allowed_hosts`; otherwise it's
-    `allowed_hosts`, or `*` when that's empty.
+    On a loopback bind it's the loopback names, the bound address itself (an IPv6 address in
+    brackets), and `allowed_hosts`; otherwise it's `allowed_hosts`, or `*` when that's empty.
+    DNS rebinding sends a host name, never the address literal, so allowing the bound address
+    keeps that protection.
     """
     if server.is_loopback:
-        return list(dict.fromkeys([*_LOOPBACK_HOSTS, *server.allowed_hosts]))
+        hosts = list(_LOOPBACK_HOSTS)
+        own = _host_literal(server.host)
+        if own.lower() not in hosts:
+            hosts.append(own)
+        return list(dict.fromkeys([*hosts, *server.allowed_hosts]))
     return list(server.allowed_hosts) or ["*"]
 
 
@@ -147,8 +154,8 @@ def check_csrf(secret_key: bytes, cookie: str | None, submitted: str | None, bin
 
 def safe_next(target: str | None) -> str:
     """Return `target` when it's a same-site relative path, else "/"."""
-    # Design note: control characters are refused too, because browsers drop tabs and
-    # newlines from URLs, which would turn "/\t/example.com" into "//example.com".
+    # Control characters are refused too, because browsers drop tabs and newlines from
+    # URLs, which would turn "/\t/example.com" into "//example.com".
     if (
         not target
         or not target.startswith("/")
@@ -344,6 +351,12 @@ class RequestLogMiddleware:
             _log.info("%s %s %d %s", scope["method"], safe_path, status, elapsed)
 
 
+def _host_literal(host: str) -> str:
+    """Return a bind address as a Host header names it, with an IPv6 address in brackets."""
+    address = host.strip("[]")
+    return f"[{address}]" if ":" in address else address
+
+
 def _security_headers(path: str) -> dict[str, str]:
     """Return the headers that every response carries, `Cache-Control` included."""
     cache = "public, max-age=3600" if path.startswith("/static/") else "no-store"
@@ -380,11 +393,11 @@ def _same_origin(scope: Scope) -> bool:
     request's own scheme, host, and port. A request with neither header comes from a
     non-browser client, or from an old browser on the same origin.
     """
-    # Design note: section 8 refuses a request when either header disagrees. Every Treadle
-    # page sends `Referrer-Policy: no-referrer`, and browsers then send `Origin: null` with
-    # same-origin form posts, so the dashboard's own forms would fail. A browser that sends
-    # `Sec-Fetch-Site` computes it from the real origins, so it decides alone when present,
-    # as in Go's net/http CrossOriginProtection.
+    # Refusing a request when either header disagrees would break the dashboard's own
+    # forms: every Treadle page sends `Referrer-Policy: no-referrer`, and browsers then
+    # send `Origin: null` with same-origin form posts. A browser that sends
+    # `Sec-Fetch-Site` computes it from the real origins, so it decides alone when
+    # present, as in Go's net/http CrossOriginProtection.
     headers = Headers(scope=scope)
     fetch_site = headers.get("sec-fetch-site")
     if fetch_site is not None:

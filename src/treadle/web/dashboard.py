@@ -1,4 +1,4 @@
-"""The server-rendered dashboard (section 8, "Dashboard pages")."""
+"""The server-rendered dashboard."""
 
 from __future__ import annotations
 
@@ -33,12 +33,11 @@ from treadle.models import (
     TriggerKind,
     WorkflowEntry,
 )
-from treadle.serialize import _display_path
+from treadle.serialize import _display_path, _error_status
 from treadle.types import JSONValue
 from treadle.units import format_duration
 from treadle.web.api import (
     _RETRY_AFTER,
-    _error_status,
     _int_param,
     _refusal,
     _run_filter,
@@ -255,8 +254,8 @@ class _Pages:
         self, response: Response, name: str, value: str, *, max_age: int | None = None
     ) -> None:
         """Set an HttpOnly, SameSite=Strict cookie for the whole site."""
-        # Design note: the CSRF cookie gets `Secure` with `secure_cookies` too, like the
-        # session cookie, so neither travels over plain HTTP once TLS is configured.
+        # The CSRF cookie gets `Secure` with `secure_cookies` too, like the session cookie,
+        # so neither travels over plain HTTP once TLS is configured.
         secure = self.ctx.settings.server.secure_cookies
         response.set_cookie(
             name, value, max_age=max_age, path="/", secure=secure, httponly=True, samesite="strict"
@@ -321,8 +320,8 @@ class _Dashboard:
 
     async def logout(self, request: Request) -> Response:
         """`POST /logout`: end the session and go to the sign-in page."""
-        # Design note: without a token there is no session to end and no sign-in page, so
-        # this answers 404 like `/login`.
+        # Without a token there is no session to end and no sign-in page, so this answers
+        # 404 like `/login`.
         if self.ctx.token is None:
             return self._no_sign_in(request)
         if await self.pages.form(request) is None:
@@ -578,8 +577,8 @@ def _problems(errors: Mapping[str, str], fields: set[str]) -> list[_Problem]:
 
 def _supplied(values: Mapping[str, str], specs: Mapping[str, InputSpec]) -> dict[str, JSONValue]:
     """Return the inputs a form supplies: an empty field of an optional input isn't one."""
-    # Design note: an empty field of a required input is still supplied, as "", so the run
-    # manager judges it the way it judges the CLI's `-i name=`.
+    # An empty field of a required input is still supplied, as "", so the run manager
+    # judges it the way it judges the CLI's `-i name=`.
     return {
         name: value
         for name, value in values.items()
@@ -623,9 +622,9 @@ def _page_line(line: LogLine, zone: ZoneInfo) -> str:
 
 
 def _text_line(line: LogLine) -> str:
-    # Design note: `log.txt` lines follow `treadle logs` ("step#attempt stream | text") with
-    # an ISO UTC timestamp, because a saved file has no time zone context; "-" marks a
-    # line that belongs to the run rather than a step.
+    # `log.txt` lines follow `treadle logs` ("step#attempt stream | text") with an ISO UTC
+    # timestamp, because a saved file has no time zone context; "-" marks a line that
+    # belongs to the run rather than a step.
     where = f"{line.step_id}#{line.attempt}" if line.step_id else "-"
     return f"{iso_utc(line.ts)} {where} {line.stream} | {line.text}"
 

@@ -103,6 +103,71 @@ class TestFirstSeenKeys:
         assert await scheduler.process_due() == 2
         assert await scheduled_slots(store) == [at(11), at(12)]
 
+    async def test_a_workflow_fixed_after_startup_resumes_from_its_stored_slot(
+        self, store: AsyncStore, clock: FakeClock
+    ) -> None:
+        trigger = schedule("0 * * * *", catch_up=CatchUp.ALL)
+        await set_last_slot(store, trigger.key, START - 2 * HOUR)
+        workflow = make_workflow(triggers=[trigger])
+        submitter = StoreSubmitter(store, workflow, clock=clock)
+        scheduler = Scheduler(store=store, submitter=submitter, clock=clock)
+        assert await scheduler.process_due() == 0  # the file is invalid at startup
+
+        await asyncio.sleep(10 * 60)
+        scheduler.update("wf", workflow)  # the file is fixed
+
+        assert await scheduler.process_due() == 2
+        assert await scheduled_slots(store) == [at(11), at(12)]
+
+    async def test_a_schedule_removed_and_restored_starts_again_at_now(
+        self, store: AsyncStore, clock: FakeClock
+    ) -> None:
+        trigger = schedule("0 * * * *", catch_up=CatchUp.ALL)
+        scheduler, _, workflow = build(store, clock, trigger)
+        await scheduler.process_due()
+
+        scheduler.update("wf", None)
+        await asyncio.sleep(5 * 3600 + 10 * 60)
+        scheduler.update("wf", workflow)
+
+        assert await scheduler.process_due() == 0
+        assert await last_slot(store, trigger.key) == to_ms(at(17, 10))
+        await asyncio.sleep(50 * 60)
+        assert await scheduler.process_due() == 1
+        assert await scheduled_slots(store) == [at(18)]
+
+    async def test_an_edit_that_is_reverted_starts_again_at_now(
+        self, store: AsyncStore, clock: FakeClock
+    ) -> None:
+        nightly = schedule("0 2 * * *")
+        scheduler, _, workflow = build(store, clock, nightly)
+        await scheduler.process_due()
+
+        scheduler.update("wf", make_workflow(triggers=[schedule("0 3 * * *")]))
+        await scheduler.process_due()
+        await asyncio.sleep(3 * 86400)
+        scheduler.update("wf", workflow)
+
+        assert await scheduler.process_due() == 0
+        [state] = scheduler.states()
+        assert state.next_fire == datetime(2026, 11, 13, 2, tzinfo=UTC)
+
+    async def test_a_restored_schedule_never_moves_back_after_a_clock_jump(
+        self, store: AsyncStore, clock: FakeClock
+    ) -> None:
+        trigger = schedule("0 * * * *")
+        scheduler, _, workflow = build(store, clock, trigger)
+        await scheduler.process_due()
+        await asyncio.sleep(3600)
+        assert await scheduler.process_due() == 1
+
+        scheduler.update("wf", None)
+        clock.jump(-2 * HOUR)
+        scheduler.update("wf", workflow)
+
+        assert await scheduler.process_due() == 0
+        assert await last_slot(store, trigger.key) == to_ms(at(13))
+
 
 class TestCatchUp:
     @pytest.mark.parametrize(

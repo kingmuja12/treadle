@@ -4,6 +4,7 @@ import json
 from datetime import timedelta
 from pathlib import Path
 
+import pytest
 from tests.support.builders import (
     FIXED_TIME,
     PROJECT_DIR,
@@ -17,6 +18,17 @@ from tests.support.builders import (
     make_workflow,
 )
 
+from treadle.errors import (
+    BusyError,
+    ConflictError,
+    InputError,
+    LockHeldError,
+    NotFoundError,
+    ShuttingDownError,
+    StoreError,
+    TreadleError,
+    WorkflowInvalidError,
+)
 from treadle.models import (
     AttemptStatus,
     Concurrency,
@@ -32,6 +44,7 @@ from treadle.models import (
     TriggerState,
 )
 from treadle.serialize import (
+    _error_status,
     error_json,
     log_json,
     run_detail_json,
@@ -50,7 +63,7 @@ NIGHTLY = TriggerState(
 )
 
 
-def test_run_json_has_the_section_8_shape_in_order() -> None:
+def test_run_json_has_the_documented_shape_in_order() -> None:
     run = make_run(
         42,
         workflow_id="nightly-backup",
@@ -380,3 +393,22 @@ def test_error_json_has_the_error_shape() -> None:
         "message": "bad",
         "details": details,
     }
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (NotFoundError("workflow 'x' doesn't exist"), (404, "not_found")),
+        (WorkflowInvalidError("x", []), (409, "workflow_invalid")),
+        (InputError({"count": "must be an integer"}), (422, "invalid_inputs")),
+        (ConflictError("run 3 is still running"), (409, "conflict")),
+        (ShuttingDownError("Treadle is shutting down"), (503, "shutting_down")),
+        (LockHeldError(None), (503, "busy")),
+        (BusyError("the run manager is busy"), (503, "busy")),
+        (StoreError("the store is closed"), None),
+    ],
+)
+def test_each_refusal_has_one_status_and_error_code(
+    error: TreadleError, expected: tuple[int, str] | None
+) -> None:
+    assert _error_status(error) == expected

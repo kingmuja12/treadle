@@ -1,4 +1,4 @@
-"""The authentication matrix of section 8: who may reach which route, with which credentials."""
+"""The authentication matrix: who may reach which route, with which credentials."""
 
 from __future__ import annotations
 

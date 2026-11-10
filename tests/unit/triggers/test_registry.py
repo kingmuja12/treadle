@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import functools
 import logging
 import os
 import shutil
@@ -61,6 +62,22 @@ steps:
 
 
 _RECORD: Any = object()
+
+
+class FlakySink:
+    """A sink that fails its next `failures` changes, and records the versions it applied."""
+
+    def __init__(self, failures: int = 0) -> None:
+        self.failures = failures
+        self.calls = 0
+        self.applied: list[Workflow | None] = []
+
+    def apply(self, change: RegistryChange) -> None:
+        self.calls += 1
+        if self.failures:
+            self.failures -= 1
+            raise RuntimeError("the sink failed")
+        self.applied.append(change.new)
 
 
 class Harness:
@@ -329,6 +346,80 @@ class TestHotReload:
             ("new", True),
         ]
 
+    async def test_a_hook_moved_into_an_earlier_file_moves_in_one_edit(
+        self, harness: Harness
+    ) -> None:
+        deploy = harness.project.write_workflow("deploy", with_hook("push"))
+        await harness.registry.load_all()
+
+        harness.project.write_workflow("build", with_hook("push"))
+        deploy.write_text(HELLO, encoding="utf-8")
+        changes = await harness.registry.poll()
+
+        assert [change.workflow_id for change in changes] == ["deploy", "build"]
+        assert harness.codes("build") == ["W311"]
+        assert [hook.name for hook in harness.current("build").webhooks()] == ["push"]
+        assert harness.current("deploy").webhooks() == ()
+
+    async def test_a_hook_moved_in_two_edits_moves_once_its_owner_drops_it(
+        self, harness: Harness
+    ) -> None:
+        deploy = harness.project.write_workflow("deploy", with_hook("push"))
+        await harness.registry.load_all()
+        harness.project.write_workflow("zeta", with_hook("push"))
+        assert await harness.registry.poll() == []
+        assert harness.codes("zeta") == ["E305", "W311"]
+
+        deploy.write_text(HELLO, encoding="utf-8")
+        changes = await harness.registry.poll()
+
+        assert [change.workflow_id for change in changes] == ["deploy", "zeta"]
+        assert harness.codes("zeta") == ["W311"]
+
+    async def test_a_conflict_found_at_startup_clears_when_the_owner_drops_the_hook(
+        self, harness: Harness
+    ) -> None:
+        alpha = harness.project.write_workflow("alpha", with_hook("push"))
+        harness.project.write_workflow("beta", with_hook("push"))
+        await harness.registry.load_all()
+        assert harness.codes("beta") == ["E305", "W311"]
+
+        alpha.write_text(HELLO, encoding="utf-8")
+        changes = await harness.registry.poll()
+
+        assert [(c.workflow_id, c.new is not None) for c in changes] == [
+            ("alpha", True),
+            ("beta", True),
+        ]
+        assert harness.codes("beta") == ["W311"]
+
+    async def test_a_hook_name_still_in_use_keeps_the_conflict(self, harness: Harness) -> None:
+        owner = harness.project.write_workflow("owner", with_hook("push"))
+        harness.project.write_workflow("zeta", with_hook("push"))
+        await harness.registry.load_all()
+
+        owner.write_text(with_hook("push", message="edited"), encoding="utf-8")
+        changes = await harness.registry.poll()
+
+        assert [change.workflow_id for change in changes] == ["owner"]
+        assert harness.codes("zeta") == ["E305", "W311"]
+        assert harness.entry("zeta").current is None
+
+    async def test_a_released_hook_name_goes_to_the_first_waiting_file_in_path_order(
+        self, harness: Harness
+    ) -> None:
+        owner = harness.project.write_workflow("owner", with_hook("push"))
+        harness.project.write_workflow("x-first", with_hook("push"))
+        harness.project.write_workflow("y-second", with_hook("push"))
+        await harness.registry.load_all()
+
+        owner.write_text(HELLO, encoding="utf-8")
+        await harness.registry.poll()
+
+        assert harness.codes("x-first") == ["W311"]
+        [conflict] = [issue for issue in harness.entry("y-second").issues if issue.code == "E305"]
+        assert conflict.message == "webhook name 'push' is already used by workflow 'x-first'"
+
     async def test_a_vanished_file_counts_as_deleted(
         self, project: ProjectFactory, settings: Settings, store: AsyncStore, clock: FakeClock
     ) -> None:
@@ -440,6 +531,104 @@ class TestHotReload:
         assert change.new.path.name == "twin.yml"
 
 
+class TestFailures:
+    async def test_a_file_that_fails_to_load_doesnt_hold_back_the_others(
+        self,
+        project: ProjectFactory,
+        settings: Settings,
+        store: AsyncStore,
+        clock: FakeClock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        beta = project.workflows_dir / "beta.yml"
+        failures = 1
+
+        async def flaky(fn: Callable[..., T], /, *args: Any) -> T:
+            nonlocal failures
+            if args == (beta,) and failures:
+                failures -= 1
+                raise RuntimeError("the loader broke")
+            return fn(*args)
+
+        harness = Harness(project, settings, store, clock, blocking=flaky)
+        await harness.registry.load_all()
+        for name in ("alpha", "beta", "gamma"):
+            project.write_workflow(name, HELLO)
+
+        changes = await harness.registry.poll()
+        assert [change.workflow_id for change in changes] == ["alpha", "gamma"]
+        assert "workflows/beta.yml: reloading failed; trying again" in caplog.text
+        assert "RuntimeError: the loader broke" in caplog.text
+
+        [change] = await harness.registry.poll()
+        assert change.workflow_id == "beta"
+
+    async def test_a_file_that_keeps_failing_is_logged_once_per_file_state(
+        self,
+        project: ProjectFactory,
+        settings: Settings,
+        store: AsyncStore,
+        clock: FakeClock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        beta = project.workflows_dir / "beta.yml"
+
+        async def broken(fn: Callable[..., T], /, *args: Any) -> T:
+            if args == (beta,):
+                raise RuntimeError("the loader broke")
+            return fn(*args)
+
+        harness = Harness(project, settings, store, clock, blocking=broken)
+        await harness.registry.load_all()
+        project.write_workflow("beta", HELLO)
+
+        for _ in range(4):
+            assert await harness.registry.poll() == []
+        assert caplog.text.count("workflows/beta.yml: reloading failed; trying again") == 1
+        assert caplog.text.count("reloading failed again; waiting for the file to change") == 1
+        assert caplog.text.count("RuntimeError: the loader broke") == 1
+
+        project.write_workflow("beta", HELLO.replace("hi", "edited"))
+        await harness.registry.poll()
+        assert caplog.text.count("workflows/beta.yml: reloading failed; trying again") == 2
+
+    async def test_a_change_that_a_sink_fails_to_apply_is_sent_again(
+        self, project: ProjectFactory, settings: Settings, store: AsyncStore, clock: FakeClock
+    ) -> None:
+        sink = FlakySink()
+        harness = Harness(project, settings, store, clock, sinks=[sink])
+        path = project.write_workflow("hello", HELLO)
+        await harness.registry.load_all()
+        good = harness.current("hello")
+
+        path.write_text(HELLO.replace("hi", "edited"), encoding="utf-8")
+        sink.failures = 1
+        assert await harness.registry.poll() == []
+        assert harness.current("hello") is good  # the entry waits until every sink has it
+
+        [change] = await harness.registry.poll()
+        assert change.old is good
+        assert sink.applied == [good, harness.current("hello")]
+
+    async def test_a_removal_that_a_sink_fails_to_apply_is_sent_again(
+        self, project: ProjectFactory, settings: Settings, store: AsyncStore, clock: FakeClock
+    ) -> None:
+        sink = FlakySink()
+        harness = Harness(project, settings, store, clock, sinks=[sink])
+        path = project.write_workflow("hello", HELLO)
+        await harness.registry.load_all()
+
+        path.unlink()
+        sink.failures = 1
+        assert await harness.registry.poll() == []
+        assert harness.registry.get("hello") is not None
+
+        [change] = await harness.registry.poll()
+        assert change.new is None
+        assert harness.registry.get("hello") is None
+        assert harness.removed == ["hello"]
+
+
 class TestSideFiles:
     async def test_an_env_change_reloads_the_secrets_for_new_loads(
         self, harness: Harness, caplog: pytest.LogCaptureFixture
@@ -538,6 +727,39 @@ class TestLookups:
         assert stored is not old
         assert (stored.id, stored.digest, stored.source) == ("hello", old.digest, HELLO)
 
+    async def test_version_of_identical_files_is_the_requested_workflow(
+        self, harness: Harness
+    ) -> None:
+        harness.project.write_workflow("backup-docs", HELLO)
+        harness.project.write_workflow("backup-photos", HELLO)
+        await harness.registry.load_all()
+        photos = harness.current("backup-photos")
+        assert harness.current("backup-docs").digest == photos.digest
+
+        assert await harness.registry.version(photos.digest, workflow_id="backup-photos") is photos
+        assert await harness.registry.version(photos.digest, workflow_id="other") is None
+
+    async def test_version_parses_a_stored_version_as_the_requested_workflow(
+        self, harness: Harness, store: AsyncStore
+    ) -> None:
+        docs = harness.project.write_workflow("backup-docs", HELLO)
+        photos = harness.project.write_workflow("backup-photos", HELLO)
+        await harness.registry.load_all()
+        old = harness.current("backup-docs")
+        await store.write(lambda repo: repo.create_run(new_run(old)))
+        for path in (docs, photos):
+            path.write_text(HELLO.replace("hi", path.stem), encoding="utf-8")
+        await harness.registry.poll()
+
+        stored = await harness.registry.version(old.digest, workflow_id="backup-photos")
+
+        assert stored is not None
+        assert (stored.id, stored.path.name, stored.digest) == (
+            "backup-photos",
+            "backup-photos.yml",
+            old.digest,
+        )
+
     async def test_version_of_an_unknown_digest_is_none(self, harness: Harness) -> None:
         assert await harness.registry.version("0" * 64) is None
 
@@ -593,7 +815,7 @@ class TestRun:
             await asyncio.sleep(0.01)
             assert len(harness.sink.changes) == 2
 
-    async def test_a_failing_poll_is_logged_and_polling_goes_on(
+    async def test_a_failing_change_is_logged_and_applied_again(
         self,
         project: ProjectFactory,
         settings: Settings,
@@ -601,16 +823,7 @@ class TestRun:
         clock: FakeClock,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        class FlakySink:
-            def __init__(self) -> None:
-                self.calls = 0
-
-            def apply(self, change: RegistryChange) -> None:
-                self.calls += 1
-                if self.calls == 1:
-                    raise RuntimeError("sink failed")
-
-        sink = FlakySink()
+        sink = FlakySink(failures=1)
         harness = Harness(project, settings, store, clock, sinks=[sink])
         await harness.registry.load_all()
 
@@ -621,5 +834,35 @@ class TestRun:
             harness.project.write_workflow("b", HELLO)
             await asyncio.sleep(3)
 
-        assert "reloading the workflows failed" in caplog.text
-        assert sink.calls == 2
+        assert "workflows/a.yml: reloading failed; trying again" in caplog.text
+        assert sink.calls == 3
+        assert [workflow.id for workflow in sink.applied if workflow] == ["a", "b"]
+
+    async def test_a_failing_poll_is_logged_and_polling_goes_on(
+        self,
+        project: ProjectFactory,
+        settings: Settings,
+        store: AsyncStore,
+        clock: FakeClock,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        scans = 0
+
+        async def flaky(fn: Callable[..., T], /, *args: Any) -> T:
+            nonlocal scans
+            if isinstance(fn, functools.partial):  # the scan of the workflows directory
+                scans += 1
+                if scans == 2:
+                    raise RuntimeError("the thread pool is gone")
+            return fn(*args)
+
+        harness = Harness(project, settings, store, clock, blocking=flaky)
+        await harness.registry.load_all()
+
+        async with running(harness.registry.run):
+            await asyncio.sleep(0.5)
+            harness.project.write_workflow("a", HELLO)
+            await asyncio.sleep(3)
+
+        assert "reloading the workflows failed; trying again" in caplog.text
+        assert [change.workflow_id for change in harness.sink.changes] == ["a"]

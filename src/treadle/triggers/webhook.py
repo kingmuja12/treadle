@@ -1,6 +1,8 @@
 """Webhook triggers: verification, replay protection, rate limits, and payloads.
 
-Section 6 ("Webhooks") defines the order of checks and the responses.
+A delivery passes its checks in order: the hook exists, Treadle isn't draining, and the
+secret is set (the precheck); the body fits; then the signature verifies, the rate limit
+allows it, and a JSON body parses (`handle`). Each failed check has its own response.
 """
 
 from __future__ import annotations
@@ -104,7 +106,7 @@ def delivery_digest(trigger: WebhookTrigger, message: bytes) -> str:
 def webhook_payload(
     trigger: WebhookTrigger, request: HookRequest, *, received_at: datetime
 ) -> JSONObject:
-    """Return the `trigger` payload of a webhook run (section 6).
+    """Return the `trigger` payload of a webhook run.
 
     Headers lose the credentials and the signature or token header. A JSON content type
     (`application/json` or `*/*+json`) gives the parsed body; anything else gives the body
@@ -189,8 +191,8 @@ class WebhookRouter:
                 del self._hooks[name]
         for name, (index, trigger) in triggers.items():
             old = self._hooks.get(name)
-            # Design note: a bucket keeps the rate it was built with, so a hook whose
-            # `rate_limit` changed gets a new bucket; every other edit keeps the old one.
+            # A bucket keeps the rate it was built with, so a hook whose `rate_limit`
+            # changed gets a new bucket; every other edit keeps the old one.
             if old is not None and (old.trigger.key, old.trigger.rate_limit) == (
                 trigger.key,
                 trigger.rate_limit,
@@ -231,8 +233,8 @@ class WebhookRouter:
             return checked
         hook, secret = checked
         trigger = hook.trigger
-        # Design note: settings can change while the route reads the body, so `handle` runs
-        # the precheck again and enforces the hook's own `max_body` itself.
+        # Settings can change while the route reads the body, so `handle` runs the precheck
+        # again and enforces the hook's own `max_body` itself.
         if len(request.body) > trigger.max_body:
             return _error(
                 413, "payload_too_large", f"the body is larger than {trigger.max_body} bytes"
@@ -261,7 +263,7 @@ class WebhookRouter:
             return _error(503, "shutting_down", str(exc), _RETRY_AFTER)
         except WorkflowInvalidError as exc:
             return _error(503, "workflow_invalid", str(exc))
-        except NotFoundError as exc:  # Design note: the workflow went away after the precheck.
+        except NotFoundError as exc:  # the workflow went away after the precheck
             return _error(404, "not_found", str(exc))
         return _accepted(name, submission)
 
@@ -319,8 +321,8 @@ def _secret_problem(secret: str | None) -> str | None:
 
 def _header_bytes(value: str) -> bytes:
     """Return the bytes a sender sent; header values arrive decoded as Latin-1."""
-    # Design note: a value outside Latin-1 can't come from the HTTP layer; UTF-8 keeps the
-    # comparison total instead of raising.
+    # A value outside Latin-1 can't come from the HTTP layer; UTF-8 keeps the comparison
+    # total instead of raising.
     try:
         return value.encode("latin-1")
     except UnicodeEncodeError:

@@ -1,4 +1,4 @@
-"""Watch triggers: polling, debouncing, and degraded roots (section 6, "Watch triggers")."""
+"""Watch triggers: polling, debouncing, and degraded roots."""
 
 from __future__ import annotations
 
@@ -6,10 +6,10 @@ import asyncio
 import functools
 import logging
 import os
-from collections.abc import Sequence
+from collections.abc import Collection, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final
+from typing import Final, TypeAlias
 
 from treadle.clock import BlockingRunner, thread_runner
 from treadle.config import Limits
@@ -23,6 +23,11 @@ from treadle.types import JSONObject, JSONValue
 MAX_PAYLOAD_CHANGES: Final = 1000
 # A batch fires at the latest this long after its first change, so churn can't starve it.
 _MIN_MAX_WAIT: Final = 60.0
+
+# The directory that a root path names, as (st_dev, st_ino). It changes when a drive is
+# mounted or unmounted at the root, when a root symlink is re-pointed, and when the root
+# directory is deleted and created again.
+_Identity: TypeAlias = tuple[int, int]
 
 _log = logging.getLogger(__name__)
 
@@ -49,12 +54,30 @@ def watch_payload(trigger: WatchTrigger, changes: Sequence[Change]) -> JSONObjec
     }
 
 
+@dataclass(frozen=True, slots=True)
+class _Scan:
+    """One good scan of a root: the directory it read, its files, and its unreadable parts.
+
+    `unreadable` holds the subdirectories that couldn't be listed.
+    """
+
+    identity: _Identity
+    snapshot: Snapshot
+    unreadable: frozenset[str]
+
+
 @dataclass(slots=True)
 class _Root:
-    """One watched root. `baseline` is None until a good scan, and again after degrading."""
+    """One watched root. `baseline` is None until a good scan, and again after degrading.
+
+    `identity` is the directory that the baseline describes, and `unreadable` holds the
+    subdirectories that the baseline's scan couldn't list.
+    """
 
     path: Path
     baseline: Snapshot | None = None
+    identity: _Identity | None = None
+    unreadable: frozenset[str] = frozenset()
     seen: bool = False
     error: str | None = None
 
@@ -81,7 +104,9 @@ class WatchService:
     """Supervises one polling task per watch trigger key.
 
     Scans run through `blocking`. A root that disappears degrades the trigger without
-    emitting deletes, and the next good scan takes a silent baseline.
+    emitting deletes, and the next good scan takes a silent baseline. A root that becomes a
+    different directory takes a silent baseline at once, and files under a subdirectory that
+    can't be read report no changes until it can.
     """
 
     def __init__(
@@ -152,18 +177,21 @@ class WatchService:
         await asyncio.gather(*stopped, return_exceptions=True)
 
     async def _watch(self, watcher: _Watcher) -> None:
-        """Poll every `poll_interval`, and fire each batch when its debounce deadline comes."""
+        """Scan every `poll_interval` and at each debounce deadline; fire batches once quiet.
+
+        The scan at a batch's deadline confirms the quiet period, so a file that is still
+        growing between polls holds the batch back. These extra scans happen only while a
+        batch waits, at most once per `debounce`.
+        """
         loop = asyncio.get_running_loop()
-        next_poll = loop.time()
         while True:
-            if loop.time() >= next_poll:
-                try:
-                    changes = await self._poll(watcher)
-                except Exception:
-                    _log.exception("watch %s: the scan failed", watcher.trigger.key)
-                    changes = []
-                next_poll = loop.time() + watcher.trigger.poll_interval
-                watcher.debouncer.add(changes, loop.time())
+            try:
+                changes = await self._poll(watcher)
+            except Exception:
+                _log.exception("watch %s: the scan failed", watcher.trigger.key)
+                changes = []
+            next_poll = loop.time() + watcher.trigger.poll_interval
+            watcher.debouncer.add(changes, loop.time())
             if watcher.debouncer.due(loop.time()):
                 await self._fire(watcher, watcher.debouncer.take())
             wake = next_poll
@@ -175,32 +203,36 @@ class WatchService:
     async def _poll(self, watcher: _Watcher) -> list[Change]:
         """Scan every root and return the changes since its baseline."""
         changes: list[Change] = []
-        skipped: list[str] = []
+        unreadable: list[str] = []
         for root in watcher.roots:
             scan_root = functools.partial(
-                scan,
+                _scan_root,
                 root.path,
                 recursive=watcher.trigger.recursive,
                 matcher=watcher.matcher,
                 max_entries=self._limits.watch_max_entries,
-                skipped=skipped,
             )
             try:
-                snapshot = await self._blocking(scan_root)
+                scanned = await self._blocking(scan_root)
             except (RootUnavailable, TooManyEntries) as exc:
                 _degrade(watcher, root, f"degraded: {exc}")
+                continue
+            if scanned is None:
+                _log.debug("watch %s: %s changed during the scan", watcher.trigger.key, root.path)
                 continue
             if root.error is not None:
                 _log.info("watch %s: %s is available again", watcher.trigger.key, root.path)
                 root.error = None
-            changes.extend(_changes(watcher, root, snapshot))
-        # Design note: "one warning per trigger" means once per watcher, not once per poll.
-        if skipped and not watcher.warned_unreadable:
+            unreadable.extend(sorted(scanned.unreadable))
+            changes.extend(_changes(watcher, root, scanned))
+        # Unreadable directories are logged once per watcher, not on every poll: they tend
+        # to stay unreadable, and their files report no changes meanwhile.
+        if unreadable and not watcher.warned_unreadable:
             watcher.warned_unreadable = True
             _log.warning(
                 "watch %s: skipping unreadable directories, such as %s",
                 watcher.trigger.key,
-                skipped[0],
+                unreadable[0],
             )
         return changes
 
@@ -236,31 +268,100 @@ class WatchService:
         )
 
 
-def _changes(watcher: _Watcher, root: _Root, snapshot: Snapshot) -> list[Change]:
+def _changes(watcher: _Watcher, root: _Root, scanned: _Scan) -> list[Change]:
     """Diff a good scan against the root's baseline, then make it the new baseline.
 
     A root without a baseline reports nothing, except that `initial_scan` reports every file
-    as created on the root's first good scan.
+    as created on the root's first good scan. A root that is now a different directory, such
+    as the empty mount point that an unmounted drive leaves behind, takes a new baseline
+    silently too. Files under a subdirectory that can't be listed keep their baseline state.
     """
-    baseline, root.baseline = root.baseline, snapshot
+    baseline, snapshot = root.baseline, scanned.snapshot
+    replaced = baseline is not None and scanned.identity != root.identity
+    if baseline is not None and not replaced:
+        snapshot = _keep_unreadable(baseline, snapshot, scanned.unreadable)
+        baseline = _admit_readable(baseline, snapshot, root.unreadable - scanned.unreadable)
+    root.baseline, root.identity, root.unreadable = snapshot, scanned.identity, scanned.unreadable
+    if replaced:
+        _log.warning(
+            "watch %s: %s is a different directory now; taking a new baseline",
+            watcher.trigger.key,
+            root.path,
+        )
+        return []
     if baseline is not None:
         return diff(baseline, snapshot, root.path)
-    # Design note: `initial_scan` applies to a root's first good scan, even when the root
-    # was missing at first. A root that comes back after degrading gets a silent baseline.
+    # `initial_scan` applies to a root's first good scan, even when the root was missing at
+    # first. A root that comes back after degrading gets a silent baseline.
     first, root.seen = not root.seen, True
     if first and watcher.trigger.initial_scan:
         return diff({}, snapshot, root.path)
     return []
 
 
+def _keep_unreadable(
+    baseline: Snapshot, snapshot: Snapshot, unreadable: Collection[str]
+) -> Snapshot:
+    """Add the baseline's files under directories that the scan couldn't list, unchanged."""
+    if not unreadable:
+        return snapshot
+    return snapshot | _inside(baseline, unreadable)
+
+
+def _admit_readable(baseline: Snapshot, snapshot: Snapshot, readable: Collection[str]) -> Snapshot:
+    """Add the files of readable-again directories that the baseline holds no files for.
+
+    The baseline never saw those files, so they can't be told apart from files that were
+    there all along: like a root that comes back, such a directory joins without events.
+    """
+    unknown = [directory for directory in readable if not _inside(baseline, [directory])]
+    if not unknown:
+        return baseline
+    return baseline | _inside(snapshot, unknown)
+
+
+def _inside(snapshot: Snapshot, directories: Iterable[str]) -> Snapshot:
+    """Return the entries of `snapshot` that are under any of `directories`."""
+    prefixes = tuple(directory + os.sep for directory in directories)
+    return {path: state for path, state in snapshot.items() if path.startswith(prefixes)}
+
+
 def _degrade(watcher: _Watcher, root: _Root, error: str) -> None:
     """Drop a root's baseline without events, and log when the problem first appears."""
-    # Design note: TooManyEntries degrades the trigger like a missing root, so the scan after
-    # it takes a silent baseline too.
+    # TooManyEntries degrades the trigger like a missing root, so the scan after it takes a
+    # silent baseline too.
     if root.error != error:
         _log.warning("watch %s: %s", watcher.trigger.key, error)
     root.error = error
-    root.baseline = None
+    root.baseline, root.identity, root.unreadable = None, None, frozenset()
+
+
+def _scan_root(
+    path: Path, *, recursive: bool, matcher: GlobMatcher, max_entries: int
+) -> _Scan | None:
+    """Scan a root, or return None when it became a different directory during the scan.
+
+    The root's identity is read before and after the scan, in the same blocking call, so a
+    scan that overlaps an unmount or a re-pointed symlink is never diffed. Raises
+    RootUnavailable or TooManyEntries.
+    """
+    before = _identity(path)
+    unreadable: list[str] = []
+    snapshot = scan(
+        path, recursive=recursive, matcher=matcher, max_entries=max_entries, skipped=unreadable
+    )
+    if before is None or _identity(path) != before:
+        return None
+    return _Scan(before, snapshot, frozenset(unreadable))
+
+
+def _identity(path: Path) -> _Identity | None:
+    """Return the directory that `path` names, following a symlink, or None on an error."""
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
 
 
 def _watches_of(workflow: Workflow) -> dict[str, tuple[int, WatchTrigger]]:

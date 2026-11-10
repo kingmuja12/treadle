@@ -59,6 +59,42 @@ def channel(store: AsyncStore, clock: FakeClock) -> Channel:
     return Channel(store, clock)
 
 
+class FailingWrites:
+    """A store whose chosen writes fail, counting from 1, and every write while `broken`."""
+
+    def __init__(self, inner: AsyncStore, *failing: int) -> None:
+        self.inner = inner
+        self.failing = set(failing)
+        self.broken = False
+        self.writes = 0
+
+    async def write(self, fn: Callable[[Repository], T], **kwargs: Any) -> T:
+        self.writes += 1
+        if self.broken or self.writes in self.failing:
+            raise StoreError("database is locked")
+        return await self.inner.write(fn, **kwargs)
+
+    async def read(self, fn: Callable[[Repository], T]) -> T:
+        return await self.inner.read(fn)
+
+
+class SlowRunControl(FakeRunControl):
+    """A run control that creates the run for workflow `slow`, then waits for `release`."""
+
+    def __init__(self, *, slow: str) -> None:
+        super().__init__()
+        self.slow = slow
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def submit(self, request: RunRequest) -> Submission:
+        submission = await super().submit(request)
+        if request.workflow_id == self.slow:
+            self.entered.set()
+            await self.release.wait()
+        return submission
+
+
 def poller_for(
     store: Any, clock: FakeClock, control: FakeRunControl, *, accept_runs: bool = True
 ) -> ControlPoller:
@@ -352,6 +388,69 @@ class TestPolling:
         assert "handling control requests failed; trying again" in caplog.text
         assert (await channel.result(request_id) or {}).get("run_id") == 5
 
+    async def test_a_failed_result_write_strands_no_other_request(
+        self,
+        store: AsyncStore,
+        clock: FakeClock,
+        channel: Channel,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        control = FakeRunControl()
+        poller = poller_for(FailingWrites(store, 2), clock, control)
+        ids = [await channel.send("run", {"workflow": name}) for name in ("a", "b", "c")]
+
+        assert await poller.process_once() == 3
+        assert [await channel.result(request_id) for request_id in ids] == [
+            None,
+            {"run_id": 2, "outcome": "queued"},
+            {"run_id": 3, "outcome": "queued"},
+        ]
+        assert f"control request {ids[0]}: storing the result failed" in caplog.text
+
+        assert await poller.process_once() == 0
+        assert await channel.result(ids[0]) == {"run_id": 1, "outcome": "queued"}
+        assert [request.workflow_id for request in control.requests] == ["a", "b", "c"]
+
+    async def test_a_kept_result_is_stored_before_new_requests_are_claimed(
+        self, store: AsyncStore, clock: FakeClock, channel: Channel
+    ) -> None:
+        control = FakeRunControl()
+        flaky = FailingWrites(store, 2)
+        poller = poller_for(flaky, clock, control)
+        first = await channel.send("run", {"workflow": "a"})
+        await poller.process_once()
+        second = await channel.send("run", {"workflow": "b"})
+
+        flaky.broken = True
+        with pytest.raises(StoreError):
+            await poller.process_once()
+        assert [request.workflow_id for request in control.requests] == ["a"]
+        flaky.broken = False
+
+        assert await poller.process_once() == 1
+        assert (await channel.result(first) or {}).get("run_id") == 1
+        assert (await channel.result(second) or {}).get("run_id") == 2
+
+    async def test_a_cancelled_poller_still_stores_the_result_of_the_request_in_hand(
+        self, store: AsyncStore, clock: FakeClock, channel: Channel
+    ) -> None:
+        control = SlowRunControl(slow="b")
+        poller = poller_for(store, clock, control)
+        ids = [await channel.send("run", {"workflow": name}) for name in ("a", "b", "c")]
+
+        task = asyncio.create_task(poller.process_once())
+        await control.entered.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        control.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert await channel.result(ids[1]) == {"run_id": 2, "outcome": "queued"}
+        assert await channel.result(ids[2]) is None
+        assert await poller_for(store, clock, FakeRunControl()).process_once() == 1
+        assert await channel.result(ids[2]) is not None
+
     async def test_the_poll_interval_is_configurable(
         self, store: AsyncStore, clock: FakeClock, channel: Channel
     ) -> None:
@@ -369,5 +468,5 @@ class TestPolling:
             assert await channel.result(request_id) is not None
 
 
-def test_the_expiry_matches_the_design() -> None:
+def test_a_request_expires_after_a_minute() -> None:
     assert CONTROL_EXPIRY == 60.0

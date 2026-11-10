@@ -18,7 +18,7 @@ NOW = datetime(2026, 11, 9, 12, 30, tzinfo=UTC)
 TEN, ELEVEN, NOON = (datetime(2026, 11, 9, hour, tzinfo=UTC) for hour in (10, 11, 12))
 
 
-def test_the_constants_match_the_design() -> None:
+def test_the_misfire_grace_nap_and_catch_up_cap() -> None:
     assert (MISFIRE_GRACE, MAX_NAP, CATCH_UP_CAP) == (60.0, 30.0, 100)
 
 

@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from tests.unit.triggers.helpers import write
 
+from treadle import fswatch
 from treadle.fswatch import (
     Change,
     Debouncer,
@@ -144,6 +145,38 @@ class TestScan:
     def test_skipped_directories_are_optional_to_collect(self, tree: Path, locked: Path) -> None:
         snapshot = scan(tree, recursive=True, matcher=EVERYTHING, max_entries=100)
         assert str(locked / "c.pdf") not in snapshot
+
+    def test_a_subdirectory_that_fails_to_list_is_skipped_and_reported(
+        self, tree: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real_list_dir = fswatch._list_dir
+
+        def failing(directory: str) -> list[os.DirEntry[str]]:
+            if directory == str(tree / "sub"):
+                raise OSError(5, "Input/output error")
+            return real_list_dir(directory)
+
+        monkeypatch.setattr(fswatch, "_list_dir", failing)
+        skipped: list[str] = []
+        snapshot = scan(tree, recursive=True, matcher=EVERYTHING, max_entries=100, skipped=skipped)
+        assert names(snapshot, tree) == [".git/e.pdf", ".hidden", "a.pdf", "b.txt"]
+        assert skipped == [str(tree / "sub")]
+
+    @pytest.mark.parametrize("error", [FileNotFoundError, NotADirectoryError])
+    def test_a_subdirectory_that_vanished_isnt_reported(
+        self, tree: Path, monkeypatch: pytest.MonkeyPatch, error: type[OSError]
+    ) -> None:
+        real_list_dir = fswatch._list_dir
+
+        def vanished(directory: str) -> list[os.DirEntry[str]]:
+            if directory == str(tree / "sub"):
+                raise error(2, "gone")
+            return real_list_dir(directory)
+
+        monkeypatch.setattr(fswatch, "_list_dir", vanished)
+        skipped: list[str] = []
+        scan(tree, recursive=True, matcher=EVERYTHING, max_entries=100, skipped=skipped)
+        assert skipped == []
 
     def test_entries_that_vanish_during_the_scan_are_skipped(
         self, tree: Path, monkeypatch: pytest.MonkeyPatch

@@ -1,7 +1,7 @@
 """The JSON shapes that the API, the CLI `--json` output, and the dashboard script share.
 
-Section 8 ("JSON shapes") defines each shape. Times are `iso_utc` strings, and missing values
-are null.
+`docs/architecture.md` ("JSON shapes") documents each shape. Times are `iso_utc` strings, and
+missing values are null.
 """
 
 from __future__ import annotations
@@ -10,8 +10,18 @@ from collections.abc import Sequence
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
+from typing import Final
 
 from treadle.clock import iso_utc
+from treadle.errors import (
+    BusyError,
+    ConflictError,
+    InputError,
+    NotFoundError,
+    ShuttingDownError,
+    TreadleError,
+    WorkflowInvalidError,
+)
 from treadle.models import (
     AttemptRecord,
     InputSpec,
@@ -24,6 +34,18 @@ from treadle.models import (
     WorkflowEntry,
 )
 from treadle.types import JSONObject, JSONValue
+
+# The HTTP status and error code of each refusal, most specific class first, because
+# ShuttingDownError is a BusyError. The API, the dashboard, and the control channel that CLI
+# processes use all answer from this one table, so a refusal gets the same code everywhere.
+_REFUSALS: Final[tuple[tuple[type[TreadleError], int, str], ...]] = (
+    (NotFoundError, 404, "not_found"),
+    (WorkflowInvalidError, 409, "workflow_invalid"),
+    (InputError, 422, "invalid_inputs"),
+    (ConflictError, 409, "conflict"),
+    (ShuttingDownError, 503, "shutting_down"),
+    (BusyError, 503, "busy"),
+)
 
 
 def run_json(run: RunRecord) -> JSONObject:
@@ -107,8 +129,8 @@ def workflow_json(
     last_run: RunRecord | None,
 ) -> JSONObject:
     """Return the Workflow shape. `path` is relative to `project_dir`."""
-    # Design note: an entry without a current version (its file never loaded) has no name,
-    # description, digest, or concurrency, so those values are null.
+    # An entry without a current version (its file never loaded) has no name, description,
+    # digest, or concurrency, so those values are null.
     workflow = entry.current
     path = _display_path(entry.path, project_dir)
     issues: list[JSONValue] = [issue.to_json(path) for issue in entry.issues]
@@ -155,6 +177,11 @@ def workflow_detail_json(
 def error_json(code: str, message: str, details: JSONValue = None) -> JSONObject:
     """Return the Error shape, `{"error": {"code", "message", "details"}}`."""
     return {"error": {"code": code, "message": message, "details": details}}
+
+
+def _error_status(exc: TreadleError) -> tuple[int, str] | None:
+    """Return the HTTP status and error code for a refused request, or None when it's internal."""
+    return next(((status, code) for kind, status, code in _REFUSALS if isinstance(exc, kind)), None)
 
 
 def _attempt_json(attempt: AttemptRecord) -> JSONObject:
