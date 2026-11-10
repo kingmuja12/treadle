@@ -15,8 +15,7 @@ from typing import ClassVar, Final, Literal, TypeAlias, cast
 
 from treadle.errors import PathNotAllowedError, StepConfigError, StepError
 from treadle.schema import Bool, Field, Obj, Str
-from treadle.steps.base import StepResult, StepRuntime, check_os_text
-from treadle.steps.shell import expand_home
+from treadle.steps.base import StepResult, StepRuntime, check_os_text, expand_home
 from treadle.types import Issue, JSONValue, Severity, YamlPath
 
 _Params: TypeAlias = Mapping[str, JSONValue]

@@ -11,7 +11,7 @@ from typing import ClassVar, Final, Literal, cast
 from treadle.errors import StepConfigError, StepError
 from treadle.models import ShellSpec
 from treadle.schema import AnyOf, Bool, CheckContext, Field, Int, ListOf, Obj, Str
-from treadle.steps.base import StepResult, StepRuntime, check_os_text
+from treadle.steps.base import StepResult, StepRuntime, check_os_text, expand_home
 from treadle.steps.procs import run_process
 from treadle.types import Issue, JSONValue, Severity, YamlPath
 from treadle.units import format_size
@@ -172,24 +172,6 @@ def parse_output_file(text: str) -> dict[str, str]:
             value = "\n".join(body)
         outputs[key] = value
     return outputs
-
-
-def expand_home(raw: str | Path, key: str) -> Path:
-    """Return `raw`, the value of the path parameter `key`, with a leading "~" expanded.
-
-    The `file` step expands its paths the same way. Raises StepConfigError, naming `key` and
-    the path, for a "~" or "~user" whose home directory isn't known, such as a user that
-    doesn't exist on this machine.
-    """
-    path = Path(raw)
-    try:
-        return path.expanduser()
-    except RuntimeError:
-        message = (
-            f"can't expand '{path.parts[0]}' in {key} '{raw}' to a home directory; "
-            "check the user name after '~', or write the full path"
-        )
-        raise StepConfigError(message) from None
 
 
 def _write_script(params: Mapping[str, JSONValue], rt: StepRuntime) -> Path | None:

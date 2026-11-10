@@ -150,3 +150,21 @@ def check_os_text(text: str, what: str) -> None:
         else:
             return
     raise StepConfigError(f"{what} holds {problem}, which the operating system doesn't accept")
+
+
+def expand_home(raw: str | Path, key: str) -> Path:
+    """Return `raw`, the value of the path parameter `key`, with a leading "~" expanded.
+
+    The shell and file steps expand their path parameters this way. Raises StepConfigError,
+    naming `key` and the path, for a "~" or "~user" whose home directory isn't known, such as
+    a user that doesn't exist on this machine.
+    """
+    path = Path(raw)
+    try:
+        return path.expanduser()
+    except RuntimeError:
+        message = (
+            f"can't expand '{path.parts[0]}' in {key} '{raw}' to a home directory; "
+            "check the user name after '~', or write the full path"
+        )
+        raise StepConfigError(message) from None
