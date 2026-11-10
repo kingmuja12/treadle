@@ -675,10 +675,13 @@ class Repository:
 
     def latest_run_id(self, workflow_id: str | None = None) -> int | None:
         """Return the newest run ID, of one workflow when `workflow_id` is set, or None."""
+        # A named parameter, not ?1: early Python 3.12 releases warn that a numbered
+        # placeholder is a named one when the parameters come as a sequence.
         return cast(
             "int | None",
             self._scalar(
-                "SELECT MAX(id) FROM runs WHERE ?1 IS NULL OR workflow_id = ?1", (workflow_id,)
+                "SELECT MAX(id) FROM runs WHERE :workflow_id IS NULL OR workflow_id = :workflow_id",
+                {"workflow_id": workflow_id},
             ),
         )
 
