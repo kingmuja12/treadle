@@ -109,8 +109,13 @@ async def test_the_scheduler_fires_a_slot_on_the_wall_clock(threaded_store: Asyn
     scheduler = Scheduler(store=threaded_store, submitter=submitter, clock=clock)
     scheduler.update("wf", workflow)
 
+    async def slot_stored() -> bool:
+        return bool(await scheduled_slots(threaded_store))
+
     async with running(scheduler.run):
-        await eventually(lambda: bool(submitter.requests), within=3.0)
+        # The submitter records a request before the writer thread commits its run, so a
+        # read right after the request appears can miss the run. Wait for the run itself.
+        await eventually(slot_stored, within=3.0)
 
     assert await scheduled_slots(threaded_store) == [datetime(2026, 11, 9, 12, tzinfo=UTC)]
     assert submitter.requests[0].trigger["catch_up"] is False

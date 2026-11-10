@@ -143,6 +143,30 @@ async def test_a_content_length_over_the_hook_limit_is_413_before_reading(
     assert hooks.requests == []
 
 
+async def test_a_content_length_over_the_webhook_limit_is_413_before_the_precheck(
+    make_web: MakeWeb, settings: Settings
+) -> None:
+    hooks = FakeWebhookHandler(precheck=8192)
+    limits = Limits(webhook_body_bytes=8192)
+    web = make_web(settings=dataclasses.replace(settings, limits=limits), hooks=hooks)
+    body = Chunks(b"x" * 8193)
+
+    response = await web.client.post(
+        "/hooks/blog-push", content=body, headers={"Content-Length": "8193"}
+    )
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "error": {
+            "code": "payload_too_large",
+            "message": "the request body is larger than 8.0 KiB",
+            "details": None,
+        }
+    }
+    assert hooks.prechecks == []
+    assert not body.started
+
+
 async def test_a_streamed_body_over_the_hook_limit_is_413(
     hooked: Web, hooks: FakeWebhookHandler
 ) -> None:

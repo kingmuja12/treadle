@@ -11,11 +11,12 @@ from treadle.web.security import WebContext, _media_type, read_body_capped
 
 
 def hook_routes(ctx: WebContext) -> list[BaseRoute]:
-    """Return the webhook route, with `max_body_size` set to `limits.webhook_body_bytes`.
+    """Return the webhook route.
 
-    The route runs the checks that come before the signature: the handler's precheck, then
-    the hook's body limit, by `Content-Length` before reading and by size while streaming.
-    The handler verifies and submits what's left.
+    The application's BodyLimitMiddleware limits every webhook body to
+    `limits.webhook_body_bytes`. The route runs the checks that come before the signature:
+    the handler's precheck, then the hook's body limit, by `Content-Length` before reading
+    and by size while streaming. The handler verifies and submits what's left.
     """
 
     async def receive_hook(request: Request) -> Response:
@@ -26,8 +27,7 @@ def hook_routes(ctx: WebContext) -> list[BaseRoute]:
         body = await read_body_capped(request, checked)
         return _response(await ctx.hooks.handle(name, _hook_request(request, body)))
 
-    limit = ctx.settings.limits.webhook_body_bytes
-    return [Route("/hooks/{name}", receive_hook, methods=["POST"], max_body_size=limit)]
+    return [Route("/hooks/{name}", receive_hook, methods=["POST"])]
 
 
 def _hook_request(request: Request, body: bytes) -> HookRequest:

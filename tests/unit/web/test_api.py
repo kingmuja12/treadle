@@ -348,12 +348,13 @@ async def test_a_streamed_body_over_the_api_limit_is_413_json(web: Web) -> None:
     assert web.runs.requests == []
 
 
-async def test_a_declared_body_over_the_api_limit_is_413(web: Web) -> None:
+async def test_a_declared_body_over_the_api_limit_is_413_json(web: Web) -> None:
     response = await web.client.post(
         "/api/v1/workflows/deploy/runs", content=b" " * (65 * 1024), headers=JSON
     )
 
     assert response.status_code == 413
+    assert response.json() == error("payload_too_large", "the request body is larger than 64.0 KiB")
     assert web.runs.requests == []
 
 

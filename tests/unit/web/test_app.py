@@ -11,10 +11,12 @@ from tests.support.fakes import FakeRunControl, FakeWebhookHandler, MemoryRunRea
 from tests.support.project import ProjectFactory
 from tests.unit.web.helpers import FORM, TOKEN, MakeWeb, Web
 
+from treadle.config import Limits
 from treadle.models import HookResponse
 from treadle.web.app import create_app
 from treadle.web.security import (
     AuthMiddleware,
+    BodyLimitMiddleware,
     HostCheckMiddleware,
     OriginGuardMiddleware,
     RequestLogMiddleware,
@@ -32,6 +34,9 @@ SECURITY_HEADERS = {
     "cross-origin-opener-policy": "same-origin",
     "cross-origin-resource-policy": "same-origin",
 }
+# One byte over the default limits; httpx declares each body's length in Content-Length.
+OVER_API_LIMIT = b"x" * (Limits().api_body_bytes + 1)
+OVER_WEBHOOK_LIMIT = b"x" * (Limits().webhook_body_bytes + 1)
 Call = Callable[[httpx.AsyncClient], Awaitable[httpx.Response]]
 # (label, whether authentication is on, expected status, request)
 REQUESTS: list[tuple[str, bool, int, Call]] = [
@@ -50,6 +55,24 @@ REQUESTS: list[tuple[str, bool, int, Call]] = [
         False,
         413,
         lambda http: http.post("/hooks/x", content=b"x" * 2048, headers={"Content-Length": "2048"}),
+    ),
+    (
+        "API declared 413",
+        False,
+        413,
+        lambda http: http.post("/api/v1/workflows/wf/runs", content=OVER_API_LIMIT),
+    ),
+    (
+        "hook declared 413",
+        False,
+        413,
+        lambda http: http.post("/hooks/x", content=OVER_WEBHOOK_LIMIT),
+    ),
+    (
+        "form declared 413",
+        False,
+        413,
+        lambda http: http.post("/runs/1/cancel", content=OVER_API_LIMIT, headers=FORM),
     ),
     ("login page", True, 200, lambda http: http.get("/login")),
     ("login redirect", True, 303, lambda http: http.get("/runs")),
@@ -193,18 +216,25 @@ async def test_requests_are_logged(web: Web, caplog: pytest.LogCaptureFixture) -
     assert record.getMessage().startswith("GET /api/v1/health 200 ")
 
 
-async def test_create_app_installs_the_middleware_in_order_and_the_body_limit(web: Web) -> None:
+async def test_create_app_installs_the_middleware_in_order_and_the_body_limits(web: Web) -> None:
     app = create_app(web.ctx)
+    limits = web.ctx.settings.limits
 
     assert isinstance(app, Starlette)
     assert [middleware.cls for middleware in app.user_middleware] == [
         RequestLogMiddleware,
         SecurityHeadersMiddleware,
+        BodyLimitMiddleware,
         HostCheckMiddleware,
         OriginGuardMiddleware,
         AuthMiddleware,
     ]
-    assert app.max_body_size == web.ctx.settings.limits.api_body_bytes
+    assert app.user_middleware[2].kwargs == {
+        "limit": limits.api_body_bytes,
+        "hook_limit": limits.webhook_body_bytes,
+    }
+    # Starlette's own limit would answer a declared oversized body from outside the middleware.
+    assert app.max_body_size is None
     paths = {getattr(route, "path", None) for route in app.routes}
     assert {"/api/v1/health", "/hooks/{name}", "/", "/static/{name}", "/login"} <= paths
 

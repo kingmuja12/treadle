@@ -172,8 +172,8 @@ async def read_body_capped(request: Request, limit: int) -> bytes:
 
     A `Content-Length` over the limit fails before anything is read.
     """
-    declared = request.headers.get("content-length", "")
-    if declared.isascii() and declared.isdigit() and int(declared) > limit:
+    declared = _declared_length(request.headers)
+    if declared is not None and declared > limit:
         raise _too_large(limit)
     chunks: list[bytes] = []
     size = 0
@@ -185,7 +185,7 @@ async def read_body_capped(request: Request, limit: int) -> bytes:
                     raise _too_large(limit)
                 chunks.append(chunk)
     except HTTPException:
-        # Only a body limit raises here: the check above, or Starlette's own limit, which is
+        # Only a body limit raises here: the check above, or BodyLimitMiddleware's, which is
         # never below `limit` and may stop the stream first. Both get this limit's message.
         raise _too_large(limit) from None
     return b"".join(chunks)
@@ -231,6 +231,47 @@ class SecurityHeadersMiddleware:
             await send(message)
 
         await self._app(scope, receive, send_with_headers)
+
+
+class BodyLimitMiddleware:
+    """Limits request bodies to `hook_limit` bytes under /hooks/ and to `limit` bytes elsewhere.
+
+    A request that declares a larger `Content-Length` gets 413 before anything reads its
+    body: the JSON error shape on API and hook paths, plain text elsewhere. A body that
+    streams past the limit makes `receive` raise HTTPException(413), which the route's error
+    handler answers.
+    """
+
+    def __init__(self, app: ASGIApp, *, limit: int, hook_limit: int) -> None:
+        self._app = app
+        self._limit = limit
+        self._hook_limit = hook_limit
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Refuse a declared body over the limit, or pass the request on and count its body."""
+        if scope["type"] != "http":
+            await self._app(scope, receive, send)
+            return
+        path: str = scope["path"]
+        limit = self._hook_limit if path.startswith("/hooks/") else self._limit
+        declared = _declared_length(Headers(scope=scope))
+        if declared is not None and declared > limit:
+            error = _too_large(limit)
+            refusal = _denied(path, error.status_code, "payload_too_large", error.detail)
+            await refusal(scope, receive, send)
+            return
+        received = 0
+
+        async def receive_within_limit() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > limit:
+                    raise _too_large(limit)
+            return message
+
+        await self._app(scope, receive_within_limit, send)
 
 
 class HostCheckMiddleware:
@@ -424,6 +465,12 @@ def _origin_parts(url: str) -> tuple[str, str, int] | None:
 def _bearer_matches(headers: Headers, token: str) -> bool:
     scheme, _, credentials = headers.get("authorization", "").partition(" ")
     return scheme.lower() == "bearer" and constant_time_equals(credentials.strip(), token)
+
+
+def _declared_length(headers: Headers) -> int | None:
+    """Return the `Content-Length` value, or None when it's missing or not ASCII digits."""
+    declared = headers.get("content-length", "")
+    return int(declared) if declared.isascii() and declared.isdigit() else None
 
 
 def _too_large(limit: int) -> HTTPException:

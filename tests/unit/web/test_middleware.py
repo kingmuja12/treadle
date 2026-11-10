@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 import pytest
+from starlette.exceptions import HTTPException
+from starlette.requests import Request
 from starlette.responses import PlainTextResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from tests.support.clock import FakeClock
@@ -12,6 +14,7 @@ from tests.support.clock import FakeClock
 from treadle.web.security import (
     SESSION_COOKIE,
     AuthMiddleware,
+    BodyLimitMiddleware,
     HostCheckMiddleware,
     OriginGuardMiddleware,
     RequestLogMiddleware,
@@ -44,6 +47,23 @@ async def broken_app(scope: Scope, receive: Receive, send: Send) -> None:
     raise RuntimeError("boom")
 
 
+async def read_body(scope: Scope, receive: Receive, send: Send) -> None:
+    """The inner application that reads the body: answers with its size, or with the 413."""
+    try:
+        body = await Request(scope, receive).body()
+    except HTTPException as exc:
+        response = PlainTextResponse(exc.detail, exc.status_code)
+    else:
+        response = PlainTextResponse(str(len(body)))
+    await response(scope, receive, send)
+
+
+async def stream(*chunks: bytes) -> AsyncIterator[bytes]:
+    """A request body that httpx sends in chunks, without a Content-Length."""
+    for chunk in chunks:
+        yield chunk
+
+
 def client(app: ASGIApp, *, base_url: str = BASE_URL) -> httpx.AsyncClient:
     return httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url=base_url)
 
@@ -52,8 +72,13 @@ def auth(clock: FakeClock) -> ASGIApp:
     return AuthMiddleware(ok_app, token=TOKEN, secret_key=KEY, ttl=3600.0, clock=clock)
 
 
+def body_limit(app: ASGIApp) -> ASGIApp:
+    return BodyLimitMiddleware(app, limit=10, hook_limit=20)
+
+
 MIDDLEWARE: list[Callable[[ASGIApp], ASGIApp]] = [
     SecurityHeadersMiddleware,
+    body_limit,
     lambda app: HostCheckMiddleware(app, allowed_hosts=["127.0.0.1"]),
     OriginGuardMiddleware,
     lambda app: AuthMiddleware(app, token=TOKEN, secret_key=KEY, ttl=1.0, clock=FakeClock()),
@@ -96,6 +121,73 @@ async def test_static_files_may_be_cached() -> None:
 
     assert response.headers["cache-control"] == "public, max-age=3600"
     assert response.headers["x-frame-options"] == "DENY"
+
+
+@pytest.mark.parametrize(
+    ("path", "size", "limit"), [("/api/v1/workflows/wf/runs", 11, "10 B"), ("/hooks/x", 21, "20 B")]
+)
+async def test_body_limit_refuses_a_declared_body_over_the_limit_before_the_app_runs(
+    path: str, size: int, limit: str
+) -> None:
+    async with client(body_limit(broken_app)) as http:
+        response = await http.post(path, content=b"x" * size)
+
+    assert response.status_code == 413
+    assert response.json() == {
+        "error": {
+            "code": "payload_too_large",
+            "message": f"the request body is larger than {limit}",
+            "details": None,
+        }
+    }
+
+
+async def test_body_limit_refuses_a_dashboard_body_in_plain_text() -> None:
+    async with client(body_limit(broken_app)) as http:
+        response = await http.post("/runs/1/cancel", content=b"x" * 11)
+
+    assert response.status_code == 413
+    assert response.text == "the request body is larger than 10 B"
+
+
+@pytest.mark.parametrize(
+    ("path", "size", "status"),
+    [
+        ("/api/v1/runs/1/cancel", 10, 200),
+        ("/api/v1/runs/1/cancel", 15, 413),
+        ("/hooks/x", 20, 200),
+        ("/hookshot", 15, 413),
+    ],
+)
+async def test_body_limit_takes_the_hook_limit_under_hooks_only(
+    path: str, size: int, status: int
+) -> None:
+    async with client(body_limit(ok_app)) as http:
+        response = await http.post(path, content=b"x" * size)
+
+    assert response.status_code == status
+
+
+@pytest.mark.parametrize(
+    ("path", "chunks", "declared", "answer"),
+    [
+        ("/api/v1/x", (6, 4), None, (200, "10")),
+        ("/api/v1/x", (6, 5), None, (413, "the request body is larger than 10 B")),
+        ("/api/v1/x", (6, 5), "5", (413, "the request body is larger than 10 B")),
+        ("/hooks/x", (15, 5), None, (200, "20")),
+        ("/hooks/x", (15, 6), None, (413, "the request body is larger than 20 B")),
+    ],
+    ids=["at the limit", "past the limit", "length lies", "hook at its limit", "hook past it"],
+)
+async def test_body_limit_counts_a_streamed_body(
+    path: str, chunks: tuple[int, ...], declared: str | None, answer: tuple[int, str]
+) -> None:
+    headers = {} if declared is None else {"Content-Length": declared}
+    body = stream(*(b"x" * size for size in chunks))
+    async with client(body_limit(read_body)) as http:
+        response = await http.post(path, content=body, headers=headers)
+
+    assert (response.status_code, response.text) == answer
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1:8765", "localhost:8765", "[::1]:8765", "treadle.lan"])

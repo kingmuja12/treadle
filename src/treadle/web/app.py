@@ -21,6 +21,7 @@ from treadle.web.hooks import hook_routes
 # `from treadle.web.app import WebContext` works.
 from treadle.web.security import (
     AuthMiddleware,
+    BodyLimitMiddleware,
     HostCheckMiddleware,
     OriginGuardMiddleware,
     RequestLogMiddleware,
@@ -49,9 +50,10 @@ _log = logging.getLogger("treadle.web")
 def create_app(ctx: WebContext) -> Starlette:
     """Build the Starlette application.
 
-    It has every route and `max_body_size=limits.api_body_bytes`, and its middleware runs in
-    this order: the request log, the security headers, the Host check, the origin guard, and
-    authentication. It never runs lifespan handlers.
+    It has every route, and its middleware runs in this order: the request log, the security
+    headers, the body limits (`limits.webhook_body_bytes` for webhooks, `limits.api_body_bytes`
+    for everything else), the Host check, the origin guard, and authentication. It never runs
+    lifespan handlers.
     """
     templates = make_templates()
     pages = _Pages(ctx, templates)
@@ -67,9 +69,13 @@ def create_app(ctx: WebContext) -> Starlette:
         page.headers.update(error.headers or {})
         return page
 
+    limits = ctx.settings.limits
     middleware = [
         Middleware(RequestLogMiddleware),
         Middleware(SecurityHeadersMiddleware),
+        Middleware(
+            BodyLimitMiddleware, limit=limits.api_body_bytes, hook_limit=limits.webhook_body_bytes
+        ),
         Middleware(HostCheckMiddleware, allowed_hosts=allowed_hosts_for(ctx.settings.server)),
         Middleware(OriginGuardMiddleware),
         Middleware(
@@ -80,9 +86,9 @@ def create_app(ctx: WebContext) -> Starlette:
             clock=ctx.clock,
         ),
     ]
-    # When a declared Content-Length passes the active limit, Starlette answers with its own
-    # plain-text 413 from outside this middleware, so that response alone has no security
-    # headers. A body that grows too large while streaming gets the JSON 413.
+    # The application sets no `max_body_size`: Starlette runs that limit outside this
+    # middleware, and it would replace every answer to a declared oversized body with a
+    # plain-text 413 that has neither the JSON error shape nor the security headers.
     return Starlette(
         routes=[*api_routes(ctx), *hook_routes(ctx), *dashboard_routes(ctx, templates)],
         middleware=middleware,
@@ -91,7 +97,6 @@ def create_app(ctx: WebContext) -> Starlette:
             ClientDisconnect: _client_disconnected,
             Exception: _internal_error,
         },
-        max_body_size=ctx.settings.limits.api_body_bytes,
     )
 
 
