@@ -9,13 +9,29 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  # A newer push to a pull request cancels the pull request's older run. Each commit on main
+  # gets a group of its own, so every commit there keeps its result.
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          python-version: "3.12"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+
   test:
     name: test (${{ matrix.os }}, Python ${{ matrix.python }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -23,22 +39,21 @@ jobs:
         python: ["3.11", "3.12", "3.13", "3.14", "3.15"]
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: ${{ matrix.python }}
           enable-cache: true
       - run: uv sync --locked
-      - run: uv run ruff check
-      - run: uv run ruff format --check
       - run: uv run mypy --python-version ${{ matrix.python }}
       - run: uv run pytest --cov --cov-report=term --cov-report=json
       - run: uv run python scripts/check_coverage.py coverage.json
 
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.12"
           enable-cache: true
@@ -53,10 +68,27 @@ jobs:
           "$treadle" version
           "$treadle" init "$RUNNER_TEMP/project"
           "$treadle" -C "$RUNNER_TEMP/project" validate --strict
+      - name: Smoke-test the daemon, the dashboard, and the static files of the wheel
+        run: |
+          treadle="$RUNNER_TEMP/venv/bin/treadle"
+          log="$RUNNER_TEMP/serve.log"
+          "$treadle" -C "$RUNNER_TEMP/project" serve --port 8765 2> "$log" &
+          pid=$!
+          trap 'kill "$pid" 2> /dev/null || true; cat "$log"' EXIT
+          for _ in $(seq 50); do
+            curl --silent --fail --output /dev/null http://127.0.0.1:8765/api/v1/health && break
+            sleep 0.2
+          done
+          for page in / /workflows/hello /runs /static/treadle.css /static/treadle.js; do
+            curl --silent --show-error --fail --output /dev/null "http://127.0.0.1:8765$page"
+          done
+          kill -TERM "$pid"
+          wait "$pid"
 
   hygiene:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
       - run: python3 scripts/check_hygiene.py
-      - run: python3 scripts/loc.py --max 7500
+      - run: python3 scripts/loc.py

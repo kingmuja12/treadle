@@ -120,7 +120,7 @@ ported.yml:2:1: error[E101]: unknown key 'on' in workflow
 | `$GITHUB_ENV` and `$GITHUB_PATH` | Not supported. Pass values to later steps as outputs, so the data flow shows in the file. |
 | `$GITHUB_EVENT_PATH` | `$TREADLE_EVENT_PATH` |
 | `$GITHUB_RUN_ID`, `$GITHUB_RUN_ATTEMPT`, `$GITHUB_WORKFLOW` | `$TREADLE_RUN_ID`, `$TREADLE_RUN_ATTEMPT`, `$TREADLE_WORKFLOW`, and more. See [Step environment](workflow-syntax.md#step-environment). |
-| `::add-mask::VALUE` | The same. |
+| `::add-mask::VALUE` | The same, for up to 1,000 values per run. |
 | Other workflow commands, such as `::error::` and `::group::` | Not supported. Treadle logs them as ordinary lines. |
 
 ## Expressions
@@ -159,7 +159,7 @@ reference, see [Expressions](expressions.md).
   steps as passing. GitHub skips a job whose needed job was skipped. To run a step only when
   an earlier step ran and succeeded, check `steps.<id>.status == 'succeeded'`.
 - **`cancelled()` is true for every kind of cancellation:** a user's cancel, a replacing
-  run, the run's timeout, and a daemon shutdown. Cleanup steps with `if: always()` or
+  run, the run's timeout, and a shutdown. Cleanup steps with `if: always()` or
   `if: cancelled()` run within `cleanup_timeout`.
 
 ## YAML

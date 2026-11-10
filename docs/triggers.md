@@ -53,7 +53,7 @@ A schedule fires on a cron expression in a time zone.
 | Key | Type | Default | Rules |
 |---|---|---|---|
 | `cron` | string | required | See [Cron syntax](#cron-syntax). An expression that never fires is E302. |
-| `timezone` | IANA zone name | the `timezone` in `treadle.toml` | Must be a known zone, such as `Europe/London` (E303). |
+| `timezone` | IANA zone name | the `timezone` in `treadle.toml` | A zone spelled exactly as in the time zone database, capitalization included, such as `Europe/London` or `UTC`. Any other name is E303, and the hint suggests the right spelling, such as `did you mean 'UTC'?`. |
 | `catch_up` | `none`, `latest`, or `all` | `latest` | See [Missed schedules](#missed-schedules). |
 
 A string sets `cron`, so `schedule: "30 2 * * *"` is a schedule with the defaults.
@@ -156,6 +156,9 @@ slots:
 - Catch-up runs go through the concurrency policy like any other run.
 - A new or changed schedule starts counting when Treadle first sees it, so it never catches
   up on slots from before that moment.
+- A schedule that comes back while `treadle serve` runs, after you removed it or edited it
+  away, also starts counting again, so it doesn't catch up on the slots that it missed
+  meanwhile. That happens when you revert an edit, or move a file away and back.
 
 Treadle wakes at least every 30 seconds to read the wall clock again. After a laptop wakes
 up, or after the clock jumps, a due slot fires within about 30 seconds.
@@ -188,7 +191,7 @@ A watch trigger polls folders and starts a run when files appear, change, or dis
 | `exclude` | list of glob patterns | `[".*", "*~", "*.tmp", "*.swp", "*.part", "*.crdownload"]` | Setting it replaces the whole default list. |
 | `recursive` | boolean | `false` | Whether to watch subfolders. |
 | `events` | list of `created`, `modified`, and `deleted` | all three | At least one. |
-| `debounce` | duration | `2s` | 0–10m. How long the folder must stay quiet before a batch of changes fires. |
+| `debounce` | duration | `2s` | 0–10m. How long the folder must stay quiet before a batch of changes fires. A scan when it ends confirms the quiet. |
 | `poll_interval` | duration | `2s` | 500ms–1h. How often Treadle scans the folders. |
 | `initial_scan` | boolean | `false` | When `true`, the first scan reports every existing file as `created`. |
 
@@ -218,8 +221,13 @@ missing file is `deleted`, and a file whose modification time, size, or inode ch
 
 Changes collect into a batch. The batch fires when no new change has arrived for
 `debounce`, or at the latest 60 seconds (or `debounce`, when it's longer) after the batch's
-first change, so constant activity can't hold it back forever. Within a batch, the events
-for one path combine:
+first change, so constant activity can't hold it back forever. When `debounce` ends before
+the next poll, Treadle scans at that moment, and fires the batch only when that scan finds
+no new change. A file that a program is still writing holds the batch back, instead of
+starting a run on every poll. These extra scans happen only while a batch waits, at most
+once per `debounce`.
+
+Within a batch, the events for one path combine:
 
 | First event | Later event | Result |
 |---|---|---|
@@ -237,9 +245,22 @@ starts one run.
 - **The first scan is a silent baseline**, unless `initial_scan` is `true`. Files that
   already exist don't start a run.
 - **A missing folder never looks like mass deletion.** When a watched folder disappears or
-  can't be read, for example because a drive was unmounted, the trigger becomes degraded
-  and reports no `deleted` events. When the folder comes back, Treadle takes a new silent
-  baseline. The dashboard, the API, and the daemon's log show a degraded trigger.
+  can't be read, the trigger becomes degraded and reports no `deleted` events. When the
+  folder comes back, Treadle takes a new silent baseline. The dashboard, the API, and the
+  daemon's log show a degraded trigger. On macOS, the folder of an unmounted drive under
+  `/Volumes` disappears, so its trigger becomes degraded.
+- **A folder that becomes a different directory gets a new silent baseline.** Treadle logs a
+  warning, reports no events, and the trigger stays healthy. This happens when an unmounted
+  drive leaves its empty mount point behind, when the drive is mounted again, when a
+  symbolic link that you watch points somewhere else, and when the folder is deleted and
+  created again. An empty mount point looks like an empty folder, not like a degraded
+  trigger.
+- **A subfolder that can't be read keeps its files' last known state.** With
+  `recursive: true`, a subfolder that Treadle can't list, because of a permission or an I/O
+  error, reports no events until Treadle can read it again. Then Treadle reports the
+  changes made meanwhile, except that a subfolder that the baseline holds no files for joins
+  the baseline silently. A deleted subfolder still reports its files as `deleted`. Treadle
+  logs one warning per trigger about unreadable subfolders.
 - A folder with more than `[limits] watch_max_entries` (default 10,000) entries also makes
   the trigger degraded, and the next poll tries again.
 - Treadle keeps the baseline in memory only. It doesn't report changes made while
@@ -289,7 +310,7 @@ A webhook trigger starts a run when a signed HTTP request arrives at
 
 | Key | Type | Default | Rules |
 |---|---|---|---|
-| `name` | string | required | The workflow ID pattern. Unique across all workflows (E305). It's the last part of the URL. |
+| `name` | string | required | The workflow ID pattern. It's the last part of the URL. Unique across all workflows: a name that another workflow already uses is E305. A workflow with E305 doesn't load, so it claims none of its names, and other workflows can still use its other names. |
 | `secret_env` | environment variable name | required | The variable that holds the secret. Treadle looks in the environment first, then in `.env`. |
 | `signature` | `hmac-sha256` or `token` | `hmac-sha256` | How the sender proves it knows the secret. |
 | `signature_header` | header name | `X-Hub-Signature-256` for `hmac-sha256`, `X-Gitlab-Token` for `token` | Case-insensitive. |
@@ -340,6 +361,12 @@ Treadle checks each delivery in this order and answers with the first failure:
 
 Treadle compares signatures in constant time. It applies the rate limit only after the
 signature verifies, so unsigned requests can't use up a real sender's allowance.
+
+One 413 differs from the others. When a request declares a `Content-Length` larger than
+`[limits] webhook_body_bytes`, Starlette, the web framework, refuses it before any of these
+checks run. That answer is plain text, `Content Too Large`, without the JSON error shape
+and without the security headers. A body that grows past that limit while it streams, and a
+body larger than a hook's own `max_body`, get the JSON `payload_too_large` error.
 
 When every check passes, Treadle submits the run and answers:
 
@@ -430,9 +457,19 @@ changes. To make it check at once, send it `SIGHUP`.
   the workflow as stale and show its issues, and the daemon logs them.
 - **A deleted file** removes the workflow and cancels its queued runs with the reason
   `workflow_removed`. A run that's already running finishes.
+- **A webhook name that another workflow uses (E305)** holds a file back only until the
+  other workflow drops the name. Then the file loads on its own. Moving a hook from one file
+  to another works in one edit or in two, whatever the file names. Two workflows that swap
+  their hook names in one edit both stay invalid until you edit one of them again.
+- **When applying a change fails unexpectedly**, for example because of a bug in Treadle or
+  in a trigger, the daemon logs the file name and the error, and tries once more. If that
+  try fails too, the daemon waits until the file changes again. Meanwhile, the workflow
+  keeps its previous version.
 
 A run uses the version of the workflow that was current when the run was created, even if
 you edit the file while the run waits in the queue. A re-run uses the current version.
 
-The daemon also reloads `.env` when it changes, for new runs and for webhook secrets. A
-change to `treadle.toml` takes effect only after a restart, and the daemon logs a reminder.
+The daemon also reloads `.env` when it changes, for new runs and for webhook secrets. The
+API token is the exception: a change to it takes effect only after a restart, and the
+daemon logs a warning. A change to `treadle.toml` takes effect only after a restart, and the
+daemon logs a reminder.

@@ -19,7 +19,11 @@ privately through GitHub instead:
 2. Click **Report a vulnerability**.
 3. Describe the problem, and send the report.
 
-Only the maintainers can read the report. Include what you can of:
+Only the maintainers can read the report. If the Security tab doesn't offer
+**Report a vulnerability**, open an issue that asks the maintainers for a private way to
+report, and leave every detail of the problem out of the issue.
+
+Include what you can of:
 
 - The Treadle version (`treadle version`), the operating system, and the Python version.
 - What an attacker can do, and what they need first, such as network access to the daemon,
@@ -60,8 +64,9 @@ Out of scope, by design:
 ## Masking limits
 
 Treadle masks secret values in logs and stored data: the raw value, each line of a multi-line
-value, and its JSON-escaped and URL-encoded forms. Masking can't protect a secret in these
-cases:
+value, and its JSON-escaped and URL-encoded forms. A stored number whose JSON text holds a
+secret value, such as a numeric chat ID, becomes the string `***`. Masking can't protect a
+secret in these cases:
 
 - The value is shorter than 4 characters, or only whitespace.
 - A step transforms the value, for example with base64 or a hash, before it prints it.

@@ -44,10 +44,12 @@ user who started it, without a sandbox.
 
 ## Features
 
-- **Four ways to start a run:** cron schedules with time zones and well-defined behavior on
-  daylight saving time changes, file watches with glob filters and debouncing, signed
-  webhooks from GitHub, Gitea, Forgejo, or GitLab, and manual runs from the CLI, the
-  dashboard, or the API.
+- **Four ways to start a run:**
+  - Cron schedules, with time zones and well-defined behavior on daylight saving time
+    changes.
+  - File watches, with glob filters and debouncing.
+  - Signed webhooks from GitHub, Gitea, Forgejo, or GitLab.
+  - Manual runs from the CLI, the dashboard, or the API.
 - **Five step types:** `shell` (bash, sh, Python, or a program without a shell), `http`,
   `file`, `log`, and `sleep`.
 - **Control over failure:** retries with exponential backoff and jitter, timeouts per step
@@ -61,11 +63,11 @@ user who started it, without a sandbox.
   line, and column, and a hint, and warns when untrusted data could reach a shell script.
 - **Run history:** `treadle runs`, `show`, and `logs`, with search, filters, and re-runs. A
   failed run's summary leads with the failure.
-- **A dashboard and a JSON API** for workflows, runs, and live logs, with **Run now**,
-  **Cancel**, and **Re-run**.
+- **A dashboard and a JSON API** for workflows, runs, and live logs. The dashboard has a
+  **Run now** form, and **Cancel run** and **Re-run** buttons.
 - **Safe defaults:** the server listens on loopback only, every webhook needs a secret,
-  secrets are masked in logs and stored data, `file` steps stay inside configured folders,
-  and every log, body, and queue has a size limit.
+  Treadle masks secrets in logs and stored data, `file` steps stay inside configured
+  folders, and every log, body, and queue has a size limit.
 - **Reliability:** Treadle records each state change in SQLite before it acts on it, creates
   at most one run per schedule slot, marks the runs that a crash interrupted, shuts down
   gracefully, and prunes old runs on its own.
@@ -91,10 +93,28 @@ Or with [pipx](https://pipx.pypa.io/):
 pipx install git+https://github.com/kingmuja12/treadle
 ```
 
+Treadle needs Python 3.11 or later. If pipx's default Python is older, name a newer one, as
+in `pipx install --python python3.12 git+https://github.com/kingmuja12/treadle`.
+
 Check the installation:
 
 ```sh
 treadle version
+```
+
+If your shell can't find `treadle`, the directory that holds it, usually `~/.local/bin`,
+isn't on your `PATH`. Run `uv tool update-shell` or `pipx ensurepath`, and then open a new
+terminal.
+
+`uv tool install` and `pipx install` don't read the repository's `uv.lock`. They install
+the newest versions of Treadle's dependencies that `pyproject.toml` allows. To install the
+exact versions that CI tests, export them from a clone and pass them to uv as constraints:
+
+```sh
+git clone https://github.com/kingmuja12/treadle.git
+cd treadle
+uv export --frozen --no-dev --no-emit-project --no-hashes -o constraints.txt
+uv tool install --constraints constraints.txt .
 ```
 
 To work on Treadle itself, set it up from source with uv:
@@ -146,15 +166,15 @@ uv run treadle version
    ```
 
    To see the dashboard, open <http://127.0.0.1:8765>. While the daemon runs, `treadle run`
-   in another terminal hands its runs to the daemon. To stop the daemon, press Ctrl-C.
+   in another terminal hands its runs to the daemon. To stop the daemon, press Ctrl+C.
 
 To make the site check run every 15 minutes, uncomment its `triggers` lines in
 `workflows/site-check.yml`. The daemon picks up the change within a few seconds.
 
 ## Examples
 
-The [`examples/`](examples/) folder holds complete workflows that you can copy into your
-project's `workflows/` folder:
+The repository's [`examples/`](examples/) folder holds complete workflows. `treadle init`
+doesn't install them; to use one, copy it into your project's `workflows/` folder:
 
 | Example | What it does | What it shows |
 |---|---|---|
@@ -194,6 +214,8 @@ Each file starts with comments that explain its setup. After you copy one, check
   `.env`. Without one, Treadle refuses to start.
 - On a machine that other people use, set `TREADLE_TOKEN` even on loopback, because other
   local users can reach the port.
+- A new or changed token takes effect when you restart `treadle serve`. Until then, the
+  daemon keeps the token that it started with, and logs a warning.
 - Treadle serves plain HTTP. To reach it from another machine, use a reverse proxy with TLS,
   an SSH tunnel, or a VPN such as Tailscale.
 - Steps run as you, with your permissions, and without a sandbox.
@@ -231,8 +253,8 @@ Treadle 0.1 is a first version. These limits are known:
 - Treadle doesn't sandbox steps or limit their CPU and memory. Under systemd, use
   `MemoryMax=` and `CPUQuota=`.
 - There's no TLS, and one shared token instead of user accounts.
-- Treadle ignores a workflow file that is a symbolic link when it runs workflows, although
-  `treadle validate` checks it. Copy the file instead.
+- Treadle skips a workflow file that is a symbolic link, and `treadle validate` warns about
+  it with W060. Copy the file instead.
 - Third-party step types can't be installed yet.
 
 ## Roadmap
@@ -244,7 +266,7 @@ These items may come after 0.1. They aren't commitments, and their order may cha
   runs.
 - Native file events through FSEvents and inotify, with polling as the fallback.
 - Concurrency groups that span workflows, and a `parallel` policy with a limit.
-- Live log streaming in the dashboard and in `treadle logs -f`.
+- Push-based log streaming, instead of polling, in the dashboard and in `treadle logs -f`.
 - Notification step types for ntfy and email.
 - Re-running a run from the step that failed.
 - `for_each` steps over a list.

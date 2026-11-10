@@ -10,11 +10,12 @@ what Treadle guarantees and why.
   at most one run, and each run starts at most once. Treadle commits each state change to
   SQLite before it acts on it.
 - **Safe defaults.** The server listens on loopback only, every webhook needs a secret,
-  secrets are masked wherever Treadle stores or prints text, and every resource has a limit.
+  Treadle masks secrets wherever it stores or prints text, and every resource has a limit.
 - **Debuggable.** Every problem in a workflow file has a stable code and a location, and you
   can debug a failed run from the CLI without starting the daemon.
-- **Small.** One process, one SQLite file, and five runtime dependencies: PyYAML, Starlette,
-  uvicorn, Jinja2, and HTTPX.
+- **Small.** One process, one SQLite file, and five direct runtime dependencies: PyYAML,
+  Starlette, uvicorn, Jinja2, and HTTPX. With their own dependencies, an install adds about
+  a dozen third-party packages.
 
 ## Processes
 
@@ -66,9 +67,17 @@ The other commands work alongside the lock holder:
   whether or not a daemon is running.
 - **`treadle run` and `treadle cancel`** write a request to the `control_requests` table and
   wait for the lock holder to answer it. The CLI needs no HTTP connection and no token:
-  anyone who can write the state directory is already trusted. When the CLI stops waiting,
-  it withdraws its request in one conditional update, so a lock holder that hasn't picked
-  the request up yet never acts on it.
+  anyone who can write the state directory is already trusted.
+
+The lock holder takes control requests one at a time, in order, and stores each answer
+before it takes the next request. When it can't store an answer, it keeps the answer and
+stores it first on its next pass. During shutdown, a request that it already took still
+gets its answer.
+
+When the CLI stops waiting, it withdraws its request in one conditional update, so a lock
+holder that hasn't taken the request yet never acts on it. When the lock holder took the
+request first, its answer is on the way: the CLI waits up to 10 more seconds for it, and
+otherwise reports that the request may still take effect.
 
 `flock` isn't reliable on network file systems, so keep the state directory on a local disk.
 
@@ -111,7 +120,7 @@ Every other module uses only the standard library and Treadle itself.
 | (new) | `queued` | The concurrency policy admits the run. |
 | (new) | `skipped` | The policy rejects the run (`already_active` or `queue_full`). |
 | `queued` | `running` | The run manager starts it. |
-| `queued` | `cancelled` | A user cancels it, a newer run replaces it, or its workflow file is deleted. |
+| `queued` | `cancelled` | A user cancels it, a newer run replaces it, or its workflow file is deleted. A file deleted while Treadle was stopped cancels the run at the next start of `treadle serve`. |
 | `queued` | `skipped` or `failed` | At startup, the daemon re-admits queued runs through the policy, and fails a run whose stored workflow version no longer loads. |
 | `running` | `succeeded`, `failed`, `cancelled`, or `timed_out` | The run ends. |
 | `running` | `interrupted` | The process that ran it stopped, and the next lock holder found it. |
@@ -138,8 +147,8 @@ failure:
 | `user` | Someone cancelled the run. |
 | `replaced` | A newer run of a `replace` workflow replaced it. |
 | `timeout` | The run reached its workflow `timeout`. |
-| `shutdown` | The daemon shut down while the run ran. |
-| `workflow_removed` | Its workflow file was deleted while the run waited. |
+| `shutdown` | Treadle shut down while the run ran: the daemon stopped, or the `treadle run` that ran it got `SIGTERM` or `SIGHUP`. |
+| `workflow_removed` | Its workflow file was deleted while the run waited, or while Treadle was stopped. |
 | `executor_stopped` | The Treadle process stopped while the run ran. |
 | `setup_failed` | The run couldn't start its steps, for example because a workflow `env` value didn't render. |
 
@@ -158,6 +167,11 @@ running or retrying ──the process stopped──> interrupted
 
 Each attempt ends `succeeded`, `failed`, `timed_out`, `cancelled`, or `interrupted`. A step's
 log lines are always committed before its final status.
+
+A run can also end without its executor: an internal error fails it, or a forced shutdown
+records it as cancelled. Then its running steps and attempts end `interrupted`, and its
+pending steps `skipped` with the reason `run_interrupted`, in the same write that finishes
+the run.
 
 ### Admission
 
@@ -209,6 +223,9 @@ Treadle keeps everything in one SQLite database, `.treadle/treadle.db`:
   `treadle runs --grep` is one query. The log sink batches inserts, every 250 milliseconds or
   500 lines, and the per-attempt and per-run log limits bound the database's size.
 - **Masking before storage.** Treadle masks secrets before anything reaches the database.
+- **Text that isn't valid Unicode.** Treadle stores U+FFFD in place of each lone surrogate,
+  such as one that the JSON escape `\ud800` in a webhook body produces, instead of failing
+  the write. Log lines show U+FFFD too.
 - **Workflow versions.** When Treadle creates a run, it stores the workflow's source by its
   SHA-256 digest. A queued run executes its own version, even if you edit the file while it
   waits. A re-run uses the current version.
@@ -248,19 +265,51 @@ left behind, in one transaction:
 2. Pending steps of those runs become `skipped` with the reason `run_interrupted`.
 3. Each interrupted run gets the log line "Run interrupted: the Treadle process stopped while
    this run was active."
-4. Control requests older than 60 seconds expire.
+4. In runs that already finished, the attempts and steps that a failed executor left
+   running or pending close the same way.
+5. Control requests older than 60 seconds expire.
 
 Then it deletes the old scratch directories. The daemon re-admits the queued runs through
-their concurrency policies, in order. A foreground `treadle run` leaves them queued for the
-next `treadle serve`.
+their concurrency policies, in order:
+
+- The daemon cancels a queued run whose workflow file was deleted while Treadle was
+  stopped, with the reason `workflow_removed`. When no workflow loads at all, for example
+  because the workflows directory can't be read, such runs stay queued, and the daemon
+  logs a warning.
+- A queued run whose stored workflow version no longer loads fails.
+
+A foreground `treadle run` leaves the queued runs for the next `treadle serve`.
 
 Treadle never runs an interrupted run again on its own, because its steps may not be safe to
 repeat. You can re-run it with `treadle run --rerun RUN`.
 
 Treadle also never signals a process group that a dead process recorded, because the
 operating system may have given that ID to another process. When such a group still exists,
-Treadle logs a warning. Under systemd, `KillMode=control-group` stops those processes with the
-service. See [Operations](operations.md#run-treadle-with-systemd).
+Treadle logs a warning. Under systemd, `KillMode=mixed` kills those processes when the
+service stops. See [Operations](operations.md#run-treadle-with-systemd).
+
+## Startup
+
+`treadle serve` handles signals from the moment its startup begins. Then it:
+
+1. Checks the API token, takes the lock, and opens the database, which migrates it when
+   needed.
+2. Recovers what a crashed lock holder left behind, as [Crash recovery](#crash-recovery)
+   describes.
+3. Loads every workflow file, and binds the listening sockets.
+4. Re-admits the queued runs, and starts the triggers, the control poller, retention, and
+   the HTTP server.
+5. Logs `listening on http://127.0.0.1:8765`, and sends `READY=1` to the service manager
+   when `NOTIFY_SOCKET` names one.
+
+A `SIGHUP` during startup does nothing, because step 3 reads every file anyway. A first
+`SIGTERM` or `SIGINT` during startup shuts the daemon down as soon as it serves. A `SIGHUP`
+that arrives in about the first 0.3 seconds of the process, before Treadle's own code runs,
+can still end it; under systemd, `Type=notify` keeps a reload from coming that early.
+
+When one of the first three steps fails, the daemon exits with that error's code, such as 8
+for a port in use. When step 4 or 5 fails, the daemon logs `starting the services failed`,
+shuts down as after a signal, and exits 1.
 
 ## Shutdown
 
@@ -270,10 +319,14 @@ On the first `SIGTERM` or `SIGINT`, the daemon:
    keep working, and the dashboard shows a banner.
 2. Stops the scheduler, the watches, the registry, the control poller, and retention.
 3. Cancels the running runs with the reason `shutdown`, and gives their cleanup steps up to
-   `[runs] shutdown_grace` (15 seconds by default). Then it forces the cancellation and kills
-   the remaining process groups.
-4. Stops the HTTP server.
-5. Closes the database, releases the lock, removes `holder.json`, and exits 0.
+   `[runs] shutdown_grace` (15 seconds by default). A run that is already cancelling, for
+   example after a user's cancel or a replacement, keeps its reason, and its cleanup steps
+   keep running within the same grace. Then the daemon forces the cancellation of the runs
+   that are left, and records each run that still hasn't stopped as cancelled.
+4. Kills every step process group that a forced cancel left behind, and logs a line such as
+   `killed 2 process groups that cancelled steps left running`.
+5. Stops the HTTP server.
+6. Closes the database, releases the lock, removes `holder.json`, and exits 0.
 
 Queued runs stay queued and run after the next start. A second signal skips the rest of the
 grace period. A third exits at once with code 130, and the next start recovers the leftovers
@@ -340,6 +393,12 @@ $ curl -s -X POST http://127.0.0.1:8765/api/v1/workflows/hello/runs \
   `unauthorized`, `forbidden`, `not_found`, `conflict`, `already_finished`,
   `workflow_invalid`, `invalid_inputs`, `unsupported_media_type`, `payload_too_large`,
   `rate_limited`, `shutting_down`, `hook_disabled`, `busy`, `expired`, and `internal`.
+
+One answer doesn't use the error shape. When a request declares a `Content-Length` larger
+than the body limit, `[limits] api_body_bytes` for the API and the dashboard's forms or
+`[limits] webhook_body_bytes` for webhooks, Starlette answers 413 with the plain text
+`Content Too Large`, and without the security headers. A body that grows past the limit
+while it streams gets the JSON `payload_too_large` error.
 
 Times are ISO 8601 strings in UTC, and missing values are `null`.
 

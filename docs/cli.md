@@ -81,10 +81,12 @@ doesn't exist exits 4, with `error: run 99 doesn't exist`,
   such as `Cancelling run #19 (press Ctrl-C again to force)` go to standard error.
 - An error prints as `error: <message>`, and the command exits with the error's
   [exit code](#exit-codes). A warning prints as `warning: <message>`.
-- An unexpected error prints `internal error: <type>: <message>` and exits 1. With
-  `--debug`, the traceback follows.
+- An unexpected error prints `internal error: <type>: <message>` and exits 1. When it
+  happened while Treadle loaded a workflow file, a second line names the file, as in
+  `  while loading workflows/x.yml`. With `--debug`, the traceback follows.
 - When the reader of the output goes away, as with `treadle logs 1 | head`, the command
-  stops quietly and exits 1.
+  stops quietly and exits 1. Output to a terminal that hung up ends a command the same way.
+  A run in this terminal goes on without output; see [`treadle run`](#treadle-run).
 - Commands with `--json` print JSON instead of text. The shapes match the
   [API](architecture.md#http-api), and times are ISO 8601 strings in UTC.
 - Tables show times in the project's time zone.
@@ -135,15 +137,16 @@ See .env.example.
 | `treadle.toml` | Every setting, commented out with its default, and `timezone` set to the time zone that Treadle detects from `TZ` or `/etc/localtime`. When it can't detect one, it warns and writes `UTC`. |
 | `workflows/hello.yml` | A first workflow with an input, an output, and a `log` step. |
 | `workflows/site-check.yml` | An HTTP check with retries and an alert. Its schedule is commented out, so a new daemon makes no network calls. |
-| `.env.example` | Comments that describe the secrets the examples use. |
+| `.env.example` | Comments that describe `TREADLE_TOKEN`, and the secrets that the repository's [example workflows](../examples/) use. The generated workflows need no secrets. |
 | `.gitignore` | Lines that keep `.env` and `.treadle/` out of Git. |
 
 Each file reports one status:
 
 - `created`: the file didn't exist.
 - `skipped`: the file exists. With `--force`, `skipped` means the file already had the same
-  content.
-- `updated`: `--force` replaced a file whose content differed.
+  content. For `.gitignore`, it means that no line was missing.
+- `updated`: `--force` replaced a file whose content differed, or Treadle added the missing
+  lines to an existing `.gitignore`.
 
 Treadle never replaces `.gitignore`. It appends the lines it needs, under the comment
 `# Treadle: secrets and local state`, and only the ones that are missing.
@@ -186,6 +189,11 @@ workflows/deploy.yml:8:30: warning[W101]: `trigger.body.ref` puts untrusted data
 Each Issue is `{"file", "severity", "code", "message", "path", "line", "column", "hint"}`,
 where `path` is the location inside the workflow, such as `steps[0].run`.
 
+When `validate` checks a directory, each workflow file in it that is a symbolic link gets
+W060, because every command skips such a file. The warning counts toward `--strict`, but the
+link counts neither as valid nor as invalid. See
+[Files and workflow IDs](workflow-syntax.md#files-and-workflow-ids).
+
 Inside a project, `validate` also runs the checks that depend on the machine, such as
 whether a secret or a watched folder exists. Outside a project, it skips them and says so:
 `1 valid, 0 invalid; machine-specific checks skipped (no treadle.toml)`. When it finds no
@@ -219,6 +227,9 @@ site-check      Site check      -                                -              
   `stale` state of a workflow whose last edit was invalid. `list` doesn't, because it
   doesn't ask the daemon.
 - With no workflows, it prints `No workflows in workflows.`.
+- For each workflow file that is a symbolic link, which Treadle skips, it prints a warning
+  to standard error, such as
+  `warning: workflows/linked.yml: the file is a symbolic link, so Treadle skips it`.
 - `--json` prints `{"workflows": [Workflow]}`.
 
 Exit codes: 0; 3.
@@ -295,30 +306,61 @@ With `--json`, each line is one event:
 
   `--detach` exits 2, because there's no daemon to hand the run to. Queued runs from an
   earlier `treadle serve` stay queued for the next one.
+
+  When the reader of the output goes away, as with `treadle run X | head -1`, the run goes
+  on without output, as a daemon's run would, and the command exits 1 once the run ends.
 - **`treadle serve` is running:** the command asks the daemon to start the run, waits up to
-  10 seconds for the answer, and then follows the run with the same output. If the daemon
-  doesn't answer, the command withdraws the request and exits 8 with
-  `error: the daemon (pid 4242) didn't respond`. A daemon that hasn't picked up the request
-  by then never acts on it.
+  10 seconds for the answer, and then follows the run with the same output.
+  - If the daemon hasn't taken the request by then, the command withdraws it and exits 8
+    with `error: the daemon (pid 4242) didn't respond`. A withdrawn request never starts a
+    run.
+  - If the daemon took the request, but its answer doesn't come within 10 more seconds, the
+    command exits 8 with
+    ``error: the daemon (pid 4242) took the request but didn't answer, so it may still start the run; `treadle runs --workflow hello` lists it``.
+  - If the daemon stops while the command follows the run, for example because the system
+    killed it, the command exits 8 within about two seconds:
+    `error: the daemon (pid 4242) stopped; run #13 will be marked interrupted when Treadle starts again`.
+    For a queued run, the message ends with
+    ``run #13 stays queued until `treadle serve` starts again``. When a new daemon takes over
+    within a second, the command keeps following, and exits 5 once crash recovery marks the
+    run interrupted.
 
 With `--detach`, the command prints `Run #10 queued` and exits 0, or
 `Run #11 skipped (already_active)` and exits 7. With `--json`, it prints one `run_created`
 event.
 
-### Ctrl-C
+### Stop signals
 
-- **During a run in this terminal**, the first Ctrl-C cancels the run and prints
-  `Cancelling run #19 (press Ctrl-C again to force)`. Cleanup steps, such as those with
-  `if: always()`, still run. A second Ctrl-C forces the cancellation. The command exits 130
-  when the run has ended.
-- **While following a daemon's run**, Ctrl-C stops following, and the command exits 130.
-  The run keeps going:
+Ctrl+C sends `SIGINT`. `treadle run` handles `SIGTERM`, and the `SIGHUP` that a closing
+terminal sends, the same way. After a stop signal, the command exits 128 plus the first
+signal's number: 130 for Ctrl+C, 143 for `SIGTERM`, and 129 for `SIGHUP`.
+
+- **During a run in this terminal**, the first stop signal cancels the run and prints
+  `Cancelling run #19 (press Ctrl-C again to force)`, or, for another signal, a line that
+  names it, such as `Cancelling run #19 (SIGTERM; signal again to force)`. Cleanup steps,
+  such as those with `if: always()`, still run. Ctrl+C cancels the run with the reason
+  `user`, and `SIGTERM` or `SIGHUP` with the reason `shutdown`. The command exits once the
+  run has ended.
+- **A second stop signal of any kind forces the cancellation.** Treadle records the run as
+  cancelled at once. When the command exits, it kills every step process that the forced
+  cancellation left behind, so none outlives the command.
+- **While following a daemon's run**, a stop signal stops following, and the run keeps
+  going:
 
   ```text
   Run #13 continues in the daemon. Follow it with `treadle logs 13 -f`.
   ```
-- **While waiting for the daemon to answer**, Ctrl-C withdraws the request and prints
-  `Stopped before the daemon started a run.`.
+
+  When the run has already finished, the command prints a line such as
+  `Run #13 already finished (succeeded).` instead. When the daemon has stopped, it prints the
+  `the daemon (pid 4242) stopped` error.
+- **While waiting for the daemon to answer**, a stop signal withdraws the request and
+  prints `Stopped before the daemon started a run.`. When the daemon took the request first,
+  the command reports what became of it, in the same ways as while following, or prints the
+  `took the request but didn't answer` error.
+
+After the terminal hangs up, the command writes nothing more, and still exits with the
+signal's code.
 
 ### Exit codes of `treadle run`
 
@@ -332,8 +374,10 @@ event.
 | 5 | The run was cancelled or interrupted. |
 | 6 | The run timed out. |
 | 7 | The concurrency policy skipped the run. |
-| 8 | Busy: another `treadle run` holds the state directory, or the daemon didn't answer or is shutting down. |
-| 130 | Interrupted with Ctrl-C. |
+| 8 | Busy: another `treadle run` holds the state directory, the daemon didn't answer or is shutting down, or the daemon stopped while the command followed its run. |
+| 129 | Stopped by `SIGHUP`, as when the terminal closes. |
+| 130 | Stopped with Ctrl+C. |
+| 143 | Stopped by `SIGTERM`. |
 
 Before a run in this terminal starts, Treadle recovers what a crashed Treadle process left
 behind, and may warn about it:
@@ -344,6 +388,15 @@ warning: run=2 was interrupted: the Treadle process stopped while it ran
 
 Treadle never runs an interrupted run again on its own, because its steps may not be safe to
 repeat. `treadle show` suggests `treadle run --rerun 2`.
+
+A run in this terminal also creates the state directory with mode 0700 when it doesn't
+exist yet. Like `treadle serve`, it warns when other users can access the state directory,
+or can read `.env`:
+
+```text
+warning: /home/ada/automations/.treadle is accessible by other users; run `chmod 700 /home/ada/automations/.treadle`
+warning: /home/ada/automations/.env is readable by other users; run `chmod 600 /home/ada/automations/.env`
+```
 
 ## `treadle runs`
 
@@ -369,14 +422,16 @@ Older runs: treadle runs --limit 2 --before 2
 | `--trigger KIND` | Only runs that `manual`, `schedule`, `watch`, or `webhook` started. |
 | `--grep TEXT` | Only runs whose error or any log line contains `TEXT`, ignoring case. |
 | `--limit N` | At most `N` runs, from 1 to 200. The default is 20. |
-| `--before ID` | Only runs older than run `ID`. |
+| `--before ID` | Only runs older than run `ID`, from 1 to 9223372036854775807. |
 | `--json` | Prints `{"runs": [Run], "next_before_id"}`. |
 
 When more runs exist, the footer repeats your filters in the command for the next page.
 DURATION shows `running` for a run that is still running. Without any run, the command
 prints `No runs yet.`, and when filters match nothing, `No runs match.`.
 
-Exit codes: 0; 2 for an invalid option value; 3.
+Exit codes: 0; 2 for an invalid option value, such as
+`treadle runs: error: argument --before: must be between 1 and 9223372036854775807` for
+`--before 0`; 3.
 
 ## `treadle show`
 
@@ -427,7 +482,8 @@ treadle logs RUN [--step ID] [--attempt N] [-f] [--json]
 
 Prints a run's log lines as `HH:MM:SS step#attempt stream | text`, in the project's time
 zone. Lines from the run itself show `-` in place of `step#attempt`. The stream is `stdout`,
-`stderr`, or `system` for Treadle's own lines.
+`stderr`, or `system` for Treadle's own lines. The command prints each page of 1,000 lines
+as soon as it reads it, so the first lines of a long log appear at once.
 
 ```console
 $ treadle logs 3 --step archive --attempt 1
@@ -440,11 +496,16 @@ $ treadle logs 3 --step archive --attempt 1
 | Option | Effect |
 |---|---|
 | `--step ID` | Only this step's lines. A step the run doesn't have exits 4: `error: run 3 has no step 'ghost'`. |
-| `--attempt N` | Only this attempt's lines. |
+| `--attempt N` | Only this attempt's lines, from 1 to 9223372036854775807. |
 | `-f`, `--follow` | Keeps printing new lines, checking every 0.5 seconds, until the run has ended and no lines remain. |
 | `--json` | Prints one Log object per line: `{"seq", "ts", "step", "attempt", "stream", "text"}`. |
 
-Exit codes: 0; 2 for a malformed reference; 3; 4.
+With `--follow`, a running run that no Treadle process runs any more, for example because
+the system killed the daemon, ends the command within about two seconds with exit code 8:
+`error: no Treadle process is running run #13 any more; it will be marked interrupted when Treadle starts again`.
+For a queued run, the command keeps waiting, because the next `treadle serve` starts it.
+
+Exit codes: 0; 2 for a malformed reference or an invalid option value; 3; 4; 8.
 
 ## `treadle cancel`
 
@@ -469,14 +530,30 @@ The command prints one of:
 - `Run #13 is already finishing.`
 
 When `treadle serve` or a `treadle run` in another terminal is running the run, the command
-asks that process. If it doesn't answer in time, the command withdraws the request and exits
-8 with `error: the daemon (pid 4242) didn't respond` or
-``error: the running `treadle run` (pid 4242) didn't respond``. When no Treadle process is
-running, the command cancels a queued run in the database directly. A run that a crashed
-process left running then reports `already finished (interrupted)`.
+asks that process:
+
+- If the process doesn't take the request in time, the command withdraws it and exits 8
+  with `error: the daemon (pid 4242) didn't respond` or
+  ``error: the running `treadle run` (pid 4242) didn't respond``.
+- If the process took the request, but its answer doesn't come within 10 more seconds, the
+  command exits 8 with
+  `error: the daemon (pid 4242) took the cancel request but didn't answer, so it may still cancel run #13`.
+- Ctrl+C, `SIGTERM`, or `SIGHUP` while the command waits withdraws the request, prints
+  `Stopped before the lock holder answered; the cancel request was withdrawn.`, and exits
+  128 plus the signal's number, such as 130 for Ctrl+C. When the process took the request
+  first, the command reports its answer, and still exits with the signal's code.
+
+A forced cancel records the run as cancelled at once. When a `treadle run` in another
+terminal ran it, that command kills the step processes that are left as it exits. In a
+daemon that keeps running, a step process that ignores `SIGTERM` can outlive the run by up
+to `[runs] kill_grace`, and the daemon kills what is left when it shuts down.
+
+When no Treadle process is running, the command cancels a queued run in the database
+directly. A run that a crashed process left running then reports
+`already finished (interrupted)`.
 
 Exit codes: 0, including for a run that already finished; 2 for a malformed reference; 3;
-4; 8.
+4; 8; and 129, 130, or 143 after a stop signal.
 
 ## `treadle serve`
 
@@ -496,15 +573,16 @@ The daemon prints nothing to standard output. It logs to standard error, one lin
 with the time in UTC:
 
 ```text
-2026-11-10T09:11:47.586Z INFO treadle.daemon listening on http://127.0.0.1:8765
-2026-11-10T09:11:49.269Z INFO treadle.engine run=1 workflow=deploy queued
-2026-11-10T09:11:49.270Z INFO treadle.triggers.webhook webhook deploy: run 1 queued
-2026-11-10T09:11:49.271Z INFO treadle.web POST /hooks/deploy 202 2ms
-2026-11-10T09:11:49.271Z INFO treadle.engine run=1 workflow=deploy started
-2026-11-10T09:11:49.280Z INFO treadle.engine run=1 step=show succeeded
-2026-11-10T09:11:49.281Z INFO treadle.engine run=1 succeeded
-2026-11-10T09:11:50.794Z INFO treadle.daemon shutting down; signal again to stop the runs at once
-2026-11-10T09:11:50.955Z INFO treadle.daemon stopped
+2026-11-10T13:06:16.505Z INFO treadle.registry workflow deploy: version 1ac47e8f5818 is current
+2026-11-10T13:06:16.508Z INFO treadle.daemon listening on http://127.0.0.1:8765
+2026-11-10T13:06:17.984Z INFO treadle.engine run=1 workflow=deploy queued
+2026-11-10T13:06:17.984Z INFO treadle.triggers.webhook webhook deploy: run 1 queued
+2026-11-10T13:06:17.985Z INFO treadle.web POST /hooks/deploy 202 2ms
+2026-11-10T13:06:17.986Z INFO treadle.engine run=1 workflow=deploy started
+2026-11-10T13:06:17.997Z INFO treadle.engine run=1 step=show succeeded
+2026-11-10T13:06:17.997Z INFO treadle.engine run=1 succeeded
+2026-11-10T13:06:19.498Z INFO treadle.daemon shutting down; signal again to stop the runs at once
+2026-11-10T13:06:19.645Z INFO treadle.daemon stopped
 ```
 
 The daemon logs each request as method, path, status, and duration. It never logs request
@@ -514,17 +592,27 @@ Signals:
 
 | Signal | Effect |
 |---|---|
-| First `SIGTERM` or `SIGINT` (Ctrl-C) | Stops accepting runs, cancels the running runs with the reason `shutdown`, gives their cleanup steps up to `[runs] shutdown_grace` (default 15s), and exits 0. Queued runs stay queued for the next start. |
+| First `SIGTERM` or `SIGINT` (Ctrl+C) | Stops accepting runs, cancels the running runs with the reason `shutdown`, gives their cleanup steps up to `[runs] shutdown_grace` (default 15s), and exits 0. A run that is already cancelling, for example after a user's cancel, keeps its reason, and its cleanup steps keep running within the same grace. Queued runs stay queued for the next start. |
 | Second `SIGTERM` or `SIGINT` | Stops the runs at once. |
 | Third `SIGTERM` or `SIGINT` | Exits 130 at once. The next start marks the leftover runs as interrupted. |
 | `SIGHUP` | Reloads the workflows now. |
+
+After the runs stop, the daemon kills every step process that a forced cancel left behind,
+and logs a line such as `killed 2 process groups that cancelled steps left running`.
+
+The daemon handles these signals from the start of its startup. A `SIGHUP` during startup
+does nothing, because startup loads every workflow file anyway. A first `SIGTERM` or
+`SIGINT` during startup shuts the daemon down as soon as it serves. When the environment
+names a service manager's notification socket in `NOTIFY_SOCKET`, as systemd's
+`Type=notify` does, the daemon sends `READY=1` once it listens. See
+[Run Treadle with systemd](operations.md#run-treadle-with-systemd).
 
 Exit codes:
 
 | Code | Cause |
 |---|---|
 | 0 | A signal stopped the daemon. |
-| 1 | A part of the daemon stopped unexpectedly. The daemon logs `shutting down, because <part> stopped`, finishes the runs as after a signal, and exits. |
+| 1 | A part of the daemon stopped unexpectedly, or a late startup step failed. The daemon logs `shutting down, because <part> stopped` or `starting the services failed`, finishes the runs as after a signal, and exits. |
 | 3 | A configuration problem, such as `set TREADLE_TOKEN (at least 32 characters) or bind 127.0.0.1` or `TREADLE_TOKEN must be at least 32 characters long`. |
 | 8 | Another Treadle process holds the state directory, as in `another Treadle process holds the state directory lock (serve, pid 4242, port 8765)`, or the port can't be used, as in `port 8765 on 127.0.0.1 is in use`. |
 
@@ -547,7 +635,7 @@ LOCAL                 UTC                   NOTE
 
 | Option | Effect |
 |---|---|
-| `--tz ZONE` | An IANA time zone. The default is the project's time zone, then the local time zone, then UTC. |
+| `--tz ZONE` | An IANA time zone, spelled exactly as in the time zone database, capitalization included. The default is the project's time zone, then the local time zone, then UTC. |
 | `-n COUNT` | How many times to show, from 1 to 100. The default is 5. |
 | `--after ISO` | Shows times strictly after this one. A time without an offset is wall time in `--tz`. The default is now. |
 | `--json` | Prints `{"expression", "timezone", "fires": [{"local", "utc", "note"}]}`. |
@@ -557,6 +645,7 @@ LOCAL                 UTC                   NOTE
 - An invalid expression shows the problem with a caret, such as
   `error: hour 25 isn't between 0 and 23`.
 - ``error: unknown time zone 'Mars/Olympus'; use an IANA name such as Europe/London``
+- ``error: unknown time zone 'utc'; did you mean 'UTC'?``, on every platform
 - ``error: --after: invalid date or time 'yesterday'; use ISO 8601, such as 2026-03-07T02:30``
 
 For the rules behind the notes, see [Time zones and daylight saving time](triggers.md#time-zones-and-daylight-saving-time).
@@ -586,7 +675,8 @@ that comes from the order of the steps rather than from `needs`.
   "edges": [{"from", "to", "implicit"}]}`.
 
 Exit codes: 0; 3 for an invalid workflow, whose issues follow the error; 4 when the workflow
-doesn't exist, as in ``error: workflow 'ghost' doesn't exist in workflows``.
+doesn't exist, as in ``error: workflow 'ghost' doesn't exist in workflows``, or when its
+file is a symbolic link, which Treadle skips.
 
 ## `treadle version`
 
@@ -613,8 +703,10 @@ treadle 0.1.0 (Python 3.12.13, darwin, SQLite 3.50.4, schema 1)
 | 5 | The run was cancelled or interrupted. |
 | 6 | The run timed out. |
 | 7 | The concurrency policy skipped the run. |
-| 8 | Busy: the state directory is in use, the port is in use, or the daemon didn't respond. |
-| 130 | Interrupted with Ctrl-C. |
+| 8 | Busy: the state directory is in use, the port is in use, the daemon didn't respond, or the process that ran a followed run stopped. |
+| 129 | `treadle run` or `treadle cancel` stopped by `SIGHUP`, as when the terminal closes. |
+| 130 | Interrupted with Ctrl+C, or `treadle serve` stopped by a third signal. |
+| 143 | `treadle run` or `treadle cancel` stopped by `SIGTERM`. |
 
 ## Configuration file
 
@@ -668,17 +760,17 @@ level = "info"                  # debug, info, warning, or error
 | `workflows_dir` | Where the workflow files are. | A path |
 | `state_dir` | Where Treadle keeps its database and lock. It must be on a local file system. | A path |
 | `env_file` | The secrets file. | A path, or `""` for none |
-| `timezone` | The default time zone for schedules and the time zone of the CLI's tables. `local` detects the zone from `TZ` or `/etc/localtime`, and falls back to UTC with a warning. | `local` or an IANA name |
-| `server.host` | The address that `treadle serve` listens on. Any address other than a loopback address needs a token. | A host or address |
+| `timezone` | The default time zone for schedules and the time zone of the CLI's tables. `local` detects the zone from `TZ` or `/etc/localtime`, and falls back to UTC with a warning. Write an IANA name exactly as the time zone database spells it, capitalization included: `timezone = "utc"` is an error, `unknown time zone 'utc'; did you mean 'UTC'?`. | `local` or an IANA name |
+| `server.host` | The address that `treadle serve` listens on. Any address other than a loopback address needs a token. `localhost` listens on both `127.0.0.1` and `::1`, on the same port, so no other local user can take that port on `::1`. On a system without IPv6, it listens on `127.0.0.1` alone. The default, `127.0.0.1`, listens on IPv4 only. | A host or address |
 | `server.port` | The port. | 0–65535 |
 | `server.token_env` | The variable that holds the API and dashboard token. Treadle looks in the environment first, then in `.env`. | A variable name |
-| `server.allowed_hosts` | More host names that the dashboard and API accept in the `Host` header, such as the public name of a reverse proxy. A wildcard must have the form `*.example.com`. | A list of host names |
+| `server.allowed_hosts` | More host names that the dashboard and API accept in the `Host` header, such as the public name of a reverse proxy. Each entry is a host name, an IPv4 address, an IPv6 address in brackets, `*`, or `*.` followed by a domain, such as `*.example.com`. Anything else, such as `foo*`, a port, a scheme, or `::1` without brackets, is a configuration error (exit 3). | A list of host names |
 | `server.secure_cookies` | Marks cookies `Secure`. Turn it on behind an HTTPS proxy. | `true` or `false` |
 | `server.session_ttl` | How long a dashboard sign-in lasts. | 5m–30d |
 | `runs.max_concurrent` | The most runs that are active at once, across workflows. | 1–64 |
 | `runs.kill_grace` | How long a stopped step's processes get between `SIGTERM` and `SIGKILL`. | 0s–60s |
 | `runs.shutdown_grace` | How long cleanup steps may run when the daemon shuts down. | 1s–10m |
-| `retention.max_age` | Finished runs older than this are deleted. | 1h–3650d |
+| `retention.max_age` | Treadle deletes finished runs older than this. | 1h–3650d |
 | `retention.max_runs_per_workflow` | Each workflow keeps at most this many runs. | 1–100,000 |
 | `retention.interval` | How often the daemon prunes. | 1m–7d |
 | `limits.step_log_bytes` | The log text that one step attempt keeps. | 64 KiB–64 MiB |
@@ -694,13 +786,33 @@ level = "info"                  # debug, info, warning, or error
 | `logging.level` | The daemon's log level. | `debug`, `info`, `warning`, or `error` |
 
 Relative paths in the file resolve against the file's directory, and `~` expands. An unknown
-key is an error with a suggestion, and every problem in the file is reported at once:
+key is an error with a suggestion, and Treadle reports every problem in the file at once,
+with exit code 3:
 
 ```text
 error: invalid configuration in /home/ada/project/treadle.toml
 treadle.toml: error[E101]: unknown key 'hots' in [server] (at server.hots)
    = help: did you mean 'host'?
 treadle.toml: error[E104]: must be between 0 and 65535 (at server.port)
+```
+
+A path that Treadle can't resolve is an error that names its key. That applies to
+`workflows_dir`, `state_dir`, `env_file`, and each `security.file_roots` entry, and to the
+`--workflows-dir` and `--state-dir` options:
+
+```text
+error: invalid configuration in /home/ada/project/treadle.toml
+treadle.toml: error[E104]: can't expand '~bob' to a home directory (at state_dir)
+   = help: check the user name after `~`, or write the full path
+```
+
+The other messages are `the path holds a NUL character`, and `can't resolve the path: ...`
+for a path that the operating system refuses to resolve. An entry of `server.allowed_hosts`
+that the `Host` check could never match gets an error of its own:
+
+```text
+treadle.toml: error[E104]: must be a host name or address, '*', or '*.' followed by a domain (at server.allowed_hosts[0])
+   = help: such as treadle.local, 192.168.1.10, [::1], or *.example.com, without a scheme or a port
 ```
 
 ### Precedence
@@ -726,6 +838,7 @@ Treadle keeps its state in `.treadle/` by default. `treadle init` adds it to `.g
 | `backups/` | Copies of the database from before each schema upgrade. Treadle keeps the newest 3. |
 | `tmp/` | Scratch directories for running runs. Treadle deletes each one when its run ends. |
 
-The directory has mode 0700. Deleting `secret.key` signs everyone out of the dashboard.
-Deleting `treadle.db` erases the history. To back up the database, see
+The directory has mode 0700. `treadle serve` reads `secret.key` when it starts, so after you
+delete the file, the next start creates a new key, which signs everyone out of the
+dashboard. Deleting `treadle.db` erases the history. To back up the database, see
 [Backups](operations.md#backups).

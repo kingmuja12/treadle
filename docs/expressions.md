@@ -227,6 +227,43 @@ steps:
     run: curl --fail --silent --data "Run ${TREADLE_RUN_ID} finished" "$NTFY_URL"
 ```
 
+While `treadle serve` runs, it reads `.env` again when the file changes, so a changed secret
+applies to new runs and webhook checks without a restart. The API token is the exception:
+it takes effect only after a restart. See [Signals](operations.md#signals).
+
+### The `.env` file
+
+`.env` holds one entry per line, in UTF-8:
+
+```sh
+# A comment line
+NTFY_URL=https://ntfy.sh/my-topic
+export BACKUP_HOST=nas.local     # `export` is optional, and ` #` starts a comment
+PASSWORD="correct horse #battery"
+GREETING="line one\nline two"
+PATTERN='^v[0-9]+\.[0-9]+$'
+```
+
+- Each line is blank, a comment that starts with `#`, or `KEY=VALUE`, with an optional
+  `export ` before it. A key uses the environment variable name pattern.
+- An unquoted value runs to the end of the line, without the spaces around it. A space or a
+  tab followed by `#` starts a comment, so `PASSWORD=correct horse #battery` sets
+  `correct horse`. Quote every value that holds a space or a `#`.
+- Single quotes keep the text exactly as written, on one line.
+- Double quotes can span lines, and turn `\n`, `\t`, `\"`, and `\\` into a newline, a tab,
+  a double quote, and a backslash. Any other backslash stays as written.
+- After a closing quote, the line can hold only spaces and a comment.
+- Treadle doesn't expand variables, so `$HOME` in a value stays `$HOME`.
+- When a key appears twice, the last value wins.
+- Treadle ignores one UTF-8 byte-order mark at the start of the file, which some editors
+  write, and accepts Windows line endings.
+
+When a line doesn't parse, the command stops with exit code 3, and the error names the file
+and the line, never the value:
+`error: /home/ada/automations/.env:2: the value of BAD has no closing quote, or text after it`.
+While `treadle serve` runs, a change that doesn't parse keeps the previous secrets, and the
+daemon logs a warning.
+
 ### Masking
 
 Treadle replaces each secret value with `***` in every log line, in stored inputs, trigger
@@ -235,6 +272,9 @@ data, step outputs, and errors, in the event file, and in the daemon's log. It m
 - The value itself.
 - Each line of a multi-line value.
 - The value in JSON-escaped form and in URL-encoded form.
+- A number whose JSON text contains a secret value, such as a numeric chat ID, in stored
+  inputs, trigger data, and outputs, and in the event file. The number becomes the string
+  `***`.
 
 Masking has limits:
 
@@ -242,10 +282,11 @@ Masking has limits:
   `treadle validate` warns about a short secret with W202.
 - A transformed value, such as a base64-encoded secret, isn't masked.
 - A secret split across two log lines isn't masked.
-- Later steps receive outputs unmasked, because they need the exact values. Only the stored
-  copies are masked.
+- Later steps receive outputs unmasked, because they need the exact values. Treadle masks
+  only the stored copies.
 - Treadle stores inputs masked, so a re-run of a run whose input held a secret runs with
-  `***` in its place.
+  `***` in its place. When that input is an `integer` or a `number`, the re-run fails input
+  validation instead, because `***` isn't a number.
 
 To mask a value that a step creates at run time, print `::add-mask::VALUE` to standard
 output. See [Masking values that a step creates](workflow-syntax.md#masking-values-that-a-step-creates).

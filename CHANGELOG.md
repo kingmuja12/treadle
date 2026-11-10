@@ -5,9 +5,9 @@ This file records every notable change to Treadle. Its format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Until 1.0, a minor version may
 change behavior in ways that aren't backward compatible.
 
-## [0.1.0] - Unreleased
+## [Unreleased]
 
-The first version. Nothing is tagged yet.
+The first version, 0.1.0. Nothing is tagged yet.
 
 ### Added
 
@@ -36,10 +36,13 @@ The first version. Nothing is tagged yet.
   untrusted data in scripts, paths, and URLs.
 - The `treadle` command: `init`, `validate`, `list`, `run`, `runs`, `show`, `logs`, `cancel`,
   `serve`, `cron`, `graph`, and `version`, most with `--json` output.
-- The `treadle serve` daemon, with hot reload of workflows and `.env`, graceful shutdown,
-  crash recovery that marks interrupted runs, and automatic pruning of old runs.
+- The `treadle serve` daemon, with hot reload of workflows and of the secrets in `.env`,
+  graceful shutdown, readiness notification for systemd's `Type=notify`, crash recovery
+  that marks interrupted runs, and automatic pruning of old runs.
 - A dashboard and a JSON API, protected by a token when you set one, with sign-in sessions,
   CSRF protection, a `Host` check against DNS rebinding, and security headers.
 - Run history in SQLite, with `--grep` search, re-runs, and backups before schema upgrades.
 - Documentation, and four example workflows: a nightly backup, a deploy on push, a
   downloads sorter, and a site uptime check.
+
+[Unreleased]: https://github.com/kingmuja12/treadle/commits/main

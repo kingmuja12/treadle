@@ -56,9 +56,20 @@ To check a workflow without running it, run `treadle validate`.
 - A file must be valid UTF-8 (E056), at most 1 MiB (E055), and a YAML mapping at the top
   level (E059).
 
-Treadle runs only regular files. If a workflow file is a symbolic link, `treadle validate`
-and `treadle list` show it, but `treadle run` and `treadle serve` ignore it. Copy the file
-into the workflows directory instead.
+Treadle loads only regular files, so every command skips a workflow file that is a symbolic
+link. To use such a workflow, copy the file into the workflows directory instead.
+
+- `treadle validate`, without a `PATH` or with a directory, warns about each link with W060,
+  `the file is a symbolic link, so Treadle skips it`. The warning counts toward `--strict`,
+  but the link counts neither as valid nor as invalid. With `--json`, the link appears under
+  `files` with `"workflow": null` and `"valid": false`.
+- `treadle list` prints a warning for each link to standard error, such as
+  `warning: workflows/linked.yml: the file is a symbolic link, so Treadle skips it`.
+- By its ID, `treadle run` and `treadle graph` treat a link as missing, and exit 4 with
+  ``error: workflow 'linked' doesn't exist: workflows/linked.yml is a symbolic link, which Treadle skips; copy the file into workflows instead``.
+- `treadle serve` skips a link without a warning.
+- When you give `treadle validate` or `treadle graph` the path of a link, it checks the file
+  that the link points to.
 
 ## YAML dialect
 
@@ -67,8 +78,23 @@ Treadle reads YAML with the YAML 1.2 core schema, which avoids the traps of YAML
 - Only `true`, `True`, `TRUE`, `false`, `False`, and `FALSE` are booleans. `yes`, `no`, `on`,
   and `off` stay strings, so `continue_on_error: yes` is an error (E103).
 - `null`, `Null`, `NULL`, `~`, and an empty value are null.
-- Integers are decimal (`0755` is 755), octal with `0o`, or hexadecimal with `0x`.
+- Integers are decimal (`0755` is 755), octal with `0o`, or hexadecimal with `0x`. An
+  integer with more than 4,300 decimal digits, Python's limit, counts as infinite, and so
+  does a `0o` or `0x` literal whose value is that large. Every key rejects such a number:
+  integer keys, such as `max_parallel`, with E103, and the others with E104, such as
+  `must be a finite number`.
 - Dates and values such as `1:30` stay strings.
+
+In a double-quoted string, every escape must produce a character that a string can hold.
+These escapes are E050:
+
+- An escape that writes NUL: `\0`, `\x00`, `\u0000`, or `\U00000000`.
+- A lone UTF-16 surrogate, such as `\ud800`.
+- A code point above U+10FFFF, such as `\U00110000`.
+
+Two `\u` escapes that form a surrogate pair become one character, as in JSON, so
+`"\ud83d\ude80"` means the same as `"\U0001F680"`, and a workflow file
+that Python's `json.dumps` wrote loads with the right characters.
 
 Treadle rejects these YAML features, so that every error location is exact:
 
@@ -213,7 +239,8 @@ new run while another run of the same workflow is queued or running.
   with the reason `already_active`.
 - **`replace`**: Treadle cancels every queued run of the workflow with the reason
   `replaced`, and asks the running run, if any, to cancel. The new run starts only after the
-  old run has ended, so two runs of one workflow never overlap.
+  old run has ended, so two runs of one workflow never overlap. More runs that arrive while
+  the old run is cancelling don't force it, so its cleanup steps still run.
 
 Across workflows, `[runs] max_concurrent` in `treadle.toml` (default 4) limits how many runs
 are active at once. A workflow that waits for its own active run doesn't delay the runs of
@@ -335,7 +362,7 @@ Each skipped step records one reason:
 | `upstream_failed` | The step's condition has no status function, and a step it depends on failed or timed out. |
 | `run_cancelled` | The run was cancelling, or Treadle forced the cancellation. |
 | `setup_failed` | The run failed before any step started, for example because a workflow `env` value didn't render. |
-| `run_interrupted` | The Treadle process stopped before the step started. |
+| `run_interrupted` | The step hadn't started when Treadle stopped running the run: the Treadle process stopped, an internal error failed the run, or a forced shutdown recorded the run as cancelled. |
 
 ### Timeouts and cancellation
 
@@ -348,6 +375,18 @@ Each skipped step records one reason:
   `cleanup_timeout` to finish, and then Treadle forces the cancellation.
 - Each step's process runs in its own process group. To stop a step, Treadle sends
   `SIGTERM` to the group, and then `SIGKILL` after `[runs] kill_grace` (default 5s).
+- A `file` step runs in a thread, which a timeout or a cancel can't interrupt. Its attempt
+  waits for the file operation to end, and logs whether it finished or failed. A timed-out
+  `file` attempt ends `timed_out` without a retry. When Treadle forces the cancellation, the
+  attempt stops waiting, and the operation may still finish after the step ends.
+- A process that a step starts in the background, such as `server >/dev/null 2>&1 &`, keeps
+  running for the later steps of the run, and the step's log says so. When the run ends,
+  whether it succeeded, failed, or was cancelled, Treadle stops such processes: `SIGTERM`,
+  and then `SIGKILL` after `[runs] kill_grace`. A forced shutdown kills them at once.
+- Redirect the output of a background process, as that example does. A background process
+  that keeps the step's output open keeps the step running.
+- A process that leaves its process group with `setsid` escapes Treadle. Under systemd,
+  `KillMode=mixed` stops it with the service.
 
 This workflow pauses a sync tool with a marker file, and removes the marker whether the
 maintenance step succeeds, fails, or is cancelled:
@@ -390,7 +429,7 @@ invalid, the step fails without starting an attempt.
 | `argv` | list of strings | none | Runs a program directly, without a shell. |
 | `shell` | `bash`, `sh`, `python`, or a list of strings | `defaults.shell` | Only with `run` (E407). |
 | `cwd` | string | `defaults.cwd` | `~` expands, and a relative path resolves against the project directory. |
-| `capture_stdout` | boolean | `false` | When `true`, the `stdout` output holds the last `[limits] stdout_capture_bytes` (default 64 KiB) of standard output, with one trailing newline removed. |
+| `capture_stdout` | boolean | `false` | When `true`, the `stdout` output holds standard output, with one trailing newline removed. When standard output is longer than `[limits] stdout_capture_bytes` characters (default 64 KiB), the output holds only the complete lines among the last that many characters, so a single line longer than the limit captures nothing. |
 | `success_codes` | list of integers | `[0]` | Exit codes from 0 to 255 that count as success. |
 
 Treadle writes a `run` script to a file with mode 0600, and runs it as follows:
@@ -411,6 +450,11 @@ Outputs:
 An exit code outside `success_codes` fails the attempt with the message `exit code N`, and
 Treadle may retry it.
 
+The operating system can't take a NUL character, or text that isn't valid Unicode, in a
+command line, an environment variable, or a path. When a rendered `argv` item, `env` value,
+or `cwd` holds one, for example from trigger data, the step fails without a retry. The error
+names the parameter, never the value.
+
 ### `http`
 
 The `http` step sends one request per attempt with a shared client that sends
@@ -424,28 +468,45 @@ The `http` step sends one request per attempt with a shared client that sends
 | `query` | mapping of values or lists of values | `{}` | A list repeats the parameter, and `null` sends an empty value. |
 | `json` | any JSON value | none | Sent as JSON, with `Content-Type: application/json` unless you set one. Can't be used with `body`. |
 | `body` | string | none | Sent as UTF-8. |
-| `timeout` | duration | `30s` | The limit for one request, including the response body. When you set it, it can't be longer than the step timeout (E407). |
+| `timeout` | duration | `30s` | The limit for the whole exchange: the request, its redirects, and the response body. When you set it, it can't be longer than the step timeout (E407). |
 | `expect` | list of status codes or patterns such as `"2xx"` | `["2xx"]` | Any other status fails the attempt. |
 | `follow_redirects` | boolean | `false` | Off by default, because a redirect to another host would still carry custom headers, such as `X-Api-Key`. |
-| `max_response_bytes` | size | `1MiB` | At most 10 MiB. A longer response fails the step. |
+| `max_response_bytes` | size | `1MiB` | At most 10 MiB. The limit counts the decoded body. A longer response fails the step without a retry. |
 
 Outputs, which every `http` step has:
 
 | Output | Value |
 |---|---|
 | `status` | The status code. |
-| `headers` | The response headers, with lowercase names. Repeated headers are joined with `, `. |
-| `body` | The body as text. |
+| `headers` | The response headers, with lowercase names. Treadle joins repeated headers with `, `. |
+| `body` | The body as text, decoded with the response's charset. |
 | `json` | The parsed body, when the content type is `application/json` or ends in `+json` and the body parses. Otherwise `null`. |
 | `url` | The final URL. |
 | `elapsed_ms` | How long the request took, in milliseconds. |
 
-A status outside `expect` fails the attempt. The error names the status and includes the
-first 2 KiB of the body. For a redirect that the step didn't follow, the error also names
-the target and suggests `follow_redirects: true`. When the step's retry policy allows more
-attempts, Treadle retries timeouts, connection errors, and unexpected statuses. A response
-longer than `max_response_bytes` fails the step without a retry. Each request writes one log
-line, such as `GET https://example.com/ -> 200 (123 ms)`.
+How the step handles cookies, redirects, and compressed bodies:
+
+- **Treadle keeps no cookies.** A cookie that a response sets never reaches a later request,
+  or another step. To send a cookie, set a `Cookie` header in `headers`. A redirect drops
+  that header.
+- **With `follow_redirects: true`, the step follows redirects itself.** It never reads the
+  body of a redirect response, and a cookie that a redirect sets reaches only the later
+  redirects of the same request.
+- **The step decodes gzip and deflate bodies itself**, and stops decoding one byte past
+  `max_response_bytes`, so a small compressed response can't use much memory. It sends
+  `Accept-Encoding: gzip, deflate` unless `headers` sets that header. A body in any other
+  content encoding arrives as the server sent it. A body that is compressed more than once,
+  such as one with `Content-Encoding: gzip, gzip`, fails the step without a retry.
+- **When the response's charset names a codec that can't decode text**, such as `base64` or
+  `idna`, Treadle decodes the body as UTF-8 instead, and logs a line that says so.
+
+A status outside `expect` fails the attempt. The error names the status, and includes the
+start of the body: up to 2,048 characters, without a line that this cut would split. When
+the body's first line is longer than that, the error includes none of the body. For a
+redirect that the step didn't follow, the error also names the target and suggests
+`follow_redirects: true`. When the step's retry policy allows more attempts, Treadle retries
+timeouts, connection errors, and unexpected statuses. Each request writes one log line, such
+as `GET https://example.com/ -> 200 (123 ms)`.
 
 ### `file`
 
@@ -476,8 +537,23 @@ Path rules:
 - The step never changes anything in the state directory. It never deletes or moves a file
   root, the project directory, the workflows directory, or a directory that contains one of
   them.
+- Treadle compares paths with the file roots, the state directory, and those protected
+  directories by file identity, not only by their text. On a file system that ignores letter
+  case or Unicode normalization, such as APFS on macOS, another spelling of a protected path
+  is still refused, and another spelling of a file root is accepted.
+- A `copy` with `recursive` and `overwrite` merges into an existing directory, and follows
+  the symbolic links that the destination holds. Before it copies anything, the step checks
+  each such link where the source has a file or a directory: a link that leads outside the
+  file roots or into the state directory fails the step. A link that stays inside the file
+  roots is followed.
 - `write` is atomic: Treadle writes a temporary file in the same directory, syncs it to
   disk, and renames it over the target.
+- A rendered `path` or `source` that holds a NUL character or text that isn't valid
+  Unicode fails the step without a retry, and so does `content` that isn't valid Unicode.
+  The error names the parameter, never the value.
+
+A step timeout or a cancel doesn't interrupt a file operation. See
+[Timeouts and cancellation](#timeouts-and-cancellation).
 
 Outputs: `path` (the resolved target), `bytes` (the bytes written by `write` and `append`,
 otherwise 0), and `changed` (`false` when `delete` found nothing to delete or `mkdir` found
@@ -578,8 +654,14 @@ steps:
 
 When a `shell` step prints a line `::add-mask::VALUE` to standard output, Treadle masks
 `VALUE` as `***` for the rest of the run, and logs the line itself as `::add-mask::***`.
-Use it for tokens that a step creates at run time. For how masking works, see
-[Masking](expressions.md#masking).
+Use it for tokens that a step creates at run time, and print the `::add-mask::` line before
+the value. For how masking works, see [Masking](expressions.md#masking).
+
+- Treadle reads a step's output in chunks, and registers every `::add-mask::` value in a
+  chunk before it writes any of the chunk's lines. So Treadle masks a value in its whole
+  chunk, even in a line that came before its `::add-mask::` line.
+- A run masks at most 1,000 values from `::add-mask::` lines. A step that adds more fails
+  without a retry: Treadle drops the rest of its output and its outputs, and logs a notice.
 
 ## Logs
 
@@ -614,6 +696,10 @@ Warnings don't, but `treadle validate --strict` fails on them too, which suits a
 The location of a problem inside a string is exact for plain scalars, single-quoted scalars
 (up to the first `''` escape), and literal block scalars (`|`). For double-quoted and folded
 (`>`) scalars, the location is the start of the value.
+
+A problem with a key itself points at the key, not at its value: an unknown key (E101),
+keys that can't be used together (E105), and a key name that doesn't match its pattern,
+such as an `env`, input, or output name (E104, `invalid key ...`).
 
 Treadle parses every template and `if` when it loads the file, and checks that:
 
@@ -675,6 +761,7 @@ Treadle parses every template and `if` when it loads the file, and checks that:
 | E405 | Reserved environment variable name (`TREADLE_` prefix) |
 | E406 | A declared output reuses one of the step type's output names |
 | E407 | Invalid step parameters, such as a key that doesn't apply, or an `http` timeout longer than the step timeout |
+| W060 | A workflow file that is a symbolic link, which Treadle skips |
 | W101 | Untrusted trigger data or HTTP response data in a `shell` `run` script |
 | W102 | An input or step output in a `shell` `run` script |
 | W103 | Untrusted data in a path or URL: `cwd`, `file` paths, or the `http` `url` |

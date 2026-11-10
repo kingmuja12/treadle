@@ -4,10 +4,15 @@
 # Setup:
 #   1. Set DEST to a folder on your backup drive. On Linux, use a mount point
 #      such as /mnt/backup/documents.
-#   2. Add NTFY_URL to .env, for example NTFY_URL=https://ntfy.sh/<your-topic>.
+#   2. Set the schedule's time zone to yours, or remove the timezone line to use
+#      the time zone in treadle.toml.
+#   3. The record step appends to ~/Library/Logs/treadle-backups.log, the usual
+#      place for logs on macOS. On Linux, change the path, for example to
+#      ~/.local/state/treadle-backups.log.
+#   4. Add NTFY_URL to .env, for example NTFY_URL=https://ntfy.sh/<your-topic>.
 #      Pick a topic name that is hard to guess, because anyone who knows it can
 #      read your notifications.
-#   3. Try a run that copies nothing: treadle run nightly-backup -i dry_run=true
+#   5. Try a run that copies nothing: treadle run nightly-backup -i dry_run=true
 name: Nightly backup
 description: Mirror ~/Documents to the backup drive every night and alert on failure.
 inputs:

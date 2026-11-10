@@ -80,9 +80,17 @@ uv run treadle validate --strict examples/*.yml
 - `scripts/check_hygiene.py` fails when the repository holds a secret file, such as `.env`,
   or text that looks like a private key or an access token.
 
-CI runs the tests and these checks on Ubuntu and macOS with Python 3.11 through 3.15, and
-runs mypy for each of those versions. It also builds the wheel, installs it in a fresh
-environment, and runs the installed command.
+CI runs these jobs on each pull request and each push to `main`:
+
+- **lint:** `ruff check` and `ruff format --check`, once, on Ubuntu.
+- **test:** mypy for the job's Python version, the tests, and the coverage floors, on
+  Ubuntu and macOS with Python 3.11 through 3.15. The tests also validate the example
+  workflows under `--strict` rules.
+- **build:** builds the sdist and the wheel, installs the wheel in a fresh environment, and
+  runs `treadle version`, `treadle init`, and `treadle validate --strict`. Then it starts
+  `treadle serve`, and loads the dashboard's pages and static files.
+- **hygiene:** `scripts/check_hygiene.py`, and `scripts/loc.py`, which prints the number of
+  code lines in `src/treadle`.
 
 ## Code style
 

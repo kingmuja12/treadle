@@ -23,11 +23,10 @@ On Linux, run Treadle as a systemd user service. Create
 ```ini
 [Unit]
 Description=Treadle workflow automation
-Wants=network-online.target
-After=network-online.target
 
 [Service]
-Type=exec
+# Treadle tells systemd when it listens.
+Type=notify
 WorkingDirectory=%h/automations
 ExecStart=%h/.local/bin/treadle serve
 ExecReload=/bin/kill -HUP $MAINPID
@@ -37,8 +36,9 @@ Restart=on-failure
 RestartSec=5
 # Exit code 3 is a configuration problem; restarting doesn't fix it.
 RestartPreventExitStatus=3
-# Stop every process the service started, including steps left behind by a crash.
-KillMode=control-group
+# SIGTERM goes to Treadle alone, so that cleanup steps can finish. When Treadle exits,
+# systemd kills every process left in the service, including steps that a crash left.
+KillMode=mixed
 TimeoutStopSec=60
 # Optional limits for Treadle and every step it starts.
 MemoryMax=1G
@@ -61,9 +61,20 @@ at boot.
 
 - `%h` is your home directory. `uv tool install` and `pipx install` put `treadle` in
   `~/.local/bin`. If yours is elsewhere, `command -v treadle` shows where.
-- `KillMode=control-group` matters: Treadle never signals the processes that a crashed
-  instance left behind, because their IDs may belong to other processes by now. systemd
-  knows which processes belong to the service, and stops them all.
+- With `Type=notify`, `treadle serve` sends `READY=1` to systemd once it listens, so systemd
+  counts the service as started only then. A `systemctl --user reload treadle` right after
+  a start or a restart waits until the daemon handles signals. Steps don't inherit the
+  `NOTIFY_SOCKET` variable.
+- `KillMode=mixed` sends `SIGTERM` to Treadle alone. Treadle cancels its runs, gives their
+  cleanup steps time to finish, and stops the step processes itself. Once Treadle has
+  exited, systemd kills every process that is left in the service. That includes the steps
+  that a crashed instance left behind, which Treadle never signals, because their IDs may
+  belong to other processes by now. With `KillMode=control-group`, systemd would also send
+  `SIGTERM` to every step process at once, which ends running cleanup steps.
+- A user service can't wait for the system's `network-online.target`, so this unit doesn't
+  name it. When Treadle needs the network at startup, for example to listen on a VPN
+  address, `Restart=on-failure` starts it again 5 seconds after a failed start. To order
+  Treadle after the network, run it as a system service with `User=` set to your user.
 - `TimeoutStopSec=60` leaves room for a graceful shutdown: up to `[runs] shutdown_grace`
   (15 seconds by default) for cleanup steps, plus the time it takes to stop the remaining
   processes.
@@ -78,7 +89,7 @@ Manage the service:
 |---|---|
 | See the logs | `journalctl --user -u treadle -f` |
 | Reload the workflows now | `systemctl --user reload treadle` |
-| Restart, for example after an upgrade or a change to `treadle.toml` | `systemctl --user restart treadle` |
+| Restart, for example after an upgrade, or a change to `treadle.toml` or to the API token | `systemctl --user restart treadle` |
 | Stop | `systemctl --user stop treadle` |
 
 If the daemon listens on a VPN address, such as a Tailscale address, it exits 8 when it
@@ -132,7 +143,11 @@ launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/local.treadle.serve.pl
 ```
 
 - `KeepAlive` with `SuccessfulExit` set to `false` restarts Treadle when it exits with an
-  error, but not after a clean stop.
+  error, but not after a clean stop. launchd has no setting that skips the restart for one
+  exit code, so after a configuration error (exit code 3), launchd starts Treadle again
+  about every 10 seconds, and each attempt logs the error. Fix the problem that the log
+  shows, and the next attempt starts Treadle. To stop the attempts meanwhile, unload the
+  agent with `launchctl bootout`.
 - `ExitTimeOut` gives Treadle 60 seconds to shut down after `SIGTERM`, before launchd sends
   `SIGKILL`.
 - launchd starts Treadle with a minimal `PATH`. The plist's `PATH` entry adds the usual
@@ -148,7 +163,7 @@ Manage the agent:
 |---|---|
 | See the logs | `tail -f ~/Library/Logs/treadle.log` |
 | Reload the workflows now | `launchctl kill HUP "gui/$(id -u)/local.treadle.serve"` |
-| Restart | `launchctl kickstart -k "gui/$(id -u)/local.treadle.serve"` |
+| Restart, for example after an upgrade, or a change to `treadle.toml` or to the API token | `launchctl kickstart -k "gui/$(id -u)/local.treadle.serve"` |
 | Stop and unload | `launchctl bootout "gui/$(id -u)/local.treadle.serve"` |
 
 ## Logs
@@ -157,9 +172,9 @@ The daemon writes its log to standard error, which journald and launchd capture.
 holds the time in UTC, the level, the component, and the message:
 
 ```text
-2026-11-10T09:11:47.586Z INFO treadle.daemon listening on http://127.0.0.1:8765
-2026-11-10T09:11:49.271Z INFO treadle.web POST /hooks/deploy 202 2ms
-2026-11-10T09:11:49.281Z INFO treadle.engine run=1 succeeded
+2026-11-10T13:06:16.508Z INFO treadle.daemon listening on http://127.0.0.1:8765
+2026-11-10T13:06:17.985Z INFO treadle.web POST /hooks/deploy 202 2ms
+2026-11-10T13:06:17.997Z INFO treadle.engine run=1 succeeded
 ```
 
 - Set the level with `[logging] level` in `treadle.toml`, or with `treadle serve
@@ -173,12 +188,32 @@ holds the time in UTC, the level, the component, and the message:
 
 | Signal | Effect |
 |---|---|
-| `SIGHUP` | Reloads the workflows now. The daemon also reloads them by itself, within a few seconds of a change. |
-| First `SIGTERM` or `SIGINT` | Shuts down gracefully: refuses new runs, cancels the running runs with the reason `shutdown`, gives their cleanup steps up to `[runs] shutdown_grace`, and exits 0. Queued runs stay queued for the next start. |
+| `SIGHUP` | Reloads the workflows now. The daemon also reloads them by itself, within a few seconds of a change. During startup, `SIGHUP` does nothing, because startup loads every workflow file anyway. |
+| First `SIGTERM` or `SIGINT` | Shuts down gracefully: refuses new runs, cancels the running runs with the reason `shutdown`, gives their cleanup steps up to `[runs] shutdown_grace`, and exits 0. A run that is already cancelling, for example after a user's cancel, keeps its reason, and its cleanup steps keep running within the same grace. Queued runs stay queued for the next start. During startup, the daemon shuts down as soon as it serves. |
 | Second `SIGTERM` or `SIGINT` | Stops the runs at once. |
 | Third `SIGTERM` or `SIGINT` | Exits 130 at once. The next start marks the leftover runs as interrupted. |
 
-A change to `treadle.toml` needs a restart. A change to `.env` doesn't.
+The daemon handles these signals from the moment its startup begins. A `SIGHUP` that
+arrives in about the first 0.3 seconds of the process, before `treadle serve` begins, can
+still end it. Under systemd, `Type=notify` keeps a reload from coming that early.
+
+A change to `treadle.toml` needs a restart, and the daemon logs a reminder. Changes to
+`.env` apply without a restart, except a change to the API token: `TREADLE_TOKEN`, or the
+variable that `[server] token_env` names. Until a restart, the API keeps checking, and
+masking, the token that the daemon started with. When `.env` changes the token, the daemon
+logs a warning:
+
+```text
+2026-11-10T12:30:44.069Z WARNING treadle.daemon TREADLE_TOKEN changed in .env; restart Treadle to apply it. Until then, the API doesn't require a token.
+```
+
+- When the daemon started with a token, the warning ends with
+  `Until then, the API accepts only the previous token.`
+- When Treadle couldn't start with the new value, such as a token shorter than 32
+  characters, or no token on an address other than loopback, the warning reads
+  `TREADLE_TOKEN changed in .env, but Treadle can't start with the new value: <reason>. Until a restart, ...`.
+- A change back to the token in use logs `TREADLE_TOKEN in .env is the token in use again`
+  at the `INFO` level.
 
 ## Backups
 
@@ -341,6 +376,8 @@ characters in `TREADLE_TOKEN`.
 | A webhook answers 503 `hook_disabled` | The hook's `secret_env` variable isn't set, or holds fewer than 16 characters. Set it in `.env`. |
 | A webhook answers 401 `unauthorized` | The secret, the signature header, or the signed body differs from what Treadle expects. Check `signature_header`, and test with the command in [Send a test delivery](triggers.md#send-a-test-delivery). |
 | The dashboard answers 400 `Invalid host header` | Add the host name you use to `[server] allowed_hosts`. |
+| The API accepts the old token after you changed `TREADLE_TOKEN`, or answers 401 to the new one | The daemon applies a token change only after a restart, and logs a warning until then. Restart `treadle serve`. |
+| The request log shows `POST /hooks/<name> 400` with no other error | The client disconnected before it sent the whole body. Treadle answers 400 to such a request, on `/hooks/`, the API, or a dashboard form, and logs no traceback. |
 | A schedule doesn't fire | Schedules fire only while `treadle serve` runs. Check the NEXT FIRE column of `treadle list`, and the times that `treadle cron` shows. A slot missed while the daemon was down runs only as `catch_up` allows. |
 | A watch doesn't fire | The first scan is silent, patterns are case-sensitive, and a missing folder makes the trigger degraded. The dashboard shows the trigger's health. |
 | `error: this database was created by a newer Treadle ...` | Upgrade Treadle, or restore a backup from before the upgrade. |

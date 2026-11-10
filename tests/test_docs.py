@@ -2,8 +2,8 @@
 
 The example workflows and every `yaml` block in `docs/` whose first line is
 `# treadle-example` must validate under `--strict` rules. The README must keep the sections
-that readers look for, and every relative link and heading anchor in the Markdown files must
-resolve.
+that readers look for, the reference tables must list every diagnostic code and exit code,
+and every relative link and heading anchor in the Markdown files must resolve.
 """
 
 from __future__ import annotations
@@ -27,6 +27,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DOCS = ROOT / "docs"
 EXAMPLES = ROOT / "examples"
 README = ROOT / "README.md"
+# The diagnostics tests' expected outputs, which together report every diagnostic code.
+GOLDEN_CASES = ROOT / "tests" / "unit" / "workflow" / "cases"
 MARKER = "# treadle-example"
 
 DOC_PAGES = (
@@ -63,6 +65,8 @@ _HEADING = re.compile(r"^(#{1,6})[ \t]+(?P<text>.+?)[ \t]*#*[ \t]*$")
 _LINK = re.compile(r"\]\((?P<target>[^)\s]+)\)")
 _EXTERNAL = re.compile(r"^[a-z][a-z0-9+.-]*:", re.IGNORECASE)
 _EMAIL = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
+_TABLE_KEY = re.compile(r"^\| (?P<key>[^|]+?) \|", re.MULTILINE)
+_REPORTED_CODE = re.compile(r"\b(?:error|warning)\[(?P<code>[EW][0-9]{3})\]")
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,6 +209,23 @@ def readme_sections() -> list[str]:
     ]
 
 
+def section(path: Path, heading: str) -> str:
+    """Return the prose under `heading`, up to the next heading of the same or a higher level."""
+    lines = prose(path).splitlines()
+    start = lines.index(heading) + 1
+    level = len(heading.split(" ", 1)[0])
+    for end in range(start, len(lines)):
+        match = _HEADING.match(lines[end])
+        if match is not None and len(match[1]) <= level:
+            return "\n".join(lines[start:end])
+    return "\n".join(lines[start:])
+
+
+def table_keys(text: str) -> list[str]:
+    """Return the first cell of each table row in `text`, the header rows included."""
+    return [match["key"] for match in _TABLE_KEY.finditer(text)]
+
+
 # The example workflows
 
 
@@ -305,12 +326,38 @@ def test_readme_links_each_doc_page(page: str) -> None:
     assert f"](docs/{page}.md)" in README.read_text(encoding="utf-8")
 
 
+# Reference tables
+
+
+def test_the_diagnostic_codes_table_lists_every_reported_code() -> None:
+    table = section(DOCS / "workflow-syntax.md", "### Diagnostic codes")
+    documented = [key for key in table_keys(table) if re.fullmatch(r"[EW][0-9]{3}", key)]
+    reported = {
+        match["code"]
+        for path in GOLDEN_CASES.glob("*.txt")
+        for match in _REPORTED_CODE.finditer(path.read_text(encoding="utf-8"))
+    }
+    assert reported, f"no diagnostic codes found in {GOLDEN_CASES}"
+    assert documented == sorted(set(documented)), "list each code once, in order"
+    assert set(documented) == reported
+
+
+def test_the_exit_codes_table_lists_every_exit_code() -> None:
+    table = section(DOCS / "cli.md", "## Exit codes")
+    documented = {int(key) for key in table_keys(table) if key.isdigit()}
+    missing = sorted(int(code) for code in ExitCode if code not in documented)
+    assert not missing, f"docs/cli.md doesn't list exit codes {missing}"
+
+
 # The other project files
 
 
 def test_changelog_has_the_unreleased_first_version() -> None:
     lines = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8").splitlines()
-    assert "## [0.1.0] - Unreleased" in lines
+    assert "## [Unreleased]" in lines
+    assert "The first version, 0.1.0. Nothing is tagged yet." in lines
+    # Keep a Changelog headings are links, so the file defines their targets.
+    assert "[Unreleased]: https://github.com/kingmuja12/treadle/commits/main" in lines
 
 
 def test_security_policy_uses_private_reporting_without_an_email_address() -> None:
