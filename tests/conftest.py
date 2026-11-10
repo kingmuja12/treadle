@@ -9,7 +9,6 @@ import random
 import textwrap
 from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
-from typing import Any
 
 import httpx
 import pytest
@@ -17,12 +16,12 @@ import pytest
 from tests.support.clock import FakeClock
 from tests.support.fakes import FakeStep, FakeSteps
 from tests.support.project import ProjectFactory
-from treadle import __version__
 from treadle.config import Settings
 from treadle.models import Workflow
 from treadle.secrets import SecretSnapshot
 from treadle.steps.base import StepRegistry
 from treadle.steps.builtin import builtin_registry
+from treadle.steps.http import shared_client
 from treadle.store.async_store import AsyncStore
 from treadle.workflow.loader import WorkflowLoader
 
@@ -108,17 +107,14 @@ def load_workflow(settings: Settings, fake_steps: FakeSteps) -> Callable[..., Wo
 
 @pytest.fixture
 def mock_http() -> Callable[..., httpx.AsyncClient]:
-    """Return `build(handler, **kwargs) -> httpx.AsyncClient` over `httpx.MockTransport`.
+    """Return `build(handler) -> httpx.AsyncClient` over `httpx.MockTransport(handler)`.
 
-    The client has the executor's settings: at most 5 redirects and the Treadle User-Agent.
+    The client comes from `treadle.steps.http.shared_client`, so tests exercise the
+    production client's redirect limit, User-Agent, and cookie policy.
     """
 
-    def build(
-        handler: Callable[[httpx.Request], httpx.Response], **kwargs: Any
-    ) -> httpx.AsyncClient:
-        kwargs.setdefault("max_redirects", 5)
-        kwargs.setdefault("headers", {"User-Agent": f"treadle/{__version__}"})
-        return httpx.AsyncClient(transport=httpx.MockTransport(handler), **kwargs)
+    def build(handler: Callable[[httpx.Request], httpx.Response]) -> httpx.AsyncClient:
+        return shared_client(transport=httpx.MockTransport(handler))
 
     return build
 

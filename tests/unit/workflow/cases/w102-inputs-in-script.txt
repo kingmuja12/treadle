@@ -2,9 +2,9 @@ workflows/w102-inputs-in-script.yml:8:27: warning[W102]: `inputs.name` is pasted
    |
  8 |     run: echo "Hello, ${{ inputs.name }} at ${{ steps.build.outputs.tag }}"
    |                           ^
-   = help: pass it through env instead: set `env: {VALUE: ${{ inputs.name }}}`, then quote "$VALUE" in the script
+   = help: pass it through env instead: set `env: {VALUE: "${{ inputs.name }}"}`, then quote "$VALUE" in the script
 workflows/w102-inputs-in-script.yml:8:49: warning[W102]: `steps.build.outputs.tag` is pasted into the `run` script as code
    |
  8 |     run: echo "Hello, ${{ inputs.name }} at ${{ steps.build.outputs.tag }}"
    |                                                 ^
-   = help: pass it through env instead: set `env: {VALUE: ${{ steps.build.outputs.tag }}}`, then quote "$VALUE" in the script
+   = help: pass it through env instead: set `env: {VALUE: "${{ steps.build.outputs.tag }}"}`, then quote "$VALUE" in the script

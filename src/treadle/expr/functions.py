@@ -146,15 +146,14 @@ def _from_json(text: JSONValue) -> JSONValue:
         raise _ArgumentError(f"expects a string, got {_kind(text)}")
     if len(text) > _MAX_CHARS:
         raise _ArgumentError(f"input is longer than {_MAX_CHARS} characters")
-    too_deep = f"input nests deeper than {_MAX_JSON_DEPTH} levels"
+    # The depth is checked before parsing, because how deep json.loads can recurse, and so
+    # which error it raises for deep input, differs between Python versions.
+    if _nests_deeper_than(text, _MAX_JSON_DEPTH):
+        raise _ArgumentError(f"input nests deeper than {_MAX_JSON_DEPTH} levels")
     try:
         value: JSONValue = json.loads(text, parse_constant=_no_constant, parse_float=_finite)
-    except RecursionError:
-        raise _ArgumentError(too_deep) from None
     except ValueError as error:
         raise _ArgumentError(f"can't parse the JSON: {error}") from None
-    if _deeper_than(value, _MAX_JSON_DEPTH):
-        raise _ArgumentError(too_deep)
     return value
 
 
@@ -169,13 +168,32 @@ def _finite(text: str) -> float:
     return number
 
 
-def _deeper_than(value: JSONValue, levels: int) -> bool:
-    """True when arrays and objects nest more than `levels` deep."""
-    if isinstance(value, dict):
-        value = list(value.values())
-    if not isinstance(value, list):
-        return False
-    return levels == 0 or any(_deeper_than(item, levels - 1) for item in value)
+def _nests_deeper_than(text: str, levels: int) -> bool:
+    """True when the arrays and objects in JSON `text` nest more than `levels` deep.
+
+    One pass counts the brackets and braces outside strings, and stops at the first one
+    that is too deep. The count is exact for valid JSON. For other text, it only decides
+    whether this error or the parser's error comes first.
+    """
+    depth = 0
+    in_string = escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > levels:
+                return True
+        elif char in "]}":
+            depth -= 1
+    return False
 
 
 def _length(value: JSONValue) -> int:

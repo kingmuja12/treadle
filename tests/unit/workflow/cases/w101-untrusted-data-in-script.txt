@@ -2,9 +2,9 @@ workflows/w101-untrusted-data-in-script.yml:12:27: warning[W101]: `trigger.body.
    |
 12 |       echo "Deploying ${{ trigger.body.ref }}"
    |                           ^
-   = help: pass it through env instead: set `env: {VALUE: ${{ trigger.body.ref }}}`, then quote "$VALUE" in the script
+   = help: pass it through env instead: set `env: {VALUE: "${{ trigger.body.ref }}"}`, then quote "$VALUE" in the script
 workflows/w101-untrusted-data-in-script.yml:13:29: warning[W101]: `steps.fetch.outputs.body` puts untrusted data into the `run` script
    |
 13 |       echo "Remote says ${{ steps.fetch.outputs.body }}"
    |                             ^
-   = help: pass it through env instead: set `env: {VALUE: ${{ steps.fetch.outputs.body }}}`, then quote "$VALUE" in the script
+   = help: pass it through env instead: set `env: {VALUE: "${{ steps.fetch.outputs.body }}"}`, then quote "$VALUE" in the script

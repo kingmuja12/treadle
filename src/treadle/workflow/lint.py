@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import errno
+import json
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -227,14 +229,14 @@ class _Linter:
         data = next((ref for kind, ref in kinds if kind == "data"), None)
         if untrusted is not None and sink == "code":
             message = f"`{_text(untrusted)}` puts untrusted data into the `{site.param}` script"
-            self._warn_at("W101", message, site, untrusted, _env_hint(untrusted))
+            self._warn_at("W101", message, site, untrusted, _env_hint(site.expression, untrusted))
         elif untrusted is not None:
             message = f"`{_text(untrusted)}` puts untrusted data into `{site.param}`"
             hint = f"check the value first, or build the {sink} from trusted parts"
             self._warn_at("W103", message, site, untrusted, hint)
         elif data is not None and sink == "code":
             message = f"`{_text(data)}` is pasted into the `{site.param}` script as code"
-            self._warn_at("W102", message, site, data, _env_hint(data))
+            self._warn_at("W102", message, site, data, _env_hint(site.expression, data))
 
     def _warn_at(self, code: str, message: str, site: _Site, ref: Reference, hint: str) -> None:
         """Warn at the position of `ref` inside the site's expression."""
@@ -303,16 +305,39 @@ def _text(ref: Reference) -> str:
     return ".".join(ref.path)
 
 
-def _env_hint(ref: Reference) -> str:
+def _env_hint(expression: Expression, ref: Reference) -> str:
+    """Return the W101 and W102 hint, whose `env` entry is valid YAML that passes `ref` on.
+
+    The entry writes the reference as the expression does, inside a double-quoted scalar.
+    JSON string syntax is valid in such a scalar, so quotes and backslashes keep their
+    meaning.
+    """
+    template = "${{ " + expression.source[ref.start : ref.end] + " }}"
+    value = json.dumps(template, ensure_ascii=False)
     return (
-        "pass it through env instead: set `env: {VALUE: ${{ " + _text(ref) + " }}}`, "
+        "pass it through env instead: set `env: {VALUE: " + value + "}`, "
         'then quote "$VALUE" in the script'
     )
 
 
 def _contains(outer: Path, inner: Path) -> bool:
-    """True when `inner` is `outer` or inside it, comparing resolved paths."""
-    try:
-        return inner.resolve().is_relative_to(outer.resolve())
-    except (OSError, RuntimeError):  # a symlink loop
+    """True when `inner` is `outer` or inside it, comparing resolved paths.
+
+    A path that leads into a symlink loop contains nothing and is inside nothing.
+    """
+    if _in_symlink_loop(outer) or _in_symlink_loop(inner):
         return False
+    return inner.resolve().is_relative_to(outer.resolve())
+
+
+def _in_symlink_loop(path: Path) -> bool:
+    """True when the system can't follow `path` because of a symlink loop (ELOOP).
+
+    `Path.resolve()` can't tell: from Python 3.13 on, it leaves a loop unresolved instead of
+    raising.
+    """
+    try:
+        path.stat()
+    except OSError as error:
+        return error.errno == errno.ELOOP
+    return False

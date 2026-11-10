@@ -335,6 +335,42 @@ def test_invalid_arguments_raise_with_the_function_name(source: str, message: st
 
 
 @pytest.mark.parametrize(
+    "text",
+    [
+        "[" * 65,
+        '{"a":' * 65,
+        "[" * 65 + "]" * 65,
+        "[" * 100_000,
+        r'["\\",' + "[" * 64 + "]" * 64 + "]",
+    ],
+    ids=[
+        "open-arrays",
+        "open-objects",
+        "closed-arrays",
+        "100k-open-arrays",
+        "after-an-escaped-backslash",
+    ],
+)
+def test_from_json_rejects_deep_nesting_before_it_parses(text: str) -> None:
+    with pytest.raises(EvaluationError) as caught:
+        call_function("fromJSON", [text], source="fromJSON(x)", offset=0)
+
+    assert caught.value.message == "fromJSON() input nests deeper than 64 levels"
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('"' + "[" * 65 + '"', "[" * 65),
+        (r'["\"' + "{" * 65 + '"]', ['"' + "{" * 65]),
+    ],
+    ids=["brackets", "braces-after-an-escaped-quote"],
+)
+def test_from_json_ignores_brackets_inside_strings(text: str, expected: JSONValue) -> None:
+    assert call_function("fromJSON", [text], source="fromJSON(x)", offset=0) == expected
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "format('{0}{0}', v.big)",

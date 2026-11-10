@@ -127,6 +127,36 @@ def test_the_safe_pattern_passes_untrusted_data_through_env() -> None:
     assert warnings(workflow) == []
 
 
+@pytest.mark.parametrize(
+    "reference",
+    [
+        "trigger.body.ref",
+        "inputs.name",
+        "trigger.changes[0].path",
+        "trigger.body['say \"hi\"']",
+        r"trigger.body['C:\temp']",
+    ],
+    ids=["member", "input", "index", "quotes", "backslash"],
+)
+def test_a_workflow_written_from_the_env_hint_passes_validation(reference: str) -> None:
+    [issue] = lint(script(reference), builtin_registry())
+    assert issue.hint is not None
+    entry = issue.hint.split("`")[1]
+    workflow = workflow_from(
+        f"""\
+        inputs:
+          name: {{default: x}}
+        steps:
+          - id: build
+            {entry}
+            run: echo "$VALUE"
+        """
+    )
+
+    assert warnings(workflow) == []
+    assert dict(workflow.steps[0].env)["VALUE"].source == "${{ " + reference + " }}"
+
+
 def test_w103_flags_untrusted_data_in_paths_and_urls() -> None:
     workflow = workflow_from(
         """\
@@ -452,3 +482,13 @@ def test_a_watch_path_in_a_symlink_loop_never_contains_anything(tmp_path: Path) 
     assert warnings(workflow, state_dir=tmp_path / "a" / "inner" / ".treadle") == [
         ("W301", f"the watch path {tmp_path / 'a' / 'inner'} doesn't exist")
     ]
+
+
+def test_a_state_directory_in_a_symlink_loop_is_inside_nothing(tmp_path: Path) -> None:
+    (tmp_path / "a").symlink_to(tmp_path / "b")
+    (tmp_path / "b").symlink_to(tmp_path / "a")
+    workflow = workflow_from(
+        "triggers:\n  watch: .\nsteps:\n  - {id: a, run: x}\n", project_dir=tmp_path
+    )
+
+    assert warnings(workflow, state_dir=tmp_path / "a" / ".treadle") == []
