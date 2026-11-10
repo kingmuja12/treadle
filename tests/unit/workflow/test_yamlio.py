@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import textwrap
+import time
 
 import pytest
 
@@ -91,6 +92,21 @@ def test_nan_resolves_to_a_float(text: str) -> None:
 
 def test_an_integer_too_long_for_python_becomes_a_float() -> None:
     assert load(f"value: {'9' * 5000}\n").data == {"value": math.inf}
+
+
+@pytest.mark.parametrize(
+    "literal",
+    [
+        pytest.param("0x" + "f" * 4000, id="hex"),
+        pytest.param("0o" + "7" * 5000, id="octal"),
+    ],
+)
+def test_an_octal_or_hex_integer_too_long_to_print_becomes_infinite(literal: str) -> None:
+    assert load(f"value: {literal}\n").data == {"value": math.inf}
+
+
+def test_a_long_hex_integer_that_prints_stays_an_integer() -> None:
+    assert load(f"value: 0x{'f' * 20}\n").data == {"value": 16**20 - 1}
 
 
 def test_non_string_keys_keep_their_types_and_positions() -> None:
@@ -236,6 +252,94 @@ def test_a_control_character_is_located() -> None:
             hint="remove the control character; YAML files hold printable text only",
         )
     ]
+
+
+@pytest.mark.parametrize(
+    "escape",
+    [
+        pytest.param("\\U00110000", id="above-the-unicode-range"),
+        pytest.param("\\UFFFFFFFF", id="above-a-c-int"),
+    ],
+)
+def test_an_escape_above_the_unicode_range_is_located(escape: str) -> None:
+    _, issues = load_yaml(f'a: 1\nname: "ab{escape}cd"\n')
+
+    assert issues == [
+        Issue(
+            Severity.ERROR,
+            "E050",
+            f"invalid escape {escape}: the code point is above U+10FFFF",
+            position=Position(2, 10),
+            hint="the largest code point is \\U0010FFFF",
+        )
+    ]
+
+
+def test_the_largest_code_point_escape_loads() -> None:
+    assert load('name: "\\U0010FFFF"\n').data == {"name": "\U0010ffff"}
+
+
+def test_surrogate_pair_escapes_become_one_character() -> None:
+    document = load('name: "Deploy \\ud83d\\uDE80"\n"\\ud83d\\ude80": key\n')
+
+    assert document.data == {"name": "Deploy \U0001f680", "\U0001f680": "key"}
+
+
+@pytest.mark.parametrize(
+    ("text", "unit"),
+    [
+        pytest.param('a: "\\ud800"\n', "D800", id="lone-high-surrogate"),
+        pytest.param('a: "x\\uDC00y"\n', "DC00", id="lone-low-surrogate"),
+        pytest.param('a: "\\udc00\\ud800"\n', "DC00", id="reversed-pair"),
+    ],
+)
+def test_a_lone_surrogate_escape_is_rejected(text: str, unit: str) -> None:
+    _, issues = load_yaml(text)
+
+    assert issues == [
+        Issue(
+            Severity.ERROR,
+            "E050",
+            f"invalid escape: U+{unit} is a lone surrogate, not a character",
+            position=Position(1, 4),
+            hint="write the character itself, or one \\U escape such as \\U0001F680",
+        )
+    ]
+
+
+def test_lone_surrogates_in_values_and_keys_are_all_reported() -> None:
+    assert problems('a: "\\ud83d"\n"\\ud800": b\n') == [
+        ("E050", "invalid escape: U+D83D is a lone surrogate, not a character", (1, 4)),
+        ("E050", "invalid escape: U+D800 is a lone surrogate, not a character", (2, 1)),
+    ]
+
+
+@pytest.mark.parametrize("escape", ["\\0", "\\x00", "\\u0000", "\\U00000000"])
+def test_a_nul_escape_is_rejected(escape: str) -> None:
+    _, issues = load_yaml(f'env:\n  TAG: "v1{escape}"\n')
+
+    assert issues == [
+        Issue(
+            Severity.ERROR,
+            "E050",
+            "invalid escape: a string can't hold U+0000 (NUL)",
+            position=Position(2, 8),
+            hint="remove the escape; processes, file paths, and environment variables can't "
+            "take NUL",
+        )
+    ]
+
+
+def test_a_nul_escape_in_a_key_is_rejected() -> None:
+    assert problems('"a\\0b": 1\n') == [
+        ("E050", "invalid escape: a string can't hold U+0000 (NUL)", (1, 1))
+    ]
+
+
+def test_other_escapes_and_quoted_backslashes_still_load() -> None:
+    document = load("a: \"tab\\there \\\\u0000\"\nb: 'single \\0'\nc: plain \\0\n")
+
+    assert document.data == {"a": "tab\there \\u0000", "b": "single \\0", "c": "plain \\0"}
 
 
 def test_deep_nesting_is_rejected_before_it_can_exhaust_the_stack() -> None:
@@ -393,3 +497,35 @@ def test_a_literal_line_that_doesnt_match_the_source_falls_back_to_the_start() -
 
 def test_an_offset_in_a_value_under_a_non_string_key_falls_back_to_its_start() -> None:
     assert load("1: echo ${{ x }}\n").offset_position(("1",), 5) == Position(1, 4)
+
+
+LONG_VALUE = "x" * 1_000_000
+
+
+@pytest.mark.parametrize(
+    ("source", "style", "first"),
+    [
+        pytest.param(f"run: {LONG_VALUE}\n", "plain", Position(1, 6), id="plain"),
+        pytest.param(f"run: '{LONG_VALUE}'\n", "'", Position(1, 7), id="single-quoted"),
+        pytest.param(f"run: |\n  {LONG_VALUE}\n", "|", Position(2, 3), id="literal"),
+    ],
+)
+def test_placing_many_offsets_in_one_long_scalar_takes_linear_time(
+    source: str, style: str, first: Position
+) -> None:
+    value = f"{LONG_VALUE}\n" if style == "|" else LONG_VALUE
+    document = YamlDocument(
+        {"run": value},
+        source,
+        {(): Position(1, 1), ("run",): Position(1, 6)},
+        {("run",): Position(1, 1)},
+        {("run",): style},
+    )
+    offsets = range(len(LONG_VALUE) - 20_000, len(LONG_VALUE))
+
+    started = time.perf_counter()
+    positions = [document.offset_position(("run",), offset) for offset in offsets]
+    elapsed = time.perf_counter() - started
+
+    assert positions == [Position(first.line, first.column + offset) for offset in offsets]
+    assert elapsed < 0.3

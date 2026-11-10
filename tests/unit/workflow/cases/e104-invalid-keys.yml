@@ -1,0 +1,11 @@
+env:
+  DEPLOY-TARGET:
+    prod
+  BAD-NULL: null
+inputs:
+  bad name: {type: string}
+steps:
+  - id: build
+    run: echo hi
+    outputs:
+      out put: done

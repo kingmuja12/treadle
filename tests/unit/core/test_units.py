@@ -56,9 +56,10 @@ def test_parse_duration_rejects_bad_values_with_a_reason(value: object, reason: 
 @pytest.mark.parametrize(
     ("seconds", "text"),
     [
-        (0, "0s"),
-        (-3, "0s"),
+        (0, "0ms"),
+        (-3, "0ms"),
         (0.0004, "0ms"),
+        (0.001, "1ms"),
         (0.85, "850ms"),
         (0.9996, "1s"),
         (12.3, "12.3s"),

@@ -166,7 +166,7 @@ def test_lock_holder_from_json_returns_none_when_malformed(data: object) -> None
     assert LockHolder.from_json(data) is None
 
 
-def test_exit_codes_match_section_9() -> None:
+def test_exit_codes_are_stable() -> None:
     assert [(code.name, code.value) for code in ExitCode] == [
         ("OK", 0),
         ("FAILURE", 1),

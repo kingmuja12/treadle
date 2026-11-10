@@ -1,7 +1,6 @@
 """The tree-walking evaluator and template rendering.
 
-Section 3 ("Types, operators, and coercion") defines the semantics. Values are plain JSON
-values; nothing reaches `eval` or Python attributes.
+Values are plain JSON values, and nothing reaches `eval` or Python attributes.
 """
 
 from __future__ import annotations
@@ -216,8 +215,8 @@ class _Evaluator:
                 raise self.error(f"an array index must be an integer, got {shown}", node.index)
             return container[position] if 0 <= position < len(container) else None
         if isinstance(container, dict):
-            # Design note: section 3 gives object keys as strings or numbers only, so any
-            # other key type raises, like a bad array index.
+            # Object keys are strings or numbers only, so any other key type raises, like a
+            # bad array index.
             if isinstance(key, bool) or not isinstance(key, (str, int, float)):
                 raise self.error(
                     f"an object key must be a string or a number, got {_kind(key)}", node.index

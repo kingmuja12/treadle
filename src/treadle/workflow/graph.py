@@ -39,8 +39,8 @@ def to_text(workflow: Workflow) -> str:
     Each line reads `[depth] id  uses  needs: a, b  if: condition`, and implicit needs are
     marked `(implicit)`. A root step has no `needs:` part.
     """
-    # Design note: section 9's example line starts with "[1]" for a step that is both at
-    # depth 1 and at position 1; the number is the depth, which the ordering is based on.
+    # The bracketed number is the depth, not the position: lines are ordered by depth, and
+    # the position only breaks ties.
     level = depths(workflow)
     lines = []
     for step in sorted(workflow.steps, key=lambda step: (level[step.id], step.position)):

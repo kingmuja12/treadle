@@ -108,7 +108,7 @@ def test_durations_need_a_start_and_a_finish() -> None:
     assert make_attempt(finished_at=None).duration_ms is None
 
 
-def test_defaults_match_section_2() -> None:
+def test_defaults_match_the_documented_defaults() -> None:
     assert RetryPolicy() == RetryPolicy(attempts=1, delay=1.0, backoff=2.0, max_delay=300.0)
     assert RetryPolicy().jitter == 0.0
     defaults = Defaults()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import re
+from bisect import bisect_left
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Final
@@ -16,9 +17,9 @@ from treadle.types import Issue, Position, Severity, YamlPath
 
 MAX_FILE_BYTES: Final = 1 << 20
 
-# Design note: the design sets no nesting limit, but the composer, the schema, and the
-# expression compiler all recurse, so a deeply nested document is rejected as E050 before any
-# of them can hit Python's recursion limit. 64 matches the JSON nesting limit elsewhere.
+# The composer, the schema, and the expression compiler all recurse, so a deeply nested
+# document is rejected as E050 before any of them can hit Python's recursion limit. 64 matches
+# the JSON nesting limit elsewhere.
 _MAX_DEPTH: Final = 64
 _NULL: Final = "tag:yaml.org,2002:null"
 _BOOL: Final = "tag:yaml.org,2002:bool"
@@ -39,6 +40,14 @@ _CORE_SCHEMA: Final = (
     ),
 )
 _REPEAT_HINT: Final = "repeat the value where you need it"
+# Escapes in double-quoted scalars can write what the reader rejects in raw text: UTF-16
+# surrogates and NUL. A surrogate pair is joined into one character, as JSON does.
+_SURROGATE: Final = re.compile("[\ud800-\udfff]")
+_SURROGATE_HINT: Final = "write the character itself, or one \\U escape such as \\U0001F680"
+_NUL_HINT: Final = (
+    "remove the escape; processes, file paths, and environment variables can't take NUL"
+)
+_LARGEST_ESCAPE_HINT: Final = "the largest code point is \\U0010FFFF"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,9 +66,17 @@ class YamlDocument:
     styles: Mapping[YamlPath, str]
     # The source split into lines once, for position lookups; not a constructor argument.
     _lines: tuple[str, ...] = field(init=False, repr=False, compare=False)
+    # What `offset_position` learns about each scalar the first time, so that placing many
+    # issues in one long scalar takes linear time: for a plain or single-quoted scalar, how
+    # much of the value its source line repeats and where its first quote is; for a literal
+    # block, its line breaks and the indent of each line.
+    _inline: dict[YamlPath, tuple[int, int]] = field(init=False, repr=False, compare=False)
+    _blocks: dict[YamlPath, _Block] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "_lines", tuple(self.source.splitlines()))
+        object.__setattr__(self, "_inline", {})
+        object.__setattr__(self, "_blocks", {})
 
     def position(self, path: YamlPath, *, key: bool = False) -> Position | None:
         """Return the position of a value (or its key), falling back to the nearest ancestor.
@@ -80,10 +97,9 @@ class YamlDocument:
         """Map a character offset inside the string at `path` to a file position.
 
         Exact for single-line plain scalars, single-line single-quoted scalars without `''`
-        before the offset, and literal block scalars; otherwise the scalar's start.
+        before the offset, and literal block scalars; otherwise the scalar's start. A plain
+        or single-quoted scalar that spans several lines is also exact on its first line.
         """
-        # Design note: a plain or single-quoted scalar is also exact on its first line when it
-        # spans several, because the check below compares the value with the source text.
         resolved = self._resolve(path)
         start = self.value_positions.get(resolved)
         value = self._value(resolved)
@@ -92,16 +108,14 @@ class YamlDocument:
         offset = min(max(offset, 0), len(value))
         style = self.styles.get(resolved)
         if style == "|":
-            return self._literal_position(start, value, offset) or start
-        if style == "plain":
-            column = start.column
-        elif style == "'" and "'" not in value[:offset]:
-            column = start.column + 1
-        else:
+            return self._literal_position(resolved, start, value, offset) or start
+        if style not in ("plain", "'"):
             return start
-        # The scalar is exact up to the offset only when the source repeats it verbatim.
-        line = self._line(start.line)
-        if line is not None and line[column - 1 :].startswith(value[: offset + 1]):
+        column = start.column if style == "plain" else start.column + 1
+        shared, quote = self._inline_facts(resolved, start.line, column, value, style)
+        # Exact while the source line repeats the value verbatim up to the offset, and, in a
+        # single-quoted scalar, before the first `''` escape, which the value holds as `'`.
+        if min(offset + 1, len(value)) <= shared and not 0 <= quote < offset:
             return Position(start.line, column + offset)
         return start
 
@@ -140,17 +154,48 @@ class YamlDocument:
     def _line(self, number: int) -> str | None:
         return self._lines[number - 1] if 0 < number <= len(self._lines) else None
 
-    def _literal_position(self, start: Position, value: str, offset: int) -> Position | None:
+    def _inline_facts(
+        self, path: YamlPath, line: int, column: int, value: str, style: str
+    ) -> tuple[int, int]:
+        """Return how many characters of `value` the source repeats from `line` and `column`,
+        and the index of the value's first `'` in a single-quoted scalar, or -1."""
+        facts = self._inline.get(path)
+        if facts is None:
+            text = self._line(line)
+            shared = 0 if text is None else _shared_length(text[column - 1 :], value)
+            facts = (shared, value.find("'") if style == "'" else -1)
+            self._inline[path] = facts
+        return facts
+
+    def _literal_position(
+        self, path: YamlPath, start: Position, value: str, offset: int
+    ) -> Position | None:
         """Map an offset in a `|` block: each value line is one source line after the header."""
-        row = value.count("\n", 0, offset)
-        begin = value.rfind("\n", 0, offset) + 1
-        end = value.find("\n", offset)
-        content = value[begin : end if end >= 0 else len(value)]
+        block = self._blocks.get(path)
+        if block is None:
+            block = self._blocks[path] = _Block(_line_breaks(value))
+        row = bisect_left(block.breaks, offset)
+        begin = block.breaks[row - 1] + 1 if row else 0
         number = start.line + 1 + row
-        line = self._line(number)
-        if line is None or not line.endswith(content):
-            return None
-        return Position(number, len(line) - len(content) + offset - begin + 1)
+        if row not in block.indents:
+            end = block.breaks[row] if row < len(block.breaks) else len(value)
+            content, line = value[begin:end], self._line(number)
+            block.indents[row] = (
+                len(line) - len(content) if line is not None and line.endswith(content) else None
+            )
+        indent = block.indents[row]
+        return None if indent is None else Position(number, indent + offset - begin + 1)
+
+
+@dataclass(slots=True)
+class _Block:
+    """A literal block's line breaks, and the indent of each value line once it's checked.
+
+    The indent is None when the source line doesn't end with the value line.
+    """
+
+    breaks: list[int]
+    indents: dict[int, int | None] = field(default_factory=dict)
 
 
 def load_yaml(text: str) -> tuple[YamlDocument | None, list[Issue]]:
@@ -158,13 +203,18 @@ def load_yaml(text: str) -> tuple[YamlDocument | None, list[Issue]]:
 
     Only YAML 1.2 booleans and nulls resolve, integers are decimal, `0o`, or `0x`, and dates
     stay strings. Duplicate keys (with both locations), merge keys, anchors, aliases, and tags
-    are errors. The document is None whenever there is an issue.
+    are errors, and so are escapes that write a lone UTF-16 surrogate, NUL, or a code point
+    above U+10FFFF. The document is None whenever there is an issue.
     """
     issues: list[Issue] = []
     try:
         loader = _Loader(text, issues)
         try:
             root = loader.get_single_node()
+        except (ValueError, OverflowError):
+            # PyYAML's scanner calls chr() on a \U escape without checking the range, so a
+            # code point above U+10FFFF raises here, while the scanner is at its hex digits.
+            return None, [*issues, _escape_range_issue(loader.get_mark(), loader.prefix(8))]
         finally:
             loader.dispose()
     except ReaderError as exc:
@@ -230,7 +280,7 @@ class _Builder:
     def build(self, node: yaml.Node, path: YamlPath) -> object:
         self.values.setdefault(path, _position(node.start_mark))
         if isinstance(node, yaml.ScalarNode):
-            value = _scalar(node)
+            value = self._scalar(node)
             if isinstance(value, str):
                 self.styles.setdefault(path, node.style or "plain")
             return value
@@ -244,15 +294,15 @@ class _Builder:
         for key_node, value_node in node.value:
             where = _position(key_node.start_mark)
             if not isinstance(key_node, yaml.ScalarNode):
-                # Design note: no code covers a list or mapping used as a key, and the loader
-                # builds only string-keyed mappings, so a complex key is a YAML error (E050).
+                # Workflow files use string keys only, and nothing reads a list or a mapping
+                # used as a key, so a complex key is a YAML error (E050).
                 self._issue("E050", "complex mapping keys aren't supported", where)
                 continue
             if key_node.style is None and key_node.value == "<<":
                 hint = "repeat the keys you need instead of merging them"
                 self._issue("E052", "merge keys (`<<`) aren't supported", where, hint)
                 continue
-            key = _scalar(key_node)
+            key = self._scalar(key_node)
             first = seen.setdefault((type(key), key), where)
             if first is not where:
                 message = (
@@ -264,6 +314,28 @@ class _Builder:
             self.keys.setdefault(child, where)
             result.setdefault(key, self.build(value_node, child))
         return result
+
+    def _scalar(self, node: yaml.ScalarNode) -> object:
+        """Return a scalar's value, checking what the escapes of a double-quoted string wrote.
+
+        `\\u` escapes that form a UTF-16 surrogate pair become one character. A lone surrogate
+        or a NUL is E050 at the scalar, because no step could use the string.
+        """
+        value = _scalar(node)
+        if node.style != '"' or not isinstance(value, str):
+            return value
+        where = _position(node.start_mark)
+        if _SURROGATE.search(value):
+            try:
+                value = value.encode("utf-16-le", "surrogatepass").decode("utf-16-le")
+            except UnicodeDecodeError as exc:
+                unit = int.from_bytes(exc.object[exc.start : exc.start + 2], "little")
+                message = f"invalid escape: U+{unit:04X} is a lone surrogate, not a character"
+                self._issue("E050", message, where, _SURROGATE_HINT)
+        if "\0" in value:
+            message = "invalid escape: a string can't hold U+0000 (NUL)"
+            self._issue("E050", message, where, _NUL_HINT)
+        return value
 
     def _issue(self, code: str, message: str, where: Position, hint: str | None = None) -> None:
         self.issues.append(Issue(Severity.ERROR, code, message, position=where, hint=hint))
@@ -292,13 +364,23 @@ def _scalar(node: yaml.ScalarNode) -> object:
 
 
 def _integer(text: str) -> int | float:
-    if text.startswith("0o"):
-        return int(text[2:], 8)
-    if text.startswith("0x"):
-        return int(text[2:], 16)
+    """Convert a core-schema integer. One with too many decimal digits becomes infinite.
+
+    Python converts integers to and from decimal text only up to a limit of digits. A
+    decimal literal past it becomes a float, which is infinite. Octal and hexadecimal
+    literals skip the limit, so one whose value is past it becomes infinite too. Every loaded
+    value can then be printed and written as JSON, and the schema rejects the infinite ones.
+    """
+    if text.startswith(("0o", "0x")):
+        value = int(text[2:], 8 if text[1] == "o" else 16)
+        try:
+            str(value)  # raises ValueError past the limit on decimal digits
+        except ValueError:
+            return math.inf
+        return value
     try:
         return int(text)
-    except ValueError:  # more digits than Python converts; the schema reports it out of range
+    except ValueError:
         return float(text)
 
 
@@ -330,6 +412,33 @@ def _syntax_issue(exc: yaml.MarkedYAMLError) -> Issue:
         hint = f"{exc.context}{where}"
     position = _position(mark) if mark is not None else None
     return Issue(Severity.ERROR, "E050", message, position=position, hint=hint)
+
+
+def _escape_range_issue(mark: yaml.Mark, digits: str) -> Issue:
+    """E050 at a `\\U` escape whose 8 hex `digits`, which start at `mark`, are too large."""
+    message = f"invalid escape \\U{digits}: the code point is above U+10FFFF"
+    position = Position(mark.line + 1, mark.column - 1)  # at the backslash before "U"
+    return Issue(Severity.ERROR, "E050", message, position=position, hint=_LARGEST_ESCAPE_HINT)
+
+
+def _shared_length(text: str, value: str) -> int:
+    """Return the length of the longest common prefix of `text` and `value`."""
+    if text.startswith(value):
+        return len(value)
+    for index, (char, other) in enumerate(zip(text, value, strict=False)):
+        if char != other:
+            return index
+    return len(text)
+
+
+def _line_breaks(text: str) -> list[int]:
+    """Return the index of every newline in `text`, in order."""
+    breaks: list[int] = []
+    index = text.find("\n")
+    while index >= 0:
+        breaks.append(index)
+        index = text.find("\n", index + 1)
+    return breaks
 
 
 def _reader_issue(text: str, exc: ReaderError) -> Issue:

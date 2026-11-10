@@ -18,8 +18,10 @@ from treadle.types import Issue, Severity, YamlPath
 from treadle.units import format_duration
 from treadle.yamlio import YamlDocument
 
+# The trigger fields that whoever sends the event chooses. A webhook signature covers only the
+# body, so a replayed delivery can carry any delivery ID and content type it likes.
 TAINTED_TRIGGER_FIELDS: Final[frozenset[str]] = frozenset(
-    {"body", "headers", "query", "changes", "paths"}
+    {"body", "headers", "query", "content_type", "delivery", "changes", "paths"}
 )
 
 # The outputs of an `http` step that carry what the server sent.

@@ -327,7 +327,7 @@ def make_watch(
     initial_scan: bool = False,
     key: str | None = None,
 ) -> WatchTrigger:
-    """Build a watch trigger with the design's defaults."""
+    """Build a watch trigger with the defaults that a workflow file gets."""
     return WatchTrigger(
         key=key or f"{workflow_id}:watch:{'|'.join(str(path) for path in paths)}",
         paths=tuple(paths),
@@ -354,7 +354,7 @@ def make_webhook(
     max_body: int = 1 << 20,
     rate_limit: int = 60,
 ) -> WebhookTrigger:
-    """Build a webhook trigger with the design's defaults."""
+    """Build a webhook trigger with the defaults that a workflow file gets."""
     default_header = (
         "x-hub-signature-256" if signature is SignatureMode.HMAC_SHA256 else "x-gitlab-token"
     )

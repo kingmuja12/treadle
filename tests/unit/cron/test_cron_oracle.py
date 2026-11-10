@@ -1,6 +1,6 @@
-"""Differential tests: the fire functions against a brute-force oracle (section 11).
+"""Differential tests: the fire functions against a brute-force oracle.
 
-The oracle steps through UTC minutes and applies the DST table of section 6 directly: an
+The oracle steps through UTC minutes and applies the DST rules directly: an
 existing wall time fires at its instant (fixed-time schedules only on its first occurrence),
 and a forward jump fires at the jump for fixed-time schedules when it skipped a matching wall
 time. Every 2026 transition in these zones falls on a whole minute, so minute steps see them.

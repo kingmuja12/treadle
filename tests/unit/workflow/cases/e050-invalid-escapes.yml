@@ -1,0 +1,7 @@
+name: "Deploy \ud83d\ude80"
+env:
+  TAG: "v1\0"
+  LABEL: "\ud800 and more"
+steps:
+  - id: greet
+    run: echo hi

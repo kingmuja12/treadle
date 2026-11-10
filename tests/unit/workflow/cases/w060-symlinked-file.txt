@@ -1,0 +1,2 @@
+workflows/linked.yml: warning[W060]: the file is a symbolic link, so Treadle skips it
+   = help: copy the file into the workflows directory instead

@@ -51,7 +51,7 @@ def test_a_failed_run_leads_with_the_failure(cli: Cli, project: ProjectFactory) 
     lines = result.out.splitlines()
     assert lines[0] == "Run #1  flaky  (manual)"
     assert re.fullmatch(
-        r"  ✗ fetch    attempt 1/2: source .*missing\.txt doesn't exist; retrying in 0s", lines[1]
+        r"  ✗ fetch    attempt 1/2: source .*missing\.txt doesn't exist; retrying in 0ms", lines[1]
     )
     assert re.fullmatch(
         rf"  ✗ fetch    attempt 2/2: source .*missing\.txt doesn't exist \({_DURATION}\)", lines[2]

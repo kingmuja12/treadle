@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 import pytest
 
@@ -44,10 +45,35 @@ from treadle.globs import GlobMatcher, compile_glob
         ("[\\]", "\\", True),
         ("a+b(c).txt", "a+b(c).txt", True),
         ("*.PDF", "report.pdf", False),
+        ("*.tar.*", "a.b.tar.gz", True),
+        ("*.tar.*", "a.tar", False),
+        ("*-*", "a-b-c", True),
+        ("*x*x*", "xx", True),
+        ("*x*x*", "x", False),
+        ("a*b*c", "abcbc", True),
+        ("a*b*c", "abcbd", False),
+        ("*[0-9]*.log", "app-2026.log", True),
+        ("*?*", "", False),
+        ("*b/*.pdf", "abxb/z.pdf", True),
+        ("a*b*c/d*e", "abxbc/dxe", True),
+        ("a*b*c/d*e", "abxbcx/dxe", False),
+        ("**/x*-*-*.pdf", "deep/dir/x1-2-3.pdf", True),
     ],
 )
 def test_the_glob_table(pattern: str, path: str, expected: bool) -> None:
     assert bool(compile_glob(pattern).fullmatch(path)) is expected
+
+
+def test_a_pattern_with_many_stars_rejects_a_long_near_miss_quickly() -> None:
+    matcher = GlobMatcher(["*-*-*-*-*-*.pdf"], [])
+    near_miss = "-".join(["a"] * 121) + ".txt"
+
+    started = time.perf_counter()
+    matched = matcher.matches(near_miss)
+    elapsed = time.perf_counter() - started
+
+    assert (len(near_miss), matched) == (245, False)
+    assert elapsed < 0.25
 
 
 @pytest.mark.parametrize(

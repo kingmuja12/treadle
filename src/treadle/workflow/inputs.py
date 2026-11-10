@@ -1,4 +1,4 @@
-"""Run input parsing and coercion (section 2, "inputs.<name>")."""
+"""Run inputs: parsing CLI `key=value` pairs, and coercing values to each input's type."""
 
 from __future__ import annotations
 
@@ -13,9 +13,8 @@ from treadle.models import InputSpec, InputType
 from treadle.schema import suggest
 from treadle.types import JSONValue
 
-# Design note: section 2 writes the integer rule as ^[+-]?\d+$. Python's \d also matches
-# non-ASCII digits and $ allows a trailing newline, so the rule is applied as ASCII digits
-# with a full match.
+# An integer is an optional sign and ASCII digits, matched in full: Python's \d would also
+# match non-ASCII digits, and $ would allow a trailing newline.
 _INTEGER: Final = re.compile(r"[+-]?[0-9]+")
 _JSON_NUMBER: Final = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
 

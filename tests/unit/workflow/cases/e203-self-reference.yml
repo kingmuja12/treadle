@@ -1,0 +1,12 @@
+steps:
+  - id: probe
+    uses: http
+    with:
+      url: https://example.net/
+    outputs:
+      code: ${{ steps.probe.outputs.status }}
+  - id: build
+    if: steps.build.status == 'success'
+    env:
+      VALUE: ${{ steps.build.outputs.value }}
+    run: echo "$VALUE"

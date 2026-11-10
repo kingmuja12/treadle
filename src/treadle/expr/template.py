@@ -1,4 +1,4 @@
-"""Templates (`${{ }}` inside strings) and step conditions (section 3, "Rendering templates")."""
+"""Templates (`${{ }}` inside strings) and step conditions."""
 
 from __future__ import annotations
 
@@ -82,9 +82,9 @@ def parse_condition(value: str | bool) -> Condition:
 
 def _parse_slice(text: str, start: int, end: int) -> Expression:
     """Parse `text[start:end]` as an expression, reporting errors against all of `text`."""
-    # Design note: section 3 calls an error's `source` the expression text, but its `offset`
-    # indexes the YAML string, and `ExpressionError.caret()` indexes `source` with `offset`.
-    # Errors therefore carry the YAML string whenever it is known, so the two agree.
+    # An error's `offset` indexes the YAML string, and `ExpressionError.caret()` indexes
+    # `source` with that offset, so the error carries the whole YAML string as its `source`
+    # rather than the expression text alone.
     try:
         return parse_expression(text[start:end], offset=start)
     except ExpressionSyntaxError as error:
@@ -96,8 +96,8 @@ def _parse_slice(text: str, start: int, end: int) -> Expression:
 def _compile(value: object, path: YamlPath, errors: _TreeErrors | None) -> TemplateTree:
     if isinstance(value, str):
         return _compile_string(value, path, errors)
-    # Design note: non-finite floats pass through, because schema validation reports them
-    # (E104) after the loader compiles a tree.
+    # Non-finite floats pass through, because schema validation reports them (E104) after
+    # the loader compiles a tree.
     if value is None or isinstance(value, (bool, int, float)):
         return value
     if isinstance(value, list):

@@ -1,4 +1,4 @@
-"""Cron parsing and fire-time computation with the DST rules of section 6.
+"""Cron parsing and fire-time computation, with Treadle's rules for daylight saving time.
 
 Naive datetimes are wall times in a trigger's zone. Aware datetimes are UTC instants.
 """
@@ -41,8 +41,8 @@ _PROOF_START: Final = datetime(2000, 1, 1) - _MINUTE
 _END_OF_TIME: Final = datetime.max.replace(tzinfo=UTC)
 _LAST_MINUTE: Final = 24 * 60 - 1
 _LAYOUT: Final = "minute hour day-of-month month day-of-week"
-# Design note: the grammar separates fields with spaces. Any whitespace separates them here,
-# and whitespace around the expression is ignored, as in a crontab line.
+# Any whitespace separates fields, and whitespace around the expression is ignored, as in a
+# crontab line.
 _WORD: Final = re.compile(r"\S+")
 _ITEM: Final = re.compile(r"(?:(\*)|([^-/*]+)(?:-([^-/*]+))?)(?:/(.+))?")
 # Quartz-style day specials: "L", "5L", "15W", and "LW".

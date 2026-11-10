@@ -1,4 +1,4 @@
-"""Durations and sizes, as section 2 ("Common value formats") defines them."""
+"""Durations such as `1h30m` and sizes such as `64KiB`: parsing and formatting."""
 
 from __future__ import annotations
 
@@ -46,15 +46,13 @@ def parse_duration(value: object) -> float:
 
 
 def format_duration(seconds: float) -> str:
-    """Format seconds compactly: "850ms", "12.3s", "3m04s", "1h02m", "2d03h".
+    """Format seconds compactly: "0ms", "850ms", "12.3s", "3m04s", "1h02m", "2d03h".
 
-    Negative values format as zero, and a zero second unit is dropped ("10m", "2h").
+    Anything under a second is in milliseconds, negative values format as "0ms", and a zero
+    second unit is dropped ("10m", "2h").
     """
-    # Design note: dropping a zero second unit yields the "10m" and "2h" that the design's
-    # messages use, such as "timed out after 10m".
+    # Dropping a zero second unit keeps messages short, such as "timed out after 10m".
     seconds = max(seconds, 0.0)
-    if seconds == 0:
-        return "0s"
     if round(seconds * 1000) < 1000:
         return f"{round(seconds * 1000)}ms"
     if round(seconds * 10) < 600:

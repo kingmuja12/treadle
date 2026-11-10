@@ -123,8 +123,8 @@ class EvaluationError(ExpressionError):
 class CronError(TreadleError):
     """An invalid cron expression. `offset` points at the bad field when it's known."""
 
-    # Design note: the exit-code table maps an invalid cron expression to 2, so CronError
-    # carries ExitCode.USAGE and `treadle cron` needs no special case.
+    # An invalid cron expression is a usage error (exit code 2), so CronError carries
+    # ExitCode.USAGE and `treadle cron` needs no special case.
     exit_code = ExitCode.USAGE
 
     def __init__(self, message: str, *, source: str, offset: int | None = None) -> None:
@@ -139,8 +139,8 @@ class StepError(TreadleError):
     `outputs` carries partial outputs, and `exit_code` the process exit code, when known.
     """
 
-    # The design gives StepError an instance `exit_code` (the step's process exit code) that
-    # shadows TreadleError's CLI exit code; step errors never reach the CLI.
+    # StepError's instance `exit_code` is the step's process exit code, which shadows
+    # TreadleError's CLI exit code; step errors never reach the CLI.
     exit_code: int | None  # type: ignore[assignment, misc]
 
     def __init__(

@@ -12,8 +12,8 @@ import difflib
 import math
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any, Final, Protocol
 
 from treadle.expr.ast import Template
@@ -34,10 +34,16 @@ _KINDS: Final = (
 
 @dataclass(slots=True)
 class CheckContext:
-    """Collects issues during one validation. `allow_templates` lets `Template` values pass."""
+    """Collects issues during one validation. `allow_templates` lets `Template` values pass.
+
+    `key_issues` also holds each issue that concerns a mapping key rather than its value: an
+    unknown key, keys that can't be used together, a key that isn't a string, and a key that
+    doesn't match `MapOf`'s pattern.
+    """
 
     issues: list[Issue]
     allow_templates: bool = False
+    key_issues: list[Issue] = field(default_factory=list)
 
 
 class Spec(Protocol):
@@ -81,7 +87,7 @@ class _Base(ABC):
         """Check a value that isn't a passing template."""
 
     def _wrong_type(self, value: object, path: YamlPath, ctx: CheckContext) -> object:
-        _report(ctx, "E103", f"expected {self.describe()}, got {_kind(value)}", path)
+        _report(ctx, "E103", f"expected {self.describe()}, got {kind_of(value)}", path)
         return value
 
 
@@ -252,11 +258,9 @@ class ListOf(_Base):
     """A list whose items match `item`.
 
     With `scalar_ok`, any single non-list value other than null becomes a one-element list, so
-    `needs: build` and `schedule: {cron: ...}` both work.
+    `needs: build` and `schedule: {cron: ...}` both work. With `unique`, an item equal to an
+    earlier one is E104 at the repeat; items that failed their own check aren't compared.
     """
-
-    # Design note: section 4 says a scalar becomes a one-element list. Triggers also accept one
-    # mapping as one item, so every non-list value except null is wrapped.
 
     def __init__(
         self,
@@ -279,20 +283,23 @@ class ListOf(_Base):
 
     def _check(self, value: object, path: YamlPath, ctx: CheckContext) -> object:
         if isinstance(value, list):
-            items = [
-                self._item.check(item, (*path, index), ctx) for index, item in enumerate(value)
-            ]
+            written = [(item, (*path, index)) for index, item in enumerate(value)]
         elif self._scalar_ok and value is not None:
-            items = [self._item.check(value, path, ctx)]
+            written = [(value, path)]
         else:
             return self._wrong_type(value, path, ctx)
+        items: list[object] = []
+        valid: list[bool] = []
+        for item, item_path in written:
+            before = len(ctx.issues)
+            items.append(self._item.check(item, item_path, ctx))
+            valid.append(len(ctx.issues) == before)
         if len(items) < self._min_len:
             _report(ctx, "E104", f"must have at least {_count(self._min_len, 'item')}", path)
         if self._max_len is not None and len(items) > self._max_len:
             _report(ctx, "E104", f"must have at most {_count(self._max_len, 'item')}", path)
-        for index, item in enumerate(items if self._unique else ()):
-            if item in items[:index]:
-                _report(ctx, "E104", f"duplicate value {item!r}", (*path, index))
+        for index in _repeats(items, valid) if self._unique else ():
+            _report(ctx, "E104", f"duplicate value {items[index]!r}", (*path, index))
         return items
 
 
@@ -322,7 +329,7 @@ class MapOf(_Base):
                 message = (
                     f"invalid key '{name}': must match the pattern {self._key_pattern.pattern}"
                 )
-                _report(ctx, "E104", message, (*path, name))
+                _report(ctx, "E104", message, (*path, name), key=True)
             result[name] = self._value.check(item, (*path, name), ctx)
         return result
 
@@ -375,8 +382,8 @@ class Obj(_Base):
     E105, and `require_one` groups are E106. `check` returns a `dict[str, object]`.
     """
 
-    # Design note: an explicit null for a key whose default is null passes unchecked, so
-    # `timestamp_header: null` and an input's `default: null` are valid.
+    # An explicit null for a key whose default is null passes unchecked, so a written
+    # `timestamp_header: null` or an input's `default: null` means the same as leaving it out.
 
     def __init__(
         self,
@@ -439,7 +446,7 @@ class Obj(_Base):
             present = [key for key in group if key in value]
             if len(present) > 1:
                 message = f"{_join(present, 'and')} can't be used together"
-                _report(ctx, "E105", message, (*path, present[1]))
+                _report(ctx, "E105", message, (*path, present[1]), key=True)
         for group in self._require_one:
             if not any(key in value for key in group):
                 _report(ctx, "E106", f"one of {_join(group, 'or')} is required", path)
@@ -453,15 +460,27 @@ class Obj(_Base):
         close = suggest(key, self._fields) if hint is None else None
         if close is not None:
             hint = f"did you mean '{close}'?"
-        _report(ctx, "E101", f"unknown key '{key}' in {self._name}", (*path, key), hint)
+        _report(ctx, "E101", f"unknown key '{key}' in {self._name}", (*path, key), hint, key=True)
 
 
 def validate(
-    spec: Spec, value: object, *, path: YamlPath = (), allow_templates: bool = False
+    spec: Spec,
+    value: object,
+    *,
+    path: YamlPath = (),
+    allow_templates: bool = False,
+    key_issues: list[Issue] | None = None,
 ) -> tuple[object, list[Issue]]:
-    """Check `value` against `spec` and return the normalized value and every issue found."""
+    """Check `value` against `spec` and return the normalized value and every issue found.
+
+    When `key_issues` is given, each issue that concerns a mapping key rather than its value
+    is also appended to it, so that a caller can point that issue at the key.
+    """
     ctx = CheckContext([], allow_templates)
-    return spec.check(value, path, ctx), ctx.issues
+    result = spec.check(value, path, ctx)
+    if key_issues is not None:
+        key_issues.extend(ctx.key_issues)
+    return result, ctx.issues
 
 
 def suggest(word: str, candidates: Iterable[str]) -> str | None:
@@ -470,22 +489,56 @@ def suggest(word: str, candidates: Iterable[str]) -> str | None:
     return matches[0] if matches else None
 
 
-def _report(
-    ctx: CheckContext, code: str, message: str, path: YamlPath, hint: str | None = None
-) -> None:
-    ctx.issues.append(Issue(Severity.ERROR, code, message, path, hint=hint))
-
-
-def _kind(value: object) -> str:
+def kind_of(value: object) -> str:
+    """Name a value's type for messages: "null", "a boolean", "a number", "a string", "a list",
+    "a mapping", "a template", or, for anything else, the name of its class."""
     if value is None:
         return "null"
     return next((name for cls, name in _KINDS if isinstance(value, cls)), type(value).__name__)
 
 
+def _report(
+    ctx: CheckContext,
+    code: str,
+    message: str,
+    path: YamlPath,
+    hint: str | None = None,
+    *,
+    key: bool = False,
+) -> None:
+    issue = Issue(Severity.ERROR, code, message, path, hint=hint)
+    ctx.issues.append(issue)
+    if key:
+        ctx.key_issues.append(issue)
+
+
+def _repeats(items: Sequence[object], valid: Sequence[bool]) -> Iterator[int]:
+    """Yield the index of each valid item that equals an earlier valid item.
+
+    Hashable items are looked up in a set. Lists and mappings, which aren't hashable, are
+    compared with the earlier lists and mappings only.
+    """
+    seen: set[object] = set()
+    unhashable: list[object] = []
+    for index, (item, ok) in enumerate(zip(items, valid, strict=True)):
+        if not ok:
+            continue
+        try:
+            repeated = item in seen
+            seen.add(item)
+        except TypeError:
+            repeated = item in unhashable
+            if not repeated:
+                unhashable.append(item)
+        if repeated:
+            yield index
+
+
 def _key_name(key: object, path: YamlPath, ctx: CheckContext) -> str:
     """Return `key` as a string, reporting E103 when the mapping key isn't a string."""
     if not isinstance(key, str):
-        _report(ctx, "E103", f"expected a string key, got {_kind(key)}", (*path, str(key)))
+        message = f"expected a string key, got {kind_of(key)}"
+        _report(ctx, "E103", message, (*path, str(key)), key=True)
     return str(key)
 
 

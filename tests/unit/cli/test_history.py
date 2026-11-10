@@ -206,7 +206,7 @@ def test_logs_of_one_attempt(cli: Cli) -> None:
 
     texts = [line.split(" | ", 1)[1] for line in result.out.splitlines()]
     assert texts[0].startswith("attempt 1 failed: source ")
-    assert texts[1] == "retrying in 0s (attempt 2 of 2)"
+    assert texts[1] == "retrying in 0ms (attempt 2 of 2)"
     assert all(" fetch#1 " in line for line in result.out.splitlines())
 
 

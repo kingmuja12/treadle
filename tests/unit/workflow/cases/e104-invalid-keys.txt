@@ -1,0 +1,20 @@
+workflows/e104-invalid-keys.yml:2:3: error[E104]: invalid key 'DEPLOY-TARGET': must match the pattern [A-Za-z_][A-Za-z0-9_]*
+   |
+ 2 |   DEPLOY-TARGET:
+   |   ^
+workflows/e104-invalid-keys.yml:4:3: error[E104]: invalid key 'BAD-NULL': must match the pattern [A-Za-z_][A-Za-z0-9_]*
+   |
+ 4 |   BAD-NULL: null
+   |   ^
+workflows/e104-invalid-keys.yml:4:13: error[E103]: expected a string, number, or boolean, got null
+   |
+ 4 |   BAD-NULL: null
+   |             ^
+workflows/e104-invalid-keys.yml:6:3: error[E104]: invalid key 'bad name': must match the pattern [A-Za-z_][A-Za-z0-9_-]{0,63}
+   |
+ 6 |   bad name: {type: string}
+   |   ^
+workflows/e104-invalid-keys.yml:11:7: error[E104]: invalid key 'out put': must match the pattern [A-Za-z_][A-Za-z0-9_-]{0,63}
+   |
+11 |       out put: done
+   |       ^

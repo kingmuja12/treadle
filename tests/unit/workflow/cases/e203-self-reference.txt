@@ -1,0 +1,15 @@
+workflows/e203-self-reference.yml:7:17: error[E203]: step 'probe' can't refer to itself through `steps`
+   |
+ 7 |       code: ${{ steps.probe.outputs.status }}
+   |                 ^
+   = help: read this step's own results through `result`, such as result.status
+workflows/e203-self-reference.yml:9:9: error[E203]: step 'build' can't refer to itself through `steps`
+   |
+ 9 |     if: steps.build.status == 'success'
+   |         ^
+   = help: `if` decides whether the step runs, so the step has no status or outputs yet
+workflows/e203-self-reference.yml:11:18: error[E203]: step 'build' can't refer to itself through `steps`
+   |
+11 |       VALUE: ${{ steps.build.outputs.value }}
+   |                  ^
+   = help: the step has no outputs until it finishes; read them in a later step

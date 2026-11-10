@@ -1,4 +1,4 @@
-"""Fixtures that every test package shares (section 11, "Fixtures and test doubles").
+"""Fixtures that every test package shares.
 
 A fixture that calls a later package's API works once that package lands.
 """

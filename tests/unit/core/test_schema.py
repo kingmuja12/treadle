@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 import pytest
@@ -20,6 +21,7 @@ from treadle.schema import (
     Size,
     Spec,
     Str,
+    kind_of,
     suggest,
     validate,
 )
@@ -101,7 +103,7 @@ class TestNumbers:
             (Int(max=5), 6, "must be at most 5"),
             (Num(min=1.0, max=10.0), 0.5, "must be between 1 and 10"),
             (Duration(min=1, max=7 * 86400), 0.5, "must be between 1s and 7d"),
-            (Duration(max=3600), "2h", "must be between 0s and 1h"),
+            (Duration(max=3600), "2h", "must be between 0ms and 1h"),
             (Size(min=1024, max=10 << 20), 10, "must be between 1.0 KiB and 10.0 MiB"),
         ],
     )
@@ -179,6 +181,31 @@ class TestListOf:
             ("E104", "duplicate value 'a'", ("options", 2))
         ]
 
+    def test_uniqueness_compares_only_the_items_that_passed_their_check(self) -> None:
+        assert problems(ListOf(Str(), unique=True), [1, 1, "a", "a"]) == [
+            ("E103", "expected a string, got a number", (0,)),
+            ("E103", "expected a string, got a number", (1,)),
+            ("E104", "duplicate value 'a'", (3,)),
+        ]
+
+    def test_uniqueness_compares_lists_and_mappings_too(self) -> None:
+        value = [[1], {"a": 1}, "x", [1], {"a": 1}, [2]]
+
+        assert problems(ListOf(AnyJSON(), unique=True), value) == [
+            ("E104", "duplicate value [1]", (3,)),
+            ("E104", "duplicate value {'a': 1}", (4,)),
+        ]
+
+    def test_uniqueness_takes_linear_time(self) -> None:
+        items = [f"item-{index}" for index in range(20_000)]
+
+        started = time.perf_counter()
+        found = problems(ListOf(Str(), unique=True), [*items, "item-7"])
+        elapsed = time.perf_counter() - started
+
+        assert found == [("E104", "duplicate value 'item-7'", (20_000,))]
+        assert elapsed < 0.5
+
 
 class TestMapOf:
     def test_checks_keys_and_values(self) -> None:
@@ -204,6 +231,20 @@ class TestMapOf:
         assert problems(MapOf(Int()), {1: 2}) == [
             ("E103", "expected a string key, got a number", ("1",))
         ]
+
+    def test_issues_about_keys_are_also_key_issues(self) -> None:
+        spec = MapOf(Str(), key_pattern=r"[A-Z]+")
+        keys: list[Issue] = []
+
+        _, issues = validate(spec, {"bad": None, 1: "x"}, path=("env",), key_issues=keys)
+
+        assert [(issue.code, issue.path) for issue in issues] == [
+            ("E104", ("env", "bad")),
+            ("E103", ("env", "bad")),
+            ("E103", ("env", "1")),
+            ("E104", ("env", "1")),
+        ]
+        assert keys == [issues[0], issues[2], issues[3]]
 
 
 class TestAnyOf:
@@ -319,6 +360,26 @@ class TestObj:
             ("E106", "one of 'run' or 'argv' is required", ())
         ]
 
+    def test_unknown_and_exclusive_keys_are_key_issues(self) -> None:
+        keys: list[Issue] = []
+        value = {"id": "a", "run": "x", "argv": ["y"], "rnu": 1}
+
+        _, issues = validate(self.STEP, value, path=("steps", 0), key_issues=keys)
+
+        assert keys == issues
+        assert [(issue.code, issue.path) for issue in keys] == [
+            ("E101", ("steps", 0, "rnu")),
+            ("E105", ("steps", 0, "argv")),
+        ]
+
+    def test_value_issues_arent_key_issues(self) -> None:
+        keys: list[Issue] = []
+
+        _, issues = validate(self.STEP, {"id": 5, "run": "x"}, key_issues=keys)
+
+        assert [issue.code for issue in issues] == ["E103"]
+        assert keys == []
+
     def test_groups_of_three_list_every_key(self) -> None:
         spec = Obj("x", {k: Field(Int()) for k in "abc"}, exclusive=[("a", "b", "c")])
 
@@ -369,3 +430,21 @@ def test_suggest() -> None:
     assert suggest("startswith", ["startsWith", "endsWith"]) == "startsWith"
     assert suggest("timout", ["timeout", "retry"]) == "timeout"
     assert suggest("xyz", ["timeout", "retry"]) is None
+
+
+@pytest.mark.parametrize(
+    ("value", "kind"),
+    [
+        (None, "null"),
+        (True, "a boolean"),
+        (3, "a number"),
+        (1.5, "a number"),
+        ("x", "a string"),
+        ([1], "a list"),
+        ({"a": 1}, "a mapping"),
+        (TEMPLATE, "a template"),
+        ({1}, "set"),
+    ],
+)
+def test_kind_of_names_the_type_of_a_value_for_messages(value: object, kind: str) -> None:
+    assert kind_of(value) == kind

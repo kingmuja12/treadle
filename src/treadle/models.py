@@ -29,7 +29,7 @@ class InputType(StrEnum):
 
 
 class ConcurrencyPolicy(StrEnum):
-    """What happens to a new run while the workflow already has one (section 5)."""
+    """What happens to a new run while the workflow already has one."""
 
     QUEUE = "queue"
     SKIP = "skip"
@@ -37,7 +37,7 @@ class ConcurrencyPolicy(StrEnum):
 
 
 class CatchUp(StrEnum):
-    """Which missed schedule slots fire after downtime (section 6)."""
+    """Which missed schedule slots fire after downtime."""
 
     NONE = "none"
     LATEST = "latest"

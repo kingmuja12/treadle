@@ -1,7 +1,10 @@
 """The workflow loader: from file bytes to a validated `Workflow`.
 
-Section 4 ("Workflow loading") lists the steps. Every problem is reported as an `Issue`
-with a file position.
+Loading takes these steps, which the comments below refer to by number: (1) check the
+file's size and encoding, and load the YAML; (2) validate the structure; (3) compile the
+templates; (4) validate each step's parameters; (5) build the step graph; and (6) check the
+expressions and triggers, then lint. Every problem is reported as an `Issue`, which gets its
+file position last.
 """
 
 from __future__ import annotations
@@ -16,9 +19,8 @@ from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, Literal, cast
-from zoneinfo import ZoneInfo
 
-from treadle.config import Limits
+from treadle.config import Limits, is_time_zone, time_zone_hint
 from treadle.cron import parse_cron
 from treadle.errors import CronError, ExpressionSyntaxError, InputError
 from treadle.expr.analysis import calls, references, tree_expressions
@@ -58,7 +60,9 @@ from treadle.schema import (
     Num,
     Obj,
     Size,
+    Spec,
     Str,
+    kind_of,
     suggest,
     validate,
 )
@@ -79,15 +83,14 @@ _DAY: Final = 86400.0
 _STEP_ID: Final = r"[A-Za-z_][A-Za-z0-9_-]{0,63}"
 _ENV_NAME: Final = r"[A-Za-z_][A-Za-z0-9_]*"
 _HOOK_NAME: Final = r"[a-z0-9][a-z0-9_-]{0,63}"
-# Design note: section 2 says "header name" without a pattern; this one accepts every
-# signature header the design names and rejects spaces and colons, which can never match.
+# Every signature header that Git servers send matches, and a name with a space or a colon,
+# which could never match a request header, doesn't.
 _HEADER_NAME: Final = r"[A-Za-z0-9][A-Za-z0-9_-]*"
 _RESERVED_ENV: Final = "TREADLE_"
 _OPEN: Final = "${{"
 _CONTEXTS: Final = ("inputs", "env", "secrets", "trigger", "run", "workflow", "steps", "result")
 _STEP_FIELDS: Final = ("outputs", "status")
 _TEMPLATE_FIELDS: Final = frozenset({"if", "run", "env", "with", "outputs"})
-_KEY_CODES: Final = frozenset({"E101", "E105"})
 _INPUT_TYPES: Final = frozenset(kind.value for kind in InputType)
 _DEFAULT_CONDITION: Final = parse_condition("success()")
 _BASE_DEFAULTS: Final = Defaults()
@@ -117,6 +120,15 @@ _CONTEXT_HINTS: Final = {
     "needs": "read another step's outputs through steps.<id>.outputs",
     "vars": "use `env` for variables",
 }
+# Hints for a step that refers to itself through `steps`, by the field that holds the reference.
+_OWN_RESULTS: Final = "read this step's own results through `result`"
+_SELF_HINTS: Final[Mapping[_Site, str]] = {
+    "if": "`if` decides whether the step runs, so the step has no status or outputs yet",
+    "env": "the step has no outputs until it finishes; read them in a later step",
+    "with": "the step has no outputs until it finishes; read them in a later step",
+}
+_SYMLINK_MESSAGE: Final = "the file is a symbolic link, so Treadle skips it"
+_SYMLINK_HINT: Final = "copy the file into the workflows directory instead"
 
 
 class _Raw:
@@ -136,7 +148,7 @@ class _Scalar:
         if isinstance(value, float) and not math.isfinite(value):
             ctx.issues.append(Issue(Severity.ERROR, "E104", "must be a finite number", path))
         elif not isinstance(value, (str, int, float, bool)):
-            message = f"expected {self.describe()}, got {_kind(value)}"
+            message = f"expected {self.describe()}, got {kind_of(value)}"
             ctx.issues.append(Issue(Severity.ERROR, "E103", message, path))
         return value
 
@@ -163,31 +175,6 @@ class _Shell:
         return _SHELL_EITHER.describe()
 
 
-class _Unique:
-    """A list whose repeated strings are E104, found with a set."""
-
-    # Design note: ListOf(unique=True) compares each item with every earlier one, which takes
-    # minutes for the longest list that a 1 MiB file can hold, so the loader checks here.
-
-    def __init__(self, items: ListOf) -> None:
-        self._items = items
-
-    def check(self, value: object, path: YamlPath, ctx: CheckContext) -> object:
-        result = self._items.check(value, path, ctx)
-        written = result if isinstance(value, list) and isinstance(result, list) else []
-        seen: set[str] = set()
-        for index, item in enumerate(written):
-            if isinstance(item, str) and item in seen:
-                message = f"duplicate value {item!r}"
-                ctx.issues.append(Issue(Severity.ERROR, "E104", message, (*path, index)))
-            elif isinstance(item, str):
-                seen.add(item)
-        return result
-
-    def describe(self) -> str:
-        return self._items.describe()
-
-
 _RAW: Final = _Raw()
 _RETRY: Final = Obj(
     "retry",
@@ -207,7 +194,7 @@ _INPUT: Final = Obj(
         "description": Field(Str(), default=""),
         "required": Field(Bool(), default=False),
         "default": Field(_Scalar(), default=None),
-        "options": Field(_Unique(ListOf(Str(), min_len=1, max_len=100))),
+        "options": Field(ListOf(Str(), min_len=1, max_len=100, unique=True)),
     },
 )
 _ENV: Final = MapOf(_Scalar(), key_pattern=_ENV_NAME)
@@ -219,7 +206,7 @@ _STEP: Final = Obj(
         "uses": Field(Str(min_len=1)),
         "run": Field(Str()),
         "with": Field(MapOf(_RAW)),
-        "needs": Field(_Unique(ListOf(Str(pattern=_STEP_ID), scalar_ok=True))),
+        "needs": Field(ListOf(Str(pattern=_STEP_ID), scalar_ok=True, unique=True)),
         "if": Field(AnyOf(Str(), Bool())),
         "env": Field(_ENV),
         "retry": Field(_RETRY),
@@ -252,7 +239,7 @@ _WATCH: Final = Obj(
         ),
         "recursive": Field(Bool(), default=False),
         "events": Field(
-            _Unique(ListOf(Str(choices=[event.value for event in WatchEvent]), min_len=1)),
+            ListOf(Str(choices=[event.value for event in WatchEvent]), min_len=1, unique=True),
             default=[event.value for event in WatchEvent],
         ),
         "debounce": Field(Duration(max=600.0), default=2.0),
@@ -337,24 +324,29 @@ def workflow_id_for(path: Path) -> str | None:
     return path.stem if WORKFLOW_ID_RE.fullmatch(path.stem) else None
 
 
-def discover(workflows_dir: Path) -> list[Path]:
-    """Return the `*.yml` and `*.yaml` files directly in `workflows_dir`, sorted.
+def discover(workflows_dir: Path, *, skipped: list[LoadResult] | None = None) -> list[Path]:
+    """Return the `*.yml` and `*.yaml` regular files directly in `workflows_dir`, sorted.
 
     Names that start with `.` or `_`, or end with `~`, are skipped. A missing directory
-    holds no workflows.
+    holds no workflows. A symbolic link with a workflow file's name is skipped too, because
+    the daemon never follows one. When `skipped` is given, a result for each such link is
+    appended to it in sorted order, with no workflow and one W060 warning.
     """
     try:
-        entries = list(workflows_dir.iterdir())
+        entries = sorted(workflows_dir.iterdir())
     except (FileNotFoundError, NotADirectoryError):
         return []
-    return sorted(
-        entry
-        for entry in entries
-        if entry.suffix in (".yml", ".yaml")
-        and not entry.name.startswith((".", "_"))
-        and not entry.name.endswith("~")
-        and entry.is_file()
-    )
+    found: list[Path] = []
+    for entry in entries:
+        if not _is_workflow_name(entry.name):
+            continue
+        if entry.is_symlink():
+            if skipped is not None:
+                warning = Issue(Severity.WARNING, "W060", _SYMLINK_MESSAGE, hint=_SYMLINK_HINT)
+                skipped.append(LoadResult(entry, None, None, None, (warning,)))
+        elif entry.is_file():
+            found.append(entry)
+    return found
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,7 +448,8 @@ def cross_check(results: Sequence[LoadResult]) -> list[LoadResult]:
 
     Results are taken in path order. Every file after the first with a workflow ID gets
     E058. The first valid workflow that uses a webhook name keeps it, and every later valid
-    workflow that uses it gets E305. The results come back in their original order.
+    workflow that uses it gets E305 for that name. A workflow with E305 claims none of its
+    names, because it can't load. The results come back in their original order.
     """
     added: dict[int, list[Issue]] = {}
     owners: dict[str, Path] = {}
@@ -474,10 +467,16 @@ def cross_check(results: Sequence[LoadResult]) -> list[LoadResult]:
         owners[workflow_id] = result.path
         if workflow is None or not result.ok:
             continue
-        for number, hook in enumerate(workflow.webhooks()):
-            owner = hooks.setdefault(hook.name, workflow_id)
-            if owner != workflow_id:
-                added.setdefault(index, []).append(_hook_conflict(result, number, owner))
+        names = [hook.name for hook in workflow.webhooks()]
+        conflicts = [
+            _hook_conflict(result, number, hooks[name])
+            for number, name in enumerate(names)
+            if name in hooks
+        ]
+        if conflicts:
+            added.setdefault(index, []).extend(conflicts)
+        else:
+            hooks.update(dict.fromkeys(names, workflow_id))
     return [
         dataclasses.replace(result, issues=_sorted_issues([*result.issues, *added[index]]))
         if index in added
@@ -518,7 +517,7 @@ class _Draft:
 
 
 class _Build:
-    """The checks and the model of one parsed document, in section 4's order."""
+    """The checks and the model of one parsed document, in the order of the loading steps."""
 
     def __init__(
         self,
@@ -551,8 +550,19 @@ class _Build:
             _Found(Issue(Severity.ERROR, code, message, path, hint=hint), key, offset)
         )
 
-    def extend(self, issues: Iterable[Issue]) -> None:
-        self.found.extend(_Found(issue, key=issue.code in _KEY_CODES) for issue in issues)
+    def extend(self, issues: Iterable[Issue], keys: Iterable[Issue] = ()) -> None:
+        """Add issues to place later. Those that are also in `keys` concern a mapping key."""
+        at_keys = set(keys)
+        self.found.extend(_Found(issue, key=issue in at_keys) for issue in issues)
+
+    def validated(
+        self, spec: Spec, value: object, path: YamlPath = ()
+    ) -> tuple[object, list[Issue]]:
+        """Validate `value` at `path` and add the issues; return the normalized value and them."""
+        keys: list[Issue] = []
+        normalized, issues = validate(spec, value, path=path, key_issues=keys)
+        self.extend(issues, keys)
+        return normalized, issues
 
     def issues(self) -> list[Issue]:
         """Return every issue with its position. E210 replaces schema errors at its path."""
@@ -577,7 +587,7 @@ class _Build:
         data = self.document.data
         if not isinstance(data, dict):
             message = (
-                f"the top level must be a mapping of workflow keys, got {_kind(data)}"
+                f"the top level must be a mapping of workflow keys, got {kind_of(data)}"
                 if data is not None
                 else "the file is empty"
             )
@@ -587,8 +597,7 @@ class _Build:
             return None
         data = cast(dict[str, object], self._string_keys(data, ()))
         self._reject_expressions(data, ())
-        normalized, issues = validate(_WORKFLOW, data)
-        self.extend(issues)
+        normalized, _ = self.validated(_WORKFLOW, data)
         top = cast(dict[str, object], normalized)
         inputs = self._inputs(top.get("inputs"))
         env = self._env(top.get("env"), ("env",))
@@ -643,7 +652,7 @@ class _Build:
             if isinstance(key, str):
                 result[key] = self._string_keys(item, (*path, key))
             else:
-                message = f"expected a string key, got {_kind(key)}"
+                message = f"expected a string key, got {kind_of(key)}"
                 self.error("E103", message, (*path, str(key)), key=True, hint="quote the key")
         return result
 
@@ -722,8 +731,8 @@ class _Build:
             return base
         policy = dataclasses.replace(base, **{k: v for k, v in value.items() if _is_number(v)})
         if policy.max_delay < policy.delay and ("delay" in value or "max_delay" in value):
-            # Design note: an inherited or default max_delay below a step's delay is the same
-            # error as one written in the mapping, because the policy as a whole is invalid.
+            # An inherited or default max_delay below the delay written here is an error too,
+            # because the policy as a whole is invalid.
             if "max_delay" in value:
                 message = f"must be at least delay ({format_duration(policy.delay)})"
                 self.error("E104", message, (*path, "max_delay"))
@@ -795,12 +804,11 @@ class _Build:
         return tuple(entries)
 
     def _steps(self, value: object, defaults: Defaults) -> list[_Draft]:
-        # Design note: steps after the 100th aren't checked. The file already fails with E104,
-        # and the bound keeps the ancestor sets of an oversized file small.
+        # Steps after the 100th aren't checked. The file already fails with E104, and the
+        # bound keeps the ancestor sets of an oversized file small.
         drafts = []
         for index, item in enumerate(value[:_MAX_STEPS] if isinstance(value, list) else ()):
-            normalized, issues = validate(_STEP, item, path=("steps", index))
-            self.extend(issues)
+            normalized, _ = self.validated(_STEP, item, ("steps", index))
             if isinstance(normalized, dict):
                 drafts.append(self._draft(index, normalized, defaults))
         return drafts
@@ -866,10 +874,15 @@ class _Build:
     ) -> dict[str, TemplateTree]:
         """Validate `with` with the step type's schema, then its own checks (step 4)."""
         where = (*path, "with")
-        normalized, issues = validate(step_type.schema, params, path=where, allow_templates=True)
+        keys: list[Issue] = []
+        normalized, issues = validate(
+            step_type.schema, params, path=where, allow_templates=True, key_issues=keys
+        )
         result = cast(dict[str, TemplateTree], normalized)
         issues.extend(step_type.check(result, where))
-        self.extend(_moved(issues, path) if shorthand else issues)
+        if shorthand:
+            issues, keys = _moved(issues, path), _moved(keys, path)
+        self.extend(issues, keys)
         return result
 
     def _request_timeout(
@@ -881,8 +894,8 @@ class _Build:
         step_timeout: float,
     ) -> None:
         """E407 for a static `http` request timeout longer than the step timeout."""
-        # Design note: only a written `with.timeout` counts; otherwise the default request
-        # timeout (30s) would reject every http step with a step timeout under 30s.
+        # Only a written `with.timeout` counts; otherwise the default request timeout (30s)
+        # would reject every http step with a step timeout under 30s.
         request = params.get("timeout")
         written = step_type.name == "http" and "timeout" in raw_with
         if not (written and isinstance(request, float) and request > step_timeout):
@@ -1034,6 +1047,12 @@ class _Build:
         target = path[1]
         if target not in self.first_step:
             return "E208", f"unknown step '{target}'", _did_you_mean(target, self.first_step)
+        if target == draft.id:
+            return (
+                "E203",
+                f"step '{target}' can't refer to itself through `steps`",
+                _self_hint(path, site),
+            )
         if target not in scope:
             later = self.first_step[target] >= draft.index
             hint = (
@@ -1063,8 +1082,7 @@ class _Build:
                 if count > _MAX_TRIGGERS:
                     continue  # the file already fails with E104, so the rest isn't checked
                 path: YamlPath = ("triggers", kind, index) if listed else ("triggers", kind)
-                normalized, issues = validate(spec, item, path=path)
-                self.extend(issues)
+                normalized, issues = self.validated(spec, item, path)
                 if issues:
                     continue
                 trigger = self._trigger(kind, cast(dict[str, object], normalized), path)
@@ -1101,8 +1119,8 @@ class _Build:
             self.error("E302", str(exc), (*path, "cron"), offset=exc.offset)
             return None
         zone = cast(str, item.get("timezone", self.loader._timezone))
-        if not _is_zone(zone):
-            hint = "use an IANA name such as Europe/London"
+        if not is_time_zone(zone):
+            hint = time_zone_hint(zone)
             self.error("E303", f"unknown time zone '{zone}'", (*path, "timezone"), hint=hint)
             return None
         catch_up = CatchUp(cast(str, item["catch_up"]))
@@ -1152,8 +1170,8 @@ class _Build:
         tolerance = cast(float, item["tolerance"])
         window = cast(float, item["dedupe_window"])
         if timestamp is not None:
-            # Design note: "with timestamp_header, the effective window is at least
-            # 2 x tolerance" is the more specific rule, so it also applies to a window of 0.
+            # With a timestamp header, a replay can only arrive within the tolerance on either
+            # side, so the window is at least 2 x tolerance, even when 0 turns deduplication off.
             window = max(window, 2 * tolerance)
         name = cast(str, item["name"])
         header = cast(str, item.get("signature_header", _SIGNATURE_HEADERS[signature]))
@@ -1232,14 +1250,17 @@ def _call_problem(call: Call, site: _Site) -> tuple[str, str, str | None] | None
     if spec.status and site != "if":
         hint = "use steps.<id>.status to read a step's status outside `if`"
         return "E205", f"status function '{call.name}()' is only allowed in `if`", hint
-    low, high, count = spec.min_args, spec.max_args, len(call.args)
-    if count < low or (high is not None and count > high):
-        expected = (
-            f"at least {low}" if high is None else str(low) if low == high else f"{low} or {high}"
-        )
-        message = f"wrong number of arguments for {call.name}(): expected {expected}, got {count}"
-        return "E206", message, None
-    return None
+    problem = spec.arity_problem(len(call.args))
+    return None if problem is None else ("E206", problem, None)
+
+
+def _self_hint(path: tuple[str, ...], site: _Site) -> str:
+    """Return the hint for a step that refers to itself through `steps` in the field `site`."""
+    if site != "outputs":
+        return _SELF_HINTS[site]
+    if len(path) > 3 and path[2] == "outputs":
+        return f"{_OWN_RESULTS}, such as result.{path[3]}"
+    return _OWN_RESULTS
 
 
 def _moved(issues: Iterable[Issue], step_path: YamlPath) -> list[Issue]:
@@ -1297,6 +1318,14 @@ def _sorted_issues(issues: Iterable[Issue]) -> tuple[Issue, ...]:
     return tuple(sorted(issues, key=order)[:_MAX_ISSUES])
 
 
+def _is_workflow_name(name: str) -> bool:
+    """True for a `*.yml` or `*.yaml` name that doesn't start with `.` or `_`.
+
+    A backup name that ends with `~` doesn't end with a YAML suffix, so it's never one.
+    """
+    return name.endswith((".yml", ".yaml")) and not name.startswith((".", "_"))
+
+
 def _has_errors(issues: Iterable[Issue]) -> bool:
     return any(issue.severity is Severity.ERROR for issue in issues)
 
@@ -1328,27 +1357,6 @@ def _is_scalar(value: object) -> bool:
     return isinstance(value, (str, int, bool))
 
 
-def _is_zone(name: str) -> bool:
-    try:
-        ZoneInfo(name)
-    except (KeyError, ValueError, OSError):  # ZoneInfoNotFoundError is a KeyError
-        return False
-    return True
-
-
 def _did_you_mean(word: str, candidates: Iterable[str]) -> str | None:
     close = suggest(word, candidates)
     return f"did you mean '{close}'?" if close else None
-
-
-def _kind(value: object) -> str:
-    """Describe a value's type for messages, as the schema does."""
-    if value is None:
-        return "null"
-    if isinstance(value, bool):
-        return "a boolean"
-    if isinstance(value, (int, float)):
-        return "a number"
-    if isinstance(value, str):
-        return "a string"
-    return "a list" if isinstance(value, list) else "a mapping"

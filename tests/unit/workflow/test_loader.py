@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import textwrap
 from collections.abc import Callable
 from pathlib import Path
@@ -75,7 +76,7 @@ def watches(workflow: Workflow) -> list[WatchTrigger]:
 
 
 @pytest.mark.parametrize("name", ["nightly-backup.yml", "deploy-on-push.yml", "sort-downloads.yml"])
-def test_the_section_2_examples_load_without_issues(name: str) -> None:
+def test_the_example_workflows_load_without_issues(name: str) -> None:
     result = make_loader().load_file(EXAMPLES / name)
 
     assert result.issues == ()
@@ -411,6 +412,27 @@ def test_schedule_triggers_fill_the_project_time_zone() -> None:
     assert second.cron.minutes == frozenset({30})
 
 
+@pytest.mark.parametrize(
+    ("zone", "hint"),
+    [
+        ("europe/london", "did you mean 'Europe/London'?"),
+        ("utc", "did you mean 'UTC'?"),
+        ("Mars/Olympus", "use an IANA name such as Europe/London"),
+    ],
+)
+def test_a_schedule_time_zone_must_be_spelled_as_the_database_spells_it(
+    zone: str, hint: str
+) -> None:
+    result = load(
+        f'triggers:\n  schedule: {{cron: "0 2 * * *", timezone: {zone}}}\n'
+        "steps:\n  - {id: a, run: x}\n"
+    )
+
+    assert [(issue.code, issue.message, issue.hint) for issue in result.issues] == [
+        ("E303", f"unknown time zone '{zone}'", hint)
+    ]
+
+
 def test_trigger_keys_stay_stable_when_triggers_are_reordered() -> None:
     reordered = SCHEDULES.replace(
         '    - {cron: "0 2 * * *"}\n'
@@ -602,6 +624,72 @@ def test_text_with_a_lone_surrogate_isnt_utf8() -> None:
     assert [issue.code for issue in load("name: \ud800\n").issues] == ["E056"]
 
 
+def test_an_escape_above_the_unicode_range_is_a_yaml_error() -> None:
+    result = load('name: "\\U00110000"\nsteps:\n  - {id: a, run: x}\n')
+
+    assert codes(result) == [
+        ("E050", "invalid escape \\U00110000: the code point is above U+10FFFF")
+    ]
+    assert result.workflow is None
+
+
+def test_a_workflow_that_json_dumps_wrote_keeps_its_characters() -> None:
+    text = json.dumps({"name": "Deploy \U0001f680", "steps": [{"id": "a", "run": "echo \u00e9"}]})
+
+    workflow = only(load(text))
+
+    assert "\\ud83d\\ude80" in text
+    assert workflow.name == "Deploy \U0001f680"
+    assert workflow.steps[0].params["run"] == "echo \u00e9"
+
+
+def test_a_nul_escape_in_an_env_value_is_a_yaml_error() -> None:
+    result = load('env:\n  TAG: "v1\\0"\nsteps:\n  - {id: a, run: x}\n')
+
+    assert codes(result) == [("E050", "invalid escape: a string can't hold U+0000 (NUL)")]
+
+
+TOO_LONG_TO_PRINT = "0x" + "f" * 4000
+
+
+@pytest.mark.parametrize(
+    ("text", "path"),
+    [
+        pytest.param(
+            f"env:\n  BIG: {TOO_LONG_TO_PRINT}\nsteps:\n  - {{id: a, run: x}}\n",
+            ("env", "BIG"),
+            id="env",
+        ),
+        pytest.param(
+            f"inputs:\n  n: {{type: integer, default: {TOO_LONG_TO_PRINT}}}\n"
+            "steps:\n  - {id: a, run: x}\n",
+            ("inputs", "n", "default"),
+            id="input-default",
+        ),
+        pytest.param(
+            "steps:\n  - id: a\n    uses: http\n    with:\n      url: https://example.net/\n"
+            f"      json: {{n: {TOO_LONG_TO_PRINT}}}\n",
+            ("steps", 0, "with", "json", "n"),
+            id="http-json",
+        ),
+    ],
+)
+def test_an_integer_too_long_to_print_isnt_a_finite_number(text: str, path: object) -> None:
+    result = load(text)
+
+    assert [(issue.code, issue.message, issue.path) for issue in result.issues] == [
+        ("E104", "must be a finite number", path)
+    ]
+
+
+def test_a_long_hex_integer_that_prints_is_an_env_value() -> None:
+    workflow = only(load(f"env:\n  BIG: 0x{'f' * 20}\nsteps:\n  - {{id: a, run: x}}\n"))
+
+    assert [(name, template.source) for name, template in workflow.env] == [
+        ("BIG", str(16**20 - 1))
+    ]
+
+
 def test_a_missing_file_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         make_loader().load_file(tmp_path / "missing.yml")
@@ -650,6 +738,32 @@ def test_ok_needs_a_workflow_and_no_errors() -> None:
     assert LoadResult(PROJECT, "wf", workflow, "", (warning,)).ok
     assert not LoadResult(PROJECT, "wf", workflow, "", (error,)).ok
     assert not LoadResult(PROJECT, "wf", None, "", ()).ok
+
+
+def test_an_invalid_key_is_located_at_the_key_and_a_value_problem_at_the_value() -> None:
+    result = load(
+        """\
+        env:
+          DEPLOY-TARGET:
+            prod
+          BAD-NULL: null
+        inputs:
+          bad name: {type: string}
+        steps:
+          - id: a
+            run: x
+            outputs:
+              out put: x
+        """
+    )
+
+    assert [(issue.code, issue.position) for issue in result.issues] == [
+        ("E104", Position(2, 3)),
+        ("E104", Position(4, 3)),
+        ("E103", Position(4, 13)),
+        ("E104", Position(6, 3)),
+        ("E104", Position(11, 7)),
+    ]
 
 
 def test_non_string_keys_are_reported_and_dropped() -> None:
@@ -935,6 +1049,39 @@ def test_format_needs_at_least_its_pattern() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("field", "hint"),
+    [
+        pytest.param(
+            "outputs: {code: '${{ steps.a.outputs.status }}'}",
+            "read this step's own results through `result`, such as result.status",
+            id="outputs",
+        ),
+        pytest.param(
+            "outputs: {state: '${{ steps.a.status }}'}",
+            "read this step's own results through `result`",
+            id="outputs-status",
+        ),
+        pytest.param(
+            "if: steps.a.status == 'success'",
+            "`if` decides whether the step runs, so the step has no status or outputs yet",
+            id="if",
+        ),
+        pytest.param(
+            "env: {VALUE: '${{ steps.a.outputs.value }}'}",
+            "the step has no outputs until it finishes; read them in a later step",
+            id="env",
+        ),
+    ],
+)
+def test_a_step_that_refers_to_itself_gets_a_hint_it_can_follow(field: str, hint: str) -> None:
+    result = load(f"steps:\n  - id: a\n    run: x\n    {field}\n")
+
+    assert [(issue.code, issue.message, issue.hint) for issue in result.issues] == [
+        ("E203", "step 'a' can't refer to itself through `steps`", hint)
+    ]
+
+
 def test_a_reference_to_all_steps_is_allowed_in_steps_only() -> None:
     result = load(
         """\
@@ -987,6 +1134,52 @@ def test_discover_lists_workflow_files_in_sorted_order(tmp_path: Path) -> None:
     assert [path.name for path in discover(tmp_path)] == ["Upper.yml", "a.yaml", "b.yml"]
 
 
+def test_discover_skips_symlinked_workflow_files_with_a_warning(tmp_path: Path) -> None:
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "linked.yml").write_text("", encoding="utf-8")
+    workflows = tmp_path / "workflows"
+    workflows.mkdir()
+    (workflows / "real.yml").write_text("", encoding="utf-8")
+    (workflows / "linked.yml").symlink_to(shared / "linked.yml")
+    (workflows / "dangling.yaml").symlink_to(tmp_path / "missing.yml")
+    (workflows / "folder.yml").symlink_to(shared)
+    (workflows / "_draft.yml").symlink_to(shared / "linked.yml")
+    (workflows / "notes.txt").symlink_to(shared / "linked.yml")
+    skipped: list[LoadResult] = []
+
+    found = discover(workflows, skipped=skipped)
+
+    assert [path.name for path in found] == ["real.yml"]
+    assert [result.path for result in skipped] == [
+        workflows / "dangling.yaml",
+        workflows / "folder.yml",
+        workflows / "linked.yml",
+    ]
+    assert skipped[0] == LoadResult(
+        workflows / "dangling.yaml",
+        None,
+        None,
+        None,
+        (
+            Issue(
+                Severity.WARNING,
+                "W060",
+                "the file is a symbolic link, so Treadle skips it",
+                hint="copy the file into the workflows directory instead",
+            ),
+        ),
+    )
+    assert not skipped[0].ok
+
+
+def test_discover_skips_symlinks_without_a_list_for_them(tmp_path: Path) -> None:
+    (tmp_path / "real.yml").write_text("", encoding="utf-8")
+    (tmp_path / "linked.yml").symlink_to(tmp_path / "real.yml")
+
+    assert discover(tmp_path) == [tmp_path / "real.yml"]
+
+
 def test_discover_treats_a_missing_directory_as_empty(tmp_path: Path) -> None:
     (tmp_path / "file").write_text("", encoding="utf-8")
 
@@ -1022,6 +1215,38 @@ def test_cross_check_gives_a_webhook_name_to_the_first_valid_workflow() -> None:
     assert [(issue.code, issue.message, issue.position) for issue in checked[0].issues] == [
         ("E305", "webhook name 'push' is already used by workflow 'b'", Position(2, 19))
     ]
+
+
+def hooks(*names: str) -> str:
+    items = ", ".join(f"{{name: {name}, secret_env: S}}" for name in names)
+    return f"triggers:\n  webhook: [{items}]\nsteps:\n  - {{id: a, run: x}}\n"
+
+
+def test_a_workflow_that_loses_one_webhook_name_claims_none_of_them() -> None:
+    loader = make_loader()
+    first = loader.load_text(hooks("deploy"), PROJECT / "a.yml")
+    second = loader.load_text(hooks("deploy", "notify"), PROJECT / "b.yml")
+    third = loader.load_text(hooks("notify"), PROJECT / "c.yml")
+
+    checked = cross_check([first, second, third])
+
+    assert (checked[0], checked[2]) == (first, third)
+    assert codes(checked[1]) == [("E305", "webhook name 'deploy' is already used by workflow 'a'")]
+
+
+def test_every_conflicting_webhook_name_of_a_workflow_is_reported() -> None:
+    loader = make_loader()
+    owner = loader.load_text(hooks("deploy", "notify"), PROJECT / "a.yml")
+    other = loader.load_text(hooks("notify", "build", "deploy"), PROJECT / "b.yml")
+    later = loader.load_text(hooks("build"), PROJECT / "c.yml")
+
+    checked = cross_check([owner, other, later])
+
+    assert codes(checked[1]) == [
+        ("E305", "webhook name 'notify' is already used by workflow 'a'"),
+        ("E305", "webhook name 'deploy' is already used by workflow 'a'"),
+    ]
+    assert checked[2] is later
 
 
 def test_cross_check_changes_nothing_without_conflicts() -> None:

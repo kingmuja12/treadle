@@ -1,0 +1,10 @@
+workflows/e050-invalid-escapes.yml:3:8: error[E050]: invalid escape: a string can't hold U+0000 (NUL)
+   |
+ 3 |   TAG: "v1\0"
+   |        ^
+   = help: remove the escape; processes, file paths, and environment variables can't take NUL
+workflows/e050-invalid-escapes.yml:4:10: error[E050]: invalid escape: U+D800 is a lone surrogate, not a character
+   |
+ 4 |   LABEL: "\ud800 and more"
+   |          ^
+   = help: write the character itself, or one \U escape such as \U0001F680

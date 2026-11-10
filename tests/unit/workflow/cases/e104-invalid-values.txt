@@ -20,7 +20,7 @@ workflows/e104-invalid-values.yml:7:9: error[E104]: must match the pattern [A-Za
    |
  7 |   - id: Bad Id
    |         ^
-workflows/e104-invalid-values.yml:12:17: error[E104]: must be between 0s and 1d
+workflows/e104-invalid-values.yml:12:17: error[E104]: must be between 0ms and 1d
    |
 12 |       duration: 48h
    |                 ^

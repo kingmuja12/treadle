@@ -1,4 +1,4 @@
-"""The expression tokenizer and the template scanner (section 3, "Lexical rules")."""
+"""The expression tokenizer and the template scanner."""
 
 from __future__ import annotations
 
@@ -48,8 +48,7 @@ class Token:
 
 OPERATORS: Final[tuple[str, ...]] = ("==", "!=", "<=", ">=", "&&", "||", "<", ">", "!")
 
-# Design note: the grammar doesn't define "letter"; names use ASCII letters, like the
-# identifier patterns in section 2.
+# Names use ASCII letters only, as step IDs and input names do.
 _NAME: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*")
 # JSON number syntax. A "-" starts a number only when a digit follows it.
 _NUMBER: Final = re.compile(r"-?(?:0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?")

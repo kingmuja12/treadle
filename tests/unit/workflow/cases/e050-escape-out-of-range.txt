@@ -1,0 +1,5 @@
+workflows/e050-escape-out-of-range.yml:1:26: error[E050]: invalid escape \U00110000: the code point is above U+10FFFF
+   |
+ 1 | name: "Deploy \U0001F680 \U00110000"
+   |                          ^
+   = help: the largest code point is \U0010FFFF

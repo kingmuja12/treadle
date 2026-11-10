@@ -64,6 +64,26 @@ def test_functions_lists_every_function_with_its_arity() -> None:
 
 
 @pytest.mark.parametrize(
+    ("name", "count", "problem"),
+    [
+        ("contains", 2, None),
+        ("join", 1, None),
+        ("join", 2, None),
+        ("format", 9, None),
+        ("success", 0, None),
+        ("contains", 3, "wrong number of arguments for contains(): expected 2, got 3"),
+        ("join", 0, "wrong number of arguments for join(): expected 1 or 2, got 0"),
+        ("format", 0, "wrong number of arguments for format(): expected at least 1, got 0"),
+        ("always", 1, "wrong number of arguments for always(): expected 0, got 1"),
+    ],
+)
+def test_arity_problem_is_the_one_message_for_a_wrong_number_of_arguments(
+    name: str, count: int, problem: str | None
+) -> None:
+    assert FUNCTIONS[name].arity_problem(count) == problem
+
+
+@pytest.mark.parametrize(
     ("source", "expected"),
     [
         ("contains('Hello', 'ell')", True),

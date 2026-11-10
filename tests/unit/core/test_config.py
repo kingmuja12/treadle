@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import re
+import sys
 import tomllib
 from pathlib import Path
 
@@ -20,8 +22,10 @@ from treadle.config import (
     detect_timezone,
     find_config,
     is_loopback_host,
+    is_time_zone,
     load_settings,
     resolve_timezone,
+    time_zone_hint,
 )
 from treadle.errors import ConfigError
 from treadle.types import ExitCode
@@ -223,6 +227,72 @@ def test_values_are_parsed_and_lists_become_tuples(project: ProjectFactory) -> N
     assert settings.security.file_roots == ("/srv/data",)
 
 
+@pytest.mark.parametrize(
+    "host",
+    [
+        "treadle.local",
+        "Treadle.Example.COM",
+        "localhost",
+        "my_host",
+        "example.com.",
+        "192.168.1.10",
+        "[::1]",
+        "[2001:db8::1]",
+        "*",
+        "*.example.com",
+    ],
+)
+def test_allowed_hosts_accept_the_forms_that_the_host_check_matches(
+    project: ProjectFactory, host: str
+) -> None:
+    project.write_config(f'timezone = "UTC"\n[server]\nallowed_hosts = ["{host}"]\n')
+
+    assert project.settings().server.allowed_hosts == (host,)
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "foo*",
+        "*foo.com",
+        "*.",
+        "a.*.com",
+        "**.example.com",
+        "example.com:8765",
+        "http://example.com",
+        "::1",
+        "[::1]:8765",
+        "[not-an-address]",
+        "[1.2.3.4]",
+        "two words",
+        "",
+    ],
+)
+def test_allowed_hosts_reject_other_forms(project: ProjectFactory, host: str) -> None:
+    project.write_config(f'timezone = "UTC"\n[server]\nallowed_hosts = ["ok.local", "{host}"]\n')
+
+    with pytest.raises(ConfigError) as caught:
+        project.settings()
+
+    assert [(i.code, i.message, i.path, i.hint) for i in caught.value.issues] == [
+        (
+            "E104",
+            "must be a host name or address, '*', or '*.' followed by a domain",
+            ("server", "allowed_hosts", 1),
+            "such as treadle.local, 192.168.1.10, [::1], or *.example.com, without a scheme "
+            "or a port",
+        )
+    ]
+
+
+def test_allowed_hosts_must_be_strings(project: ProjectFactory) -> None:
+    text = 'timezone = "UTC"\n[server]\nallowed_hosts = [5]\n'
+
+    assert config_problems(project, text) == [
+        ("E103", "expected a string, got a number", ("server", "allowed_hosts", 0))
+    ]
+
+
 def test_unknown_keys_get_suggestions(project: ProjectFactory) -> None:
     project.write_config('timezne = "UTC"\n[server]\nprot = 1\n[extras]\n')
     with pytest.raises(ConfigError) as caught:
@@ -242,7 +312,7 @@ def test_unknown_keys_get_suggestions(project: ProjectFactory) -> None:
         ("server", "token_env", "'1BAD'", "must match the pattern [A-Za-z_][A-Za-z0-9_]*"),
         ("server", "session_ttl", "'1m'", "must be between 5m and 30d"),
         ("runs", "max_concurrent", "0", "must be between 1 and 64"),
-        ("runs", "kill_grace", "'2m'", "must be between 0s and 1m"),
+        ("runs", "kill_grace", "'2m'", "must be between 0ms and 1m"),
         ("runs", "shutdown_grace", "'20m'", "must be between 1s and 10m"),
         ("retention", "max_age", "'30m'", "must be between 1h and 3650d"),
         ("retention", "max_runs_per_workflow", "0", "must be between 1 and 100000"),
@@ -293,6 +363,110 @@ def test_an_invalid_log_level_flag_is_reported(project: ProjectFactory) -> None:
     assert [(i.code, i.path) for i in caught.value.issues] == [("E104", ("logging", "level"))]
 
 
+UNKNOWN_USER = "~nosuchuser4242"
+NO_HOME = f"can't expand '{UNKNOWN_USER}' to a home directory"
+NUL = "the path holds a NUL character"
+
+
+@pytest.mark.parametrize(
+    ("text", "key", "message"),
+    [
+        pytest.param(
+            f'workflows_dir = "{UNKNOWN_USER}/workflows"\n',
+            ("workflows_dir",),
+            NO_HOME,
+            id="workflows-dir-of-an-unknown-user",
+        ),
+        pytest.param(
+            f'state_dir = "{UNKNOWN_USER}/state"\n',
+            ("state_dir",),
+            NO_HOME,
+            id="state-dir-of-an-unknown-user",
+        ),
+        pytest.param(
+            f'env_file = "{UNKNOWN_USER}/.env"\n',
+            ("env_file",),
+            NO_HOME,
+            id="env-file-of-an-unknown-user",
+        ),
+        pytest.param('state_dir = "a\\u0000b"\n', ("state_dir",), NUL, id="state-dir-with-nul"),
+        pytest.param('env_file = "a\\u0000b"\n', ("env_file",), NUL, id="env-file-with-nul"),
+        pytest.param(
+            f'[security]\nfile_roots = [".", "{UNKNOWN_USER}/data"]\n',
+            ("security", "file_roots", 1),
+            NO_HOME,
+            id="file-root-of-an-unknown-user",
+        ),
+        pytest.param(
+            '[security]\nfile_roots = ["a\\u0000b"]\n',
+            ("security", "file_roots", 0),
+            NUL,
+            id="file-root-with-nul",
+        ),
+    ],
+)
+def test_a_path_that_cant_be_resolved_is_reported_at_its_key(
+    project: ProjectFactory, text: str, key: tuple[object, ...], message: str
+) -> None:
+    assert config_problems(project, f'timezone = "UTC"\n{text}') == [("E104", message, key)]
+
+
+def test_an_unknown_user_gets_a_hint(project: ProjectFactory) -> None:
+    project.write_config(f'timezone = "UTC"\nstate_dir = "{UNKNOWN_USER}/state"\n')
+
+    with pytest.raises(ConfigError) as caught:
+        project.settings()
+
+    assert [issue.hint for issue in caught.value.issues] == [
+        "check the user name after `~`, or write the full path"
+    ]
+
+
+def test_every_path_that_cant_be_resolved_is_reported(project: ProjectFactory) -> None:
+    project.write_config(
+        f'timezone = "UTC"\nstate_dir = "{UNKNOWN_USER}/s"\nenv_file = "a\\u0000"\n'
+    )
+
+    with pytest.raises(ConfigError) as caught:
+        project.settings()
+
+    assert [issue.path for issue in caught.value.issues] == [("state_dir",), ("env_file",)]
+
+
+def test_a_path_flag_that_cant_be_resolved_is_a_config_error(project: ProjectFactory) -> None:
+    with pytest.raises(ConfigError) as caught:
+        project.settings(state_dir=Path(f"{UNKNOWN_USER}/state"))
+
+    assert [(issue.code, issue.message, issue.path) for issue in caught.value.issues] == [
+        ("E104", NO_HOME, ("state_dir",))
+    ]
+
+
+def test_a_config_path_that_cant_be_resolved_is_a_config_error(tmp_path: Path) -> None:
+    overrides = Overrides(config=Path(f"{UNKNOWN_USER}/treadle.toml"))
+
+    with pytest.raises(ConfigError) as caught:
+        load_settings(overrides, cwd=tmp_path, environ={})
+
+    assert str(caught.value) == f"can't use the config file {UNKNOWN_USER}/treadle.toml: {NO_HOME}"
+
+
+@pytest.mark.skipif(
+    sys.version_info >= (3, 13), reason="Path.resolve() raises for a symlink loop before 3.13 only"
+)
+def test_a_symlink_loop_is_reported_with_the_system_error(project: ProjectFactory) -> None:
+    loop = project.root / "loop"
+    loop.symlink_to(loop)
+    project.write_config('timezone = "UTC"\nstate_dir = "loop/state"\n')
+
+    with pytest.raises(ConfigError) as caught:
+        project.settings()
+
+    [issue] = caught.value.issues
+    assert (issue.code, issue.path) == ("E104", ("state_dir",))
+    assert issue.message.startswith("can't resolve the path: ")
+
+
 def test_file_roots_expand_home_and_resolve_against_the_project(
     project: ProjectFactory, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -320,6 +494,59 @@ def test_resolve_timezone() -> None:
         resolve_timezone("Nowhere/Special", {})
     with pytest.raises(ConfigError, match="unknown time zone"):
         resolve_timezone("", {})
+
+
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [
+        ("utc", "unknown time zone 'utc'; did you mean 'UTC'?"),
+        ("europe/london", "unknown time zone 'europe/london'; did you mean 'Europe/London'?"),
+        (
+            "Mars/Olympus",
+            "unknown time zone 'Mars/Olympus'; use an IANA name such as Europe/London",
+        ),
+    ],
+)
+def test_a_time_zone_name_must_be_spelled_as_the_database_spells_it(
+    name: str, message: str
+) -> None:
+    with pytest.raises(ConfigError) as caught:
+        resolve_timezone(name, {})
+
+    assert str(caught.value) == message
+
+
+def test_a_wrong_case_time_zone_in_the_file_is_a_config_error(project: ProjectFactory) -> None:
+    project.write_config('timezone = "utc"\n')
+
+    with pytest.raises(ConfigError, match="did you mean 'UTC'"):
+        project.settings()
+
+
+@pytest.mark.parametrize(
+    ("name", "known"),
+    [
+        ("UTC", True),
+        ("Europe/London", True),
+        ("America/Argentina/Buenos_Aires", True),
+        ("utc", False),
+        ("EUROPE/LONDON", False),
+        ("Europe/Londn", False),
+        ("", False),
+        ("/UTC", False),
+    ],
+)
+def test_is_time_zone(name: str, known: bool) -> None:
+    assert is_time_zone(name) is known
+
+
+def test_time_zone_hint_suggests_the_right_spelling() -> None:
+    assert time_zone_hint("america/new_york") == "did you mean 'America/New_York'?"
+    assert time_zone_hint("Nowhere") == "use an IANA name such as Europe/London"
+
+
+def test_detect_timezone_ignores_a_wrong_case_tz() -> None:
+    assert detect_timezone({"TZ": "utc"}, localtime=NO_LINK) is None
 
 
 def test_local_time_zone_falls_back_to_utc_with_a_warning(caplog: pytest.LogCaptureFixture) -> None:
@@ -390,6 +617,19 @@ def test_detect_timezone_needs_a_link(tmp_path: Path) -> None:
 def test_is_loopback_host(host: str, loopback: bool) -> None:
     assert is_loopback_host(host) is loopback
     assert ServerSettings(host=host).is_loopback is loopback
+
+
+@pytest.mark.parametrize("zone", ["UTC", "Europe/London", "America/Argentina/ComodRivadavia"])
+def test_default_config_text_lines_up_its_comments_for_any_zone(zone: str) -> None:
+    text = default_config_text(zone)
+    columns = {
+        match.start(1)
+        for line in text.splitlines()
+        if (match := re.search(r"\S\s+(# )", line)) is not None
+    }
+
+    assert f'timezone = "{zone}"\n' in text
+    assert len(columns) == 1
 
 
 def test_default_config_text_loads_as_the_defaults(project: ProjectFactory) -> None:

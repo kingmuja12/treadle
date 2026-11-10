@@ -1,4 +1,4 @@
-"""Glob patterns for watch triggers (section 6, "Watch triggers")."""
+"""Glob patterns for watch triggers: which files a watch reports, and which folders it skips."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Final
 
 # Zero or more whole segments, each followed by "/": what a non-final "**" segment matches.
 _ANY_DIRECTORIES: Final = "(?:[^/]+/)*"
+_STAR: Final = "[^/]*"
 
 
 def compile_glob(pattern: str) -> re.Pattern[str]:
@@ -15,10 +16,11 @@ def compile_glob(pattern: str) -> re.Pattern[str]:
 
     `*` and `?` never match `/`, `[...]` is a class (`[!...]` negates), and `**` as a whole
     segment matches zero or more segments. Raises ValueError for a bad pattern. Match the
-    result with `fullmatch` against a path relative to the watched root.
+    result with `fullmatch` against a path relative to the watched root. The `*` wildcards
+    of a segment match in time linear in the name's length, however many there are.
     """
-    # Design note: relative paths never start or end with "/" or hold an empty segment, so
-    # a pattern that does could never match; it is rejected instead of ignored silently.
+    # Relative paths never start or end with "/" or hold an empty segment, so a pattern that
+    # does could never match; it is rejected instead of ignored silently.
     if not pattern:
         raise ValueError("the pattern is empty")
     if pattern.startswith("/") or pattern.endswith("/") or "//" in pattern:
@@ -73,25 +75,50 @@ def _any(patterns: Sequence[tuple[re.Pattern[str], bool]], rel_path: str) -> boo
 
 
 def _segment(text: str) -> str:
-    """Translate one path segment: wildcards, classes, and literal characters."""
-    out: list[str] = []
+    """Translate one path segment: wildcards, classes, and literal characters.
+
+    A greedy `*` before more fixed text would let a near-miss name make the regex try every
+    placement of the fixed parts, which takes polynomial time in the name's length. So each
+    `*` but the segment's last matches lazily up to the next fixed part, inside an atomic
+    group that never gives the match back. Fixed parts match a fixed number of characters,
+    so their earliest placement is one that can succeed whenever any can. The last `*` stays
+    greedy, so the rest of the segment can still end where the segment ends.
+    """
+    parts = _fixed_parts(text)
+    if len(parts) == 1:
+        return parts[0]
+    first, *middle, last = parts
+    lazy = "".join(f"(?>{_STAR}?{part})" for part in middle)
+    return f"{first}{lazy}{_STAR}{last}"
+
+
+def _fixed_parts(text: str) -> list[str]:
+    """Split a segment at each run of `*` and translate the fixed parts between them.
+
+    A segment with n runs of `*` has n + 1 parts. Only the first and the last can be empty.
+    """
+    parts: list[list[str]] = [[]]
+    after_star = False
     index = 0
     while index < len(text):
         char = text[index]
         if char == "*":
-            if not out or out[-1] != "[^/]*":
-                out.append("[^/]*")
+            if not after_star:
+                parts.append([])
+            after_star = True
             index += 1
-        elif char == "?":
-            out.append("[^/]")
+            continue
+        after_star = False
+        if char == "?":
+            parts[-1].append("[^/]")
             index += 1
         elif char == "[":
             translated, index = _char_class(text, index)
-            out.append(translated)
+            parts[-1].append(translated)
         else:
-            out.append(re.escape(char))
+            parts[-1].append(re.escape(char))
             index += 1
-    return "".join(out)
+    return ["".join(part) for part in parts]
 
 
 def _char_class(text: str, start: int) -> tuple[str, int]:

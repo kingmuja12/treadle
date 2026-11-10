@@ -1,0 +1,4 @@
+name: "Deploy \U0001F680 \U00110000"
+steps:
+  - id: greet
+    run: echo hi

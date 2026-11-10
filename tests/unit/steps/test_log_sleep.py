@@ -15,6 +15,7 @@ from treadle.steps.base import StepResult
 from treadle.steps.log import LogStep
 from treadle.steps.sleep import SleepStep
 from treadle.types import JSONValue
+from treadle.units import format_duration
 
 
 def params(schema: Obj, **raw: object) -> dict[str, JSONValue]:
@@ -97,7 +98,9 @@ def test_sleep_parameters_are_validated() -> None:
     schema = SleepStep().schema
 
     assert codes(schema) == [("E102", "missing required key 'duration'")]
-    assert codes(schema, duration="25h") == [("E104", "must be between 0s and 1d")]
+    # The schema formats the bounds; the sleep step only chooses them.
+    bounds = f"must be between {format_duration(0)} and {format_duration(86400)}"
+    assert codes(schema, duration="25h") == [("E104", bounds)]
     assert codes(schema, duration=True) == [
         ("E103", "expected a duration such as 30s, got a boolean")
     ]

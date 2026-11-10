@@ -1,4 +1,4 @@
-"""The expression functions (section 3, "Functions").
+"""The expression functions.
 
 This module also holds the value rules that the evaluator reuses, because the layer order puts
 it first: display strings, `==`, numeric strings, and the type names in messages.
@@ -33,9 +33,21 @@ class FunctionSpec:
     max_args: int | None
     status: bool = False
 
+    def arity_problem(self, count: int) -> str | None:
+        """Return the message for a call with `count` arguments, or None when it's allowed.
 
-# Design note: section 4 says "the 15 functions", but the table in section 3 lists 16 names,
-# counting the four status functions. FUNCTIONS holds all 16.
+        The loader reports the message as E206, and a call at run time raises it.
+        """
+        low, high = self.min_args, self.max_args
+        if low <= count and (high is None or count <= high):
+            return None
+        expected = (
+            f"at least {low}" if high is None else str(low) if low == high else f"{low} or {high}"
+        )
+        return f"wrong number of arguments for {self.name}(): expected {expected}, got {count}"
+
+
+# Every function, the four status functions included.
 FUNCTIONS: Final[Mapping[str, FunctionSpec]] = {
     spec.name: spec
     for spec in (
@@ -68,16 +80,9 @@ def call_function(name: str, args: Sequence[JSONValue], *, source: str, offset: 
     spec = FUNCTIONS.get(name)
     if spec is None or spec.status:
         raise EvaluationError(f"unknown function '{name}'", source=source, offset=offset)
-    low, high = spec.min_args, spec.max_args
-    if len(args) < low or (high is not None and len(args) > high):
-        expected = (
-            f"at least {low}" if high is None else str(low) if low == high else f"{low} or {high}"
-        )
-        raise EvaluationError(
-            f"wrong number of arguments for {name}(): expected {expected}, got {len(args)}",
-            source=source,
-            offset=offset,
-        )
+    problem = spec.arity_problem(len(args))
+    if problem is not None:
+        raise EvaluationError(problem, source=source, offset=offset)
     try:
         return _IMPLEMENTATIONS[name](*args)
     except _ArgumentError as error:
@@ -92,8 +97,8 @@ def _contains(haystack: JSONValue, needle: JSONValue) -> bool:
     if isinstance(haystack, str):
         return needle is not None and _display(needle) in haystack
     if isinstance(haystack, list):
-        # Design note: the null-needle rule is stated for string haystacks. Array membership
-        # uses ==, so an array that holds null contains null.
+        # A null needle never matches in a string, but array membership uses ==, so an
+        # array that holds null contains null.
         return any(_equals(item, needle) for item in haystack)
     if haystack is None:
         return False
@@ -135,8 +140,8 @@ def _join(items: JSONValue, separator: JSONValue = ",") -> str:
 
 
 def _from_json(text: JSONValue) -> JSONValue:
-    # Design note: section 3 doesn't say what fromJSON does with a non-string, so it raises
-    # instead of guessing at a conversion.
+    # A non-string raises instead of being converted, because any conversion would be a
+    # guess.
     if not isinstance(text, str):
         raise _ArgumentError(f"expects a string, got {_kind(text)}")
     if len(text) > _MAX_CHARS:
@@ -208,7 +213,7 @@ def _check_size(size: int) -> None:
 
 
 def _display(value: JSONValue) -> str:
-    """Return the display string of a value (section 3, "Rendering templates")."""
+    """Return the display string of a value, which templates render."""
     if isinstance(value, str):
         return value
     if value is None:

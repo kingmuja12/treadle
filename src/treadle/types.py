@@ -17,7 +17,7 @@ _RESET: Final = "\x1b[0m"
 
 
 class ExitCode(IntEnum):
-    """Exit codes of the `treadle` CLI. Section 9 defines what each one means."""
+    """Exit codes of the `treadle` CLI, which scripts can rely on."""
 
     OK = 0
     FAILURE = 1
@@ -65,7 +65,7 @@ class Issue:
     hint: str | None = None
 
     def render(self, file: str, source: str | None = None, *, color: bool = False) -> str:
-        """Render the issue in the rustc-style diagnostic format that section 3 shows.
+        """Render the issue in a rustc-style diagnostic format.
 
         With a position, the first line is `file:line:column: severity[code]: message`, followed
         by the source line and a caret when `source` holds that line. Without a position, the
@@ -75,9 +75,9 @@ class Issue:
         if color:
             severity = f"{_COLORS[self.severity]}{severity}{_RESET}"
         summary = f"{severity}[{self.code}]: {self.message}"
-        # Design note: the gutter is at least two digits wide, so `= help:` lines up with the
-        # `|` gutter and matches the design's literal "   = help: {hint}" for most files. An
-        # empty path drops the "(at ...)" suffix instead of printing "(at )".
+        # The gutter is at least two digits wide, so `= help:` lines up with the `|` gutter,
+        # three spaces in for an issue on lines 1 to 99. An empty path drops the "(at ...)"
+        # suffix instead of printing "(at )".
         gutter = "   "
         if self.position is None:
             where = f" (at {format_path(self.path)})" if self.path else ""
@@ -98,8 +98,7 @@ class Issue:
 
         `path` is the formatted YAML path, or null for an issue about the whole file.
         """
-        # Design note: section 4 lists seven keys but the signature takes `file`, and a
-        # signature beats prose, so the shape also carries "file".
+        # The shape carries "file" too, so an issue read on its own still names its file.
         position = self.position
         return {
             "file": file,

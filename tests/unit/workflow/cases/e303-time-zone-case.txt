@@ -1,0 +1,10 @@
+workflows/e303-time-zone-case.yml:4:17: error[E303]: unknown time zone 'europe/london'
+   |
+ 4 |       timezone: europe/london
+   |                 ^
+   = help: did you mean 'Europe/London'?
+workflows/e303-time-zone-case.yml:6:17: error[E303]: unknown time zone 'utc'
+   |
+ 6 |       timezone: utc
+   |                 ^
+   = help: did you mean 'UTC'?

@@ -1,4 +1,4 @@
-"""Enforce section 4's layer map, third-party import rules, and package `__init__` rules.
+"""Enforce the layer map, the third-party import rules, and the package `__init__` rules.
 
 Every import counts, including imports under `if TYPE_CHECKING:` and inside functions. A
 module may import from any lower layer and from modules listed earlier in its own layer.

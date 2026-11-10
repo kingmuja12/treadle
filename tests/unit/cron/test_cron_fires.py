@@ -29,7 +29,8 @@ def utc(text: str) -> datetime:
     return datetime.fromisoformat(text).replace(tzinfo=UTC)
 
 
-# Section 6, "Verified DST vectors": (expression, zone, after, the next fires), all in UTC.
+# Fire times across DST changes, checked by hand: (expression, zone, after, the next fires),
+# all in UTC.
 VECTORS = [
     (
         "30 2 * * *",

@@ -7,17 +7,31 @@ select the file), then `treadle.toml` found by searching upward, then built-in d
 from __future__ import annotations
 
 import contextlib
+import functools
 import ipaddress
 import logging
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final, Literal, cast
-from zoneinfo import ZoneInfo
+from zoneinfo import available_timezones
 
 from treadle.errors import ConfigError
-from treadle.schema import Bool, Duration, Field, Int, ListOf, Obj, Size, Str, validate
+from treadle.schema import (
+    Bool,
+    CheckContext,
+    Duration,
+    Field,
+    Int,
+    ListOf,
+    Obj,
+    Size,
+    Str,
+    validate,
+)
+from treadle.types import Issue, Severity, YamlPath
 
 CONFIG_FILENAME: Final = "treadle.toml"
 _DAY: Final = 86400.0
@@ -25,6 +39,18 @@ _KIB: Final = 1024
 _MIB: Final = 1024**2
 _LOCALTIME: Final = Path("/etc/localtime")
 _DEFAULT_DIRS: Final = {"workflows_dir": "workflows", "state_dir": ".treadle"}
+_ZONE_EXAMPLE: Final = "use an IANA name such as Europe/London"
+_HOME_HINT: Final = "check the user name after `~`, or write the full path"
+# The `allowed_hosts` entries that Starlette's TrustedHostMiddleware can match against the
+# Host header: a host name or an IPv4 address, an IPv6 address in brackets, "*", or "*." and
+# a domain. The middleware refuses any other wildcard when the daemon starts, and a scheme,
+# a port, or an IPv6 address without brackets could never match.
+_HOST_NAME: Final = re.compile(r"(?:\*\.)?[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\.?")
+_BRACKETED: Final = re.compile(r"\[([0-9A-Fa-f:.]+)\]")
+_HOST_MESSAGE: Final = "must be a host name or address, '*', or '*.' followed by a domain"
+_HOST_HINT: Final = (
+    "such as treadle.local, 192.168.1.10, [::1], or *.example.com, without a scheme or a port"
+)
 _log = logging.getLogger(__name__)
 
 
@@ -140,7 +166,11 @@ class Settings:
         return self.state_dir / "backups"
 
     def file_roots(self) -> tuple[Path, ...]:
-        """The `file` step roots: "~" expanded, relative to `project_dir`, symlinks resolved."""
+        """The `file` step roots: "~" expanded, relative to `project_dir`, symlinks resolved.
+
+        `load_settings` checks that every root resolves. Raises ValueError with the reason
+        when one no longer does.
+        """
         return tuple(_resolve(self.project_dir, root) for root in self.security.file_roots)
 
     def protected_paths(self) -> tuple[Path, ...]:
@@ -165,6 +195,16 @@ class Overrides:
     log_level: str | None = None
 
 
+class _AllowedHost(Str):
+    """An `allowed_hosts` entry: a host name or address, "*", or "*." followed by a domain."""
+
+    def _check(self, value: object, path: YamlPath, ctx: CheckContext) -> object:
+        if isinstance(value, str) and not _is_host_pattern(value):
+            ctx.issues.append(Issue(Severity.ERROR, "E104", _HOST_MESSAGE, path, hint=_HOST_HINT))
+            return value
+        return super()._check(value, path, ctx)
+
+
 def _table(name: str, **fields: Field) -> Field:
     return Field(Obj(f"[{name}]", fields))
 
@@ -182,7 +222,7 @@ _SCHEMA: Final = Obj(
             host=Field(Str(min_len=1)),
             port=Field(Int(min=0, max=65535)),
             token_env=Field(Str(pattern=r"[A-Za-z_][A-Za-z0-9_]*")),
-            allowed_hosts=Field(ListOf(Str(min_len=1))),
+            allowed_hosts=Field(ListOf(_AllowedHost())),
             secure_cookies=Field(Bool()),
             session_ttl=Field(Duration(min=300, max=30 * _DAY)),
         ),
@@ -223,8 +263,10 @@ _CONFIG_TEMPLATE: Final = """\
 
 workflows_dir = "workflows"
 state_dir = ".treadle"
-env_file = ".env"           # "" disables it
-timezone = "{timezone}"     # an IANA name, or "local" to detect it at startup
+# "" disables the env file.
+env_file = ".env"
+# An IANA name, or "local" to detect the zone at startup.
+timezone = "{timezone}"
 
 [server]
 # host = "127.0.0.1"        # any other address requires TREADLE_TOKEN
@@ -284,7 +326,9 @@ def load_settings(
 
     Without a config file, `require_project=True` raises ConfigError with the hint to run
     `treadle init`; otherwise `cwd` is the project directory and defaults apply. Every problem
-    in the file is reported in one ConfigError whose issues carry the key paths.
+    in the file is reported in one ConfigError whose issues carry the key paths. Once the rest
+    of the file is valid, a path that can't be resolved, such as one under the `~` of an
+    unknown user, is reported the same way.
     """
     cwd = cwd.resolve()
     config_path = _config_path(overrides, cwd, environ)
@@ -293,20 +337,27 @@ def load_settings(
     raw = _read_toml(config_path) if config_path is not None else {}
     _apply_overrides(raw, overrides)
     data, issues = validate(_SCHEMA, raw)
+    source = config_path or "command-line options"
     if issues:
-        source = config_path or "command-line options"
         raise ConfigError(f"invalid configuration in {source}", issues=issues)
     values = cast(dict[str, Any], data)
     project_dir = config_path.parent if config_path is not None else cwd
+    workflows_dir = _choose_dir(
+        overrides.workflows_dir, values, "workflows_dir", cwd, project_dir, issues
+    )
+    state_dir = _choose_dir(overrides.state_dir, values, "state_dir", cwd, project_dir, issues)
     env_file = values.get("env_file", ".env")
+    env_path = _checked_path(project_dir, env_file, ("env_file",), issues) if env_file else None
+    for index, root in enumerate(values.get("security", {}).get("file_roots", ())):
+        _checked_path(project_dir, root, ("security", "file_roots", index), issues)
+    if issues:
+        raise ConfigError(f"invalid configuration in {source}", issues=issues)
     return Settings(
         project_dir=project_dir,
         config_path=config_path,
-        workflows_dir=_choose_dir(
-            overrides.workflows_dir, values, "workflows_dir", cwd, project_dir
-        ),
-        state_dir=_choose_dir(overrides.state_dir, values, "state_dir", cwd, project_dir),
-        env_file=_resolve(project_dir, env_file) if env_file else None,
+        workflows_dir=workflows_dir,
+        state_dir=state_dir,
+        env_file=env_path,
         timezone=resolve_timezone(values.get("timezone", "local"), environ),
         server=ServerSettings(**_table_values(values, "server")),
         runs=RunSettings(**_table_values(values, "runs")),
@@ -320,12 +371,12 @@ def load_settings(
 def resolve_timezone(name: str, environ: Mapping[str, str], *, localtime: Path = _LOCALTIME) -> str:
     """Return an IANA zone name. "local" detects the zone, falling back to UTC with a warning.
 
-    Any other name must load with `zoneinfo.ZoneInfo`, or ConfigError is raised. `localtime`
-    is the link that detection reads after `TZ`.
+    Any other name must pass `is_time_zone`, or ConfigError is raised. `localtime` is the link
+    that detection reads after `TZ`.
     """
     if name != "local":
-        if not _is_zone(name):
-            raise ConfigError(f"unknown time zone {name!r}; use an IANA name such as Europe/London")
+        if not is_time_zone(name):
+            raise ConfigError(f"unknown time zone {name!r}; {time_zone_hint(name)}")
         return name
     detected = detect_timezone(environ, localtime=localtime)
     if detected is None:
@@ -341,9 +392,25 @@ def detect_timezone(environ: Mapping[str, str], *, localtime: Path = _LOCALTIME)
         candidates.append(str(localtime.readlink()))
     for candidate in candidates:
         name = candidate.rpartition("zoneinfo/")[2]
-        if name and _is_zone(name):
+        if name and is_time_zone(name):
             return name
     return None
+
+
+def is_time_zone(name: str) -> bool:
+    """True when `name` is in the IANA time zone database, spelled exactly as it is there.
+
+    Case matters even where the file system ignores it, as on macOS, so a name that works on
+    one machine works on every machine with the same database.
+    """
+    return _zone_spellings().get(name.casefold()) == name
+
+
+def time_zone_hint(name: str) -> str:
+    """Return the hint for a name that isn't a time zone: its spelling in the database, or an
+    example of a valid name."""
+    spelled = _zone_spellings().get(name.casefold())
+    return f"did you mean '{spelled}'?" if spelled else _ZONE_EXAMPLE
 
 
 def is_loopback_host(host: str) -> bool:
@@ -365,7 +432,10 @@ def _config_path(overrides: Overrides, cwd: Path, environ: Mapping[str, str]) ->
     explicit = overrides.config or environ.get("TREADLE_CONFIG")
     if not explicit:
         return find_config(cwd)
-    path = _resolve(cwd, explicit)
+    try:
+        path = _resolve(cwd, explicit)
+    except ValueError as exc:
+        raise ConfigError(f"can't use the config file {explicit}: {exc}") from None
     if not path.is_file():
         raise ConfigError(f"config file not found: {path}")
     return path
@@ -393,11 +463,17 @@ def _apply_overrides(raw: dict[str, Any], overrides: Overrides) -> None:
 
 
 def _choose_dir(
-    flag: Path | None, values: dict[str, Any], key: str, cwd: Path, project_dir: Path
+    flag: Path | None,
+    values: dict[str, Any],
+    key: str,
+    cwd: Path,
+    project_dir: Path,
+    issues: list[Issue],
 ) -> Path:
+    """Resolve a directory from its flag against `cwd`, or from the file against the project."""
     if flag is not None:
-        return _resolve(cwd, flag)
-    return _resolve(project_dir, values.get(key, _DEFAULT_DIRS[key]))
+        return _checked_path(cwd, flag, (key,), issues)
+    return _checked_path(project_dir, values.get(key, _DEFAULT_DIRS[key]), (key,), issues)
 
 
 def _table_values(values: dict[str, Any], table: str) -> dict[str, Any]:
@@ -406,13 +482,61 @@ def _table_values(values: dict[str, Any], table: str) -> dict[str, Any]:
     return {key: tuple(value) if isinstance(value, list) else value for key, value in entries}
 
 
-def _resolve(base: Path, raw: str | Path) -> Path:
-    return (base / Path(raw).expanduser()).resolve()
+class _NoHomeError(ValueError):
+    """A path starts with a "~" or "~user" whose home directory isn't known."""
 
 
-def _is_zone(name: str) -> bool:
+def _checked_path(base: Path, raw: str | Path, key: YamlPath, issues: list[Issue]) -> Path:
+    """Resolve `raw` against `base`, or append an E104 issue at `key` that says why it can't.
+
+    A path that can't be resolved comes back as `base`, which stands in until the caller
+    raises ConfigError for the issues.
+    """
     try:
-        ZoneInfo(name)
-    except (KeyError, ValueError, OSError):  # ZoneInfoNotFoundError is a KeyError
+        return _resolve(base, raw)
+    except ValueError as exc:
+        hint = _HOME_HINT if isinstance(exc, _NoHomeError) else None
+        issues.append(Issue(Severity.ERROR, "E104", str(exc), key, hint=hint))
+        return base
+
+
+def _resolve(base: Path, raw: str | Path) -> Path:
+    """Expand "~" in `raw`, make it absolute against `base`, and resolve its symlinks.
+
+    Raises ValueError with the reason for a path that holds a NUL character, a "~" or
+    "~user" without a known home directory, or a path that the system refuses.
+    """
+    text = str(raw)
+    if "\0" in text:
+        raise ValueError("the path holds a NUL character")
+    try:
+        expanded = Path(raw).expanduser()
+    except RuntimeError:
+        raise _NoHomeError(f"can't expand '{text.split('/')[0]}' to a home directory") from None
+    try:
+        return (base / expanded).resolve()
+    except (OSError, RuntimeError) as exc:  # before Python 3.13, a symlink loop raises here
+        raise ValueError(f"can't resolve the path: {exc}") from None
+
+
+def _is_host_pattern(text: str) -> bool:
+    """True for an `allowed_hosts` entry that the Host check can match."""
+    if text == "*" or _HOST_NAME.fullmatch(text):
+        return True
+    bracketed = _BRACKETED.fullmatch(text)
+    if bracketed is None:
+        return False
+    try:
+        ipaddress.IPv6Address(bracketed[1])
+    except ValueError:
         return False
     return True
+
+
+@functools.cache
+def _zone_spellings() -> Mapping[str, str]:
+    """Map each name in the time zone database, case-folded, to its spelling there.
+
+    Listing the zones reads every file of the database, so it happens once per process.
+    """
+    return {name.casefold(): name for name in available_timezones()}

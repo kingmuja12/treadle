@@ -1,9 +1,10 @@
 """Golden diagnostics: each case renders exactly the issues in its `.txt` file.
 
 A case is `cases/<name>.yml`, a directory `cases/<name>/` of workflow files that load
-together with `cross_check`, or a generated file in GENERATED. Every E and W code in
-section 2 has at least one case. After an intended message change, run the suite with
-TREADLE_UPDATE_GOLDEN=1 to rewrite the expected files, then review the diff.
+together with `cross_check`, a generated file in GENERATED, or a generated directory with a
+symbolic link in LINKED. Every documented E and W code has at least one case. After an
+intended message change, run the suite with TREADLE_UPDATE_GOLDEN=1 to rewrite the expected
+files, then review the diff.
 """
 
 from __future__ import annotations
@@ -30,6 +31,8 @@ GENERATED = {
     "e055-too-large": b"steps: []\n" + b"#" * (1 << 20),
     "e056-not-utf8": b"name: Caf\xe9\nsteps:\n  - id: greet\n    run: echo hi\n",
 }
+# Directories that hold a symbolic link, which a source tree shouldn't: (link, its target).
+LINKED = {"w060-symlinked-file": ("linked.yml", "real.yml")}
 CODES = [
     "E050",
     "E051",
@@ -72,6 +75,7 @@ CODES = [
     "E405",
     "E406",
     "E407",
+    "W060",
     "W101",
     "W102",
     "W103",
@@ -89,6 +93,7 @@ NAMES = sorted(
     [path.stem for path in CASES.glob("*.yml")]
     + [path.name for path in CASES.iterdir() if path.is_dir()]
     + list(GENERATED)
+    + list(LINKED)
 )
 
 
@@ -110,10 +115,26 @@ def load_case(name: str, tmp_path: Path) -> list[LoadResult]:
         path = tmp_path / f"{name}.yml"
         path.write_bytes(GENERATED[name])
         return [loader.load_file(path)]
+    if name in LINKED:
+        link, target = LINKED[name]
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / target).write_text(
+            "steps:\n  - id: greet\n    run: echo hi\n", encoding="utf-8"
+        )
+        (directory / link).symlink_to(directory / target)
+        return load_directory(loader, directory)
     directory = CASES / name
     if directory.is_dir():
-        return cross_check([loader.load_file(path) for path in discover(directory)])
+        return load_directory(loader, directory)
     return [loader.load_file(CASES / f"{name}.yml")]
+
+
+def load_directory(loader: WorkflowLoader, directory: Path) -> list[LoadResult]:
+    """Load a directory's workflow files together, then add the files that discovery skips."""
+    skipped: list[LoadResult] = []
+    loaded = cross_check([loader.load_file(path) for path in discover(directory, skipped=skipped)])
+    return sorted([*loaded, *skipped], key=lambda result: result.path)
 
 
 def render(results: Sequence[LoadResult]) -> str:

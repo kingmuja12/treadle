@@ -68,6 +68,8 @@ def script(expression: str) -> Workflow:
         "trigger.query.page",
         "trigger.changes[0].path",
         "trigger.paths[0]",
+        "trigger.delivery",
+        "trigger.content_type",
         "toJSON(trigger)",
         "steps.fetch.outputs.body",
         "steps.fetch.outputs.json.version",
@@ -91,7 +93,15 @@ def test_w102_flags_inputs_and_step_outputs_in_a_run_script(reference: str) -> N
 
 @pytest.mark.parametrize(
     "reference",
-    ["trigger.kind", "trigger.hook", "steps.fetch.status", "env.HOME", "run.id", "workflow.id"],
+    [
+        "trigger.kind",
+        "trigger.hook",
+        "trigger.scheduled_for",
+        "steps.fetch.status",
+        "env.HOME",
+        "run.id",
+        "workflow.id",
+    ],
 )
 def test_trusted_data_in_a_run_script_is_fine(reference: str) -> None:
     assert warnings(script(reference)) == []
@@ -144,6 +154,22 @@ def test_w103_flags_untrusted_data_in_paths_and_urls() -> None:
         ("W103", "`trigger.changes.0.rel` puts untrusted data into `path`"),
         ("W103", "`steps.fetch.outputs.body` puts untrusted data into `source`"),
         ("W103", "`trigger.query.dir` puts untrusted data into `cwd`"),
+    ]
+
+
+def test_w103_flags_the_delivery_id_in_a_url() -> None:
+    workflow = workflow_from(
+        """\
+        steps:
+          - id: notify
+            uses: http
+            with:
+              url: https://example.net/deliveries/${{ trigger.delivery }}
+        """
+    )
+
+    assert warnings(workflow) == [
+        ("W103", "`trigger.delivery` puts untrusted data into `url`"),
     ]
 
 

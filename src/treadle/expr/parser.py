@@ -1,4 +1,4 @@
-"""The recursive-descent expression parser (section 3, "Grammar")."""
+"""The recursive-descent expression parser."""
 
 from __future__ import annotations
 
@@ -40,9 +40,9 @@ def parse_expression(source: str, *, offset: int = 0) -> Expression:
     comparisons with the hint "combine comparisons with &&". Raises ExpressionSyntaxError with
     the offset of the problem inside the YAML string.
     """
-    # Design note: nesting counts both open parentheses, brackets, and call argument lists,
-    # and the height of the syntax tree, so long `||` chains count too. Bounding the tree
-    # keeps evaluation and analysis far from Python's recursion limit.
+    # Nesting counts open parentheses, brackets, and call argument lists, and also the height
+    # of the syntax tree, so long `||` chains count too. Bounding the tree keeps evaluation
+    # and analysis far from Python's recursion limit.
     if len(source) > MAX_SOURCE:
         raise ExpressionSyntaxError(
             f"the expression is longer than {MAX_SOURCE} characters", source=source, offset=offset
