@@ -197,14 +197,16 @@ class TestListOf:
         ]
 
     def test_uniqueness_takes_linear_time(self) -> None:
-        items = [f"item-{index}" for index in range(20_000)]
+        items = [f"item-{index}" for index in range(40_000)]
 
         started = time.perf_counter()
         found = problems(ListOf(Str(), unique=True), [*items, "item-7"])
         elapsed = time.perf_counter() - started
 
-        assert found == [("E104", "duplicate value 'item-7'", (20_000,))]
-        assert elapsed < 0.5
+        assert found == [("E104", "duplicate value 'item-7'", (40_000,))]
+        # A quadratic check takes over 5 seconds here; a linear one takes milliseconds, and
+        # well under the limit on a slow CI runner with coverage.
+        assert elapsed < 1.5
 
 
 class TestMapOf:

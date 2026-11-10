@@ -499,33 +499,56 @@ def test_an_offset_in_a_value_under_a_non_string_key_falls_back_to_its_start() -
     assert load("1: echo ${{ x }}\n").offset_position(("1",), 5) == Position(1, 4)
 
 
-LONG_VALUE = "x" * 1_000_000
-
-
-@pytest.mark.parametrize(
-    ("source", "style", "first"),
-    [
-        pytest.param(f"run: {LONG_VALUE}\n", "plain", Position(1, 6), id="plain"),
-        pytest.param(f"run: '{LONG_VALUE}'\n", "'", Position(1, 7), id="single-quoted"),
-        pytest.param(f"run: |\n  {LONG_VALUE}\n", "|", Position(2, 3), id="literal"),
-    ],
-)
-def test_placing_many_offsets_in_one_long_scalar_takes_linear_time(
-    source: str, style: str, first: Position
-) -> None:
-    value = f"{LONG_VALUE}\n" if style == "|" else LONG_VALUE
-    document = YamlDocument(
+def _scalar_document(text: str, style: str) -> YamlDocument:
+    """Return a document whose `run` key holds `text` as a scalar in `style`."""
+    if style == "|":
+        source, value = f"run: |\n  {text}\n", f"{text}\n"
+    elif style == "'":
+        source, value = f"run: '{text}'\n", text
+    else:
+        source, value = f"run: {text}\n", text
+    return YamlDocument(
         {"run": value},
         source,
         {(): Position(1, 1), ("run",): Position(1, 6)},
         {("run",): Position(1, 1)},
         {("run",): style},
     )
-    offsets = range(len(LONG_VALUE) - 20_000, len(LONG_VALUE))
 
-    started = time.perf_counter()
-    positions = [document.offset_position(("run",), offset) for offset in offsets]
-    elapsed = time.perf_counter() - started
 
-    assert positions == [Position(first.line, first.column + offset) for offset in offsets]
-    assert elapsed < 0.3
+def _fastest_placement(document: YamlDocument, offsets: range) -> float:
+    """Return the best of three timings, in seconds, of placing every offset in `offsets`."""
+    timings = []
+    for _ in range(3):
+        started = time.perf_counter()
+        for offset in offsets:
+            document.offset_position(("run",), offset)
+        timings.append(time.perf_counter() - started)
+    return min(timings)
+
+
+@pytest.mark.parametrize(
+    ("style", "first"),
+    [
+        pytest.param("plain", Position(1, 6), id="plain"),
+        pytest.param("'", Position(1, 7), id="single-quoted"),
+        pytest.param("|", Position(2, 3), id="literal"),
+    ],
+)
+def test_placing_an_offset_costs_the_same_in_a_short_and_a_long_scalar(
+    style: str, first: Position
+) -> None:
+    short, long = 10_000, 4_000_000
+    short_document = _scalar_document("x" * short, style)
+    long_document = _scalar_document("x" * long, style)
+    long_tail = range(long - 5_000, long)
+
+    short_time = _fastest_placement(short_document, range(short - 5_000, short))
+    long_time = _fastest_placement(long_document, long_tail)
+
+    positions = [long_document.offset_position(("run",), offset) for offset in long_tail]
+    assert positions == [Position(first.line, first.column + offset) for offset in long_tail]
+    # A placement that rescans the source takes time in proportion to its length, which
+    # makes the long scalar hundreds of times slower. Comparing the two, instead of checking
+    # a fixed time, holds on any machine, with or without coverage.
+    assert long_time < 4 * short_time + 0.01

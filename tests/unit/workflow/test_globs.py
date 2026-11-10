@@ -73,7 +73,8 @@ def test_a_pattern_with_many_stars_rejects_a_long_near_miss_quickly() -> None:
     elapsed = time.perf_counter() - started
 
     assert (len(near_miss), matched) == (245, False)
-    assert elapsed < 0.25
+    # A backtracking translation takes over 8 seconds on this name.
+    assert elapsed < 1.0
 
 
 @pytest.mark.parametrize(

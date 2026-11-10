@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-import time
+import re
 from urllib.parse import quote, quote_plus
 
 import pytest
 
+from treadle.engine import masking
 from treadle.engine.masking import MASK, MIN_SECRET_LENGTH, Masker
 
 
@@ -89,15 +90,27 @@ def test_add_masks_later_text_only() -> None:
     assert (before, masker.mask("value-1234")) == ("value-1234", "***")
 
 
-def test_many_values_added_in_a_row_compile_once() -> None:
+def test_many_values_added_in_a_row_compile_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    compiled: list[str] = []
+
+    class CountingRe:
+        """The re module, counting the patterns that the masker compiles."""
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(re, name)
+
+        def compile(self, pattern: str) -> re.Pattern[str]:
+            compiled.append(pattern)
+            return re.compile(pattern)
+
+    monkeypatch.setattr(masking, "re", CountingRe())
     masker = Masker(["base-secret"])
     values = [f"tok-{index:05d}-0123456789" for index in range(1000)]
-    started = time.perf_counter()
 
     added = [masker.add(value) for value in values]
     masked = [masker.mask(f"line {value}") for value in values]
 
-    assert time.perf_counter() - started < 3  # compiling 1,000 times takes over 7 seconds
+    assert len(compiled) == 1
     assert all(added)
     assert masked == ["line ***"] * 1000
     assert masker.longest == len(values[0])
