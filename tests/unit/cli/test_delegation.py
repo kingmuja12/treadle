@@ -233,7 +233,7 @@ def test_a_maintenance_holder_makes_run_and_cancel_wait_then_give_up(
 
 @contextlib.contextmanager
 def _pressed_at_once(callback: Callable[[int], None]) -> Iterator[None]:
-    """Stand in for the stop-signal handlers: Ctrl-C is pressed as soon as they're installed."""
+    """Stand in for the stop-signal handlers: Ctrl+C is pressed as soon as they're installed."""
     callback(signal.SIGINT)
     yield
 
@@ -257,7 +257,7 @@ def test_ctrl_c_before_the_daemon_answers_withdraws_the_request(
 def _pressed_after(
     seconds: float, number: int = signal.SIGINT
 ) -> Callable[[Callable[[int], None]], contextlib.AbstractContextManager[None]]:
-    """Stand in for the stop-signal handlers: the signal, Ctrl-C by default, comes `seconds`
+    """Stand in for the stop-signal handlers: the signal, Ctrl+C by default, comes `seconds`
     after they're installed."""
 
     @contextlib.contextmanager
@@ -460,7 +460,7 @@ def test_ctrl_c_while_the_daemon_answers_a_claimed_request_leaves_the_run_to_it(
     project.write_workflow("slow", SLOW)
     monkeypatch.setattr(commands, "_on_stop_signals", _pressed_after(0.3))
 
-    # Ctrl-C comes after the claim and before the answer, which then still arrives.
+    # Ctrl+C comes after the claim and before the answer, which then still arrives.
     with InProcessDaemon(project.settings(), delay=0.8):
         result = cli("run", "slow")
         running = _status(project, 1)
@@ -477,7 +477,7 @@ def test_ctrl_c_after_the_daemon_finished_the_run_says_so(
     store_runs(project.settings(), "greet", lambda runs: runs.finished(RunStatus.SUCCEEDED))
     monkeypatch.setattr(commands, "_on_stop_signals", _pressed_after(0.3))
 
-    # The holder answers with run 1, which has finished, after Ctrl-C.
+    # The holder answers with run 1, which has finished, after Ctrl+C.
     with InProcessDaemon(
         project.settings(), answers=_delayed_answer({"run_id": 1, "outcome": "queued"}, 0.6)
     ):

@@ -112,10 +112,9 @@ Untrusted trigger data is a webhook's `body`, `headers`, `query`, `content_type`
 request headers that no signature covers, so a replayed signed body can carry any values
 for them. The other fields of a schedule, a watch, or a manual run come from Treadle.
 
-Each warning's hint shows the fix. For W101 and W102, write the `env` entry on its own
-line, as the safe example on this page does. In a one-line mapping, the template needs
-quotes, as in `env: {VALUE: "${{ trigger.body.ref }}"}`. To fail a CI job on these
-warnings, run `treadle validate --strict`.
+Each warning's hint shows the fix. For W101 and W102, the hint gives an `env` entry that you
+can paste into the step as written, such as `env: {VALUE: "${{ trigger.body.ref }}"}`. To
+fail a CI job on these warnings, run `treadle validate --strict`.
 
 ## Secrets
 
@@ -171,10 +170,8 @@ Other protections:
   in `allowed_hosts`. Webhooks skip this check, because a tunnel or proxy may forward them
   with any `Host`.
 - **Every response** carries a strict Content Security Policy, `X-Frame-Options: DENY`,
-  `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, and
-  `Cache-Control: no-store`. The one exception is the plain-text 413 that Starlette sends
-  when a request declares a `Content-Length` larger than the body limit. Its body is always
-  the same text, `Content Too Large`.
+  `X-Content-Type-Options: nosniff`, and `Referrer-Policy: no-referrer`. Every response
+  except the dashboard's static files also carries `Cache-Control: no-store`.
 
 Treadle serves plain HTTP. To reach it from another machine, put TLS in front of it with a
 reverse proxy, an SSH tunnel, or a VPN such as Tailscale. See
@@ -213,4 +210,6 @@ Treadle bounds what one workflow, request, or step can consume:
   connections at once.
 
 Treadle doesn't limit CPU time or memory. To limit them, run Treadle under systemd with
-`MemoryMax=` and `CPUQuota=`. See [Run Treadle with systemd](operations.md#run-treadle-with-systemd).
+`MemoryMax=` and `CPUQuota=`, or in a container with `--memory` and `--cpus`. See
+[Run Treadle with systemd](operations.md#run-treadle-with-systemd) and
+[Run Treadle in a container](operations.md#run-treadle-in-a-container).

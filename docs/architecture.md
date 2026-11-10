@@ -394,12 +394,6 @@ $ curl -s -X POST http://127.0.0.1:8765/api/v1/workflows/hello/runs \
   `workflow_invalid`, `invalid_inputs`, `unsupported_media_type`, `payload_too_large`,
   `rate_limited`, `shutting_down`, `hook_disabled`, `busy`, `expired`, and `internal`.
 
-One answer doesn't use the error shape. When a request declares a `Content-Length` larger
-than the body limit, `[limits] api_body_bytes` for the API and the dashboard's forms or
-`[limits] webhook_body_bytes` for webhooks, Starlette answers 413 with the plain text
-`Content Too Large`, and without the security headers. A body that grows past the limit
-while it streams gets the JSON `payload_too_large` error.
-
 Times are ISO 8601 strings in UTC, and missing values are `null`.
 
 ### Dashboard

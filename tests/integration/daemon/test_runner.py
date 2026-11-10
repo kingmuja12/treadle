@@ -7,6 +7,8 @@ the shared HTTP client, and none of the daemon's HTTP stack imported.
 from __future__ import annotations
 
 import asyncio
+import logging
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -132,7 +134,8 @@ async def test_a_forced_cancel_leaves_no_process_behind_once_the_runner_closes(
         status = await asyncio.wait_for(runner.wait(run_id), 10)
         started = loop.time()
 
-    # The step ignores SIGTERM and has 30 seconds of kill grace, yet closing kills it.
+    # The step ignores SIGTERM and has 30 seconds of kill grace, yet nothing of it is left,
+    # and closing doesn't wait out the grace.
     assert status is RunStatus.CANCELLED
     assert loop.time() - started < 5
     assert surviving_process_groups(settings.db_path) == []
@@ -152,6 +155,26 @@ async def test_a_tracked_group_that_no_step_forgets_delays_closing_only_briefly(
     await runner_module._kill_leftovers(processes)
 
     assert 0.25 < loop.time() - started < 2
+
+
+async def test_a_tracked_group_that_is_still_alive_gets_sigkill(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(runner_module, "_LEFTOVER_WAIT", 0.3)
+    alive = await asyncio.create_subprocess_exec("sleep", "30", start_new_session=True)
+    processes = ProcessRegistry()
+    processes.add(alive.pid)  # a group that a step still tracks after its run ended
+    caplog.set_level(logging.INFO, logger="treadle.runner")
+    try:
+        await runner_module._kill_leftovers(processes)
+        code = await asyncio.wait_for(alive.wait(), 5)
+    finally:
+        if alive.returncode is None:
+            alive.kill()
+            await alive.wait()
+
+    assert code == -signal.SIGKILL
+    assert caplog.messages == ["killed 1 process group that cancelled steps left running"]
 
 
 async def test_the_shared_http_client_keeps_no_cookies(

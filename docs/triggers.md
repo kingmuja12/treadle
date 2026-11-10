@@ -362,11 +362,10 @@ Treadle checks each delivery in this order and answers with the first failure:
 Treadle compares signatures in constant time. It applies the rate limit only after the
 signature verifies, so unsigned requests can't use up a real sender's allowance.
 
-One 413 differs from the others. When a request declares a `Content-Length` larger than
-`[limits] webhook_body_bytes`, Starlette, the web framework, refuses it before any of these
-checks run. That answer is plain text, `Content Too Large`, without the JSON error shape
-and without the security headers. A body that grows past that limit while it streams, and a
-body larger than a hook's own `max_body`, get the JSON `payload_too_large` error.
+One 413 comes before these checks. When a request declares a `Content-Length` larger than
+`[limits] webhook_body_bytes`, Treadle answers 413 `payload_too_large` without reading the
+body, even for a hook that doesn't exist. A body that grows past that limit while it
+streams, and a body larger than a hook's own `max_body`, get the same error.
 
 When every check passes, Treadle submits the run and answers:
 

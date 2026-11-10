@@ -127,7 +127,7 @@ _CONTROL_ERRORS: Final[Mapping[str, type[TreadleError]]] = {
 }
 # The result that a withdrawn control request keeps.
 _WITHDRAWN: Final = error_json("expired", "the CLI stopped waiting for an answer")
-# The signals that stop a command that runs a workflow or waits on the lock holder: Ctrl-C,
+# The signals that stop a command that runs a workflow or waits on the lock holder: Ctrl+C,
 # `kill` or a supervisor's stop, and a terminal that closes.
 _STOP_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 # A write to a pipe whose reader left fails with EPIPE, and to a terminal that hung up, EIO.
@@ -885,14 +885,14 @@ class _Signals:
         self.event.set()
 
     def exit_code(self) -> int:
-        """Return 128 plus the first signal's number, as a shell reports it: 130 after Ctrl-C."""
+        """Return 128 plus the first signal's number, as a shell reports it: 130 after Ctrl+C."""
         return 128 + self.received[0]
 
 
 class _RunStops(_Signals):
     """Handles stop signals during a local run: the first cancels the run, the next forces it.
 
-    Ctrl-C cancels it for the user. SIGTERM and SIGHUP cancel it with the reason `shutdown`,
+    Ctrl+C cancels it for the user. SIGTERM and SIGHUP cancel it with the reason `shutdown`,
     because the process that runs it was told to stop. A signal that arrives before the run
     exists takes effect as soon as `follow` names the run.
     """
@@ -933,7 +933,7 @@ class _RunStops(_Signals):
 def _cancelling(run_id: int, signum: int) -> str:
     """The message for the first stop signal during a local run."""
     if signum == signal.SIGINT:
-        return f"Cancelling run #{run_id} (press Ctrl-C again to force)"
+        return f"Cancelling run #{run_id} (press Ctrl+C again to force)"
     return f"Cancelling run #{run_id} ({signal.Signals(signum).name}; signal again to force)"
 
 
@@ -1025,7 +1025,7 @@ async def _follow_here(
     """Follow a run in this process until it ends, while `stops` handles stop signals.
 
     After a stop signal the command still waits for the run to end, so cleanup steps run,
-    and then exits 128 plus the signal's number: 130 after Ctrl-C. When the reader of the
+    and then exits 128 plus the signal's number: 130 after Ctrl+C. When the reader of the
     output goes away, as with `treadle run X | head -1`, the run goes on without output, as
     a daemon's run would, and the command exits 1 once it ends.
     """
@@ -1433,7 +1433,7 @@ def _created(submission: Submission) -> RunRecord:
 def _on_stop_signals(callback: Callable[[int], None]) -> Iterator[None]:
     """Call `callback(signum)` on the event loop for each stop signal while the block runs.
 
-    The stop signals are SIGINT (Ctrl-C), SIGTERM, and SIGHUP. Their previous handlers come
+    The stop signals are SIGINT (Ctrl+C), SIGTERM, and SIGHUP. Their previous handlers come
     back afterward. Outside the main thread, signals can't be handled, and each keeps its
     usual effect.
     """

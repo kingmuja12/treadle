@@ -413,16 +413,20 @@ async def _stop_manager(
 async def _kill_leftovers(processes: ProcessRegistry) -> None:
     """SIGKILL the process groups that are still tracked once no run is active.
 
-    A forced cancel records its run as cancelled while the cancelled step may still be giving
-    its process group the kill grace, so without this, a process that ignores SIGTERM would
-    outlive the lock holder. The steps that track those groups then get up to 2 seconds to
-    notice that the groups are gone and stop tracking them.
+    A run can end while a step still tracks a process group. When a forced cancel reaches a
+    step that is already stopping, the step waits at most 2 seconds after SIGKILL, and a
+    forced shutdown cancels the runs that are still active 2 seconds after its SIGKILL. In
+    both cases, the termination of the groups goes on in the background. Without this, a
+    process left in such a group could outlive the lock holder. The steps that track those
+    groups then get up to 2 seconds to notice that the groups are gone and stop tracking
+    them.
     """
     if not processes:
         return
     killed = processes.kill_all()
     if killed:
-        _log.info("killed %d process groups that cancelled steps left running", killed)
+        groups = "process group" if killed == 1 else "process groups"
+        _log.info("killed %d %s that cancelled steps left running", killed, groups)
     for _ in range(math.ceil(_LEFTOVER_WAIT / _LEFTOVER_POLL)):
         if not processes:
             return

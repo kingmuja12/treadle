@@ -1,7 +1,7 @@
 # Operations
 
-This guide covers running `treadle serve` as a long-lived service, reading its logs, backing
-up and upgrading it, and reaching it from other machines.
+This guide covers running `treadle serve` as a long-lived service or in a container, reading
+its logs, backing up and upgrading it, and reaching it from other machines.
 
 ## Before you start
 
@@ -165,6 +165,63 @@ Manage the agent:
 | Reload the workflows now | `launchctl kill HUP "gui/$(id -u)/local.treadle.serve"` |
 | Restart, for example after an upgrade, or a change to `treadle.toml` or to the API token | `launchctl kickstart -k "gui/$(id -u)/local.treadle.serve"` |
 | Stop and unload | `launchctl bootout "gui/$(id -u)/local.treadle.serve"` |
+
+## Run Treadle in a container
+
+Treadle has no official container image. Build one that installs Treadle as the
+[README](../README.md#install) describes, and run `treadle serve` in it under an init
+process. With Docker, the `--init` option adds one:
+
+```sh
+docker run --init --stop-timeout 60 \
+  -v /srv/automations:/automations -w /automations \
+  IMAGE treadle serve
+```
+
+Replace `IMAGE` with your image. This command runs the project in `/srv/automations` on the
+host. With Docker Compose, set `init: true` and `stop_grace_period: 60s` on the service. To
+run the image without `--init`, install tini in it, and make tini the entrypoint:
+
+```dockerfile
+ENTRYPOINT ["tini", "--"]
+CMD ["treadle", "serve"]
+```
+
+### Why Treadle needs an init process
+
+Without an init process, Treadle runs as PID 1, the container's first process. PID 1 adopts
+every process whose parent exits, such as the background processes of a step whose shell
+has ended. Treadle waits only for the processes that it starts. When an adopted process
+ends, for example because Treadle killed it, nothing reaps it, and it stays a zombie. Linux
+still counts a zombie as a member of its process group, so the step's group never looks
+empty. Each time Treadle stops such a group, it waits out the whole `[runs] kill_grace`,
+sends `SIGKILL`, and waits 2 more seconds. With the default grace of 5 seconds, a step that
+times out after 1 second takes about 8 seconds to end. The zombies also keep their process
+IDs until Treadle exits.
+
+An init process such as tini, which `--init` runs, reaps those processes at once. It
+forwards signals to Treadle, so `docker stop` still shuts Treadle down gracefully, and
+`docker kill --signal HUP` still reloads the workflows.
+
+### Container settings
+
+- `docker stop` sends `SIGTERM`, and then `SIGKILL` when the container's stop timeout runs
+  out. Docker's default timeout can be shorter than `[runs] shutdown_grace` (15 seconds by
+  default), and `SIGKILL` ends the cleanup steps that are still running. `--stop-timeout 60`
+  gives Treadle the time that `TimeoutStopSec=60` gives it under systemd. When Treadle
+  exits, the container stops, and so does every process left in it, including the steps
+  that a crashed Treadle left behind.
+- Inside a container, `127.0.0.1` is the container's own loopback address, which a published
+  port can't reach. To publish the port, listen on every address with `--host 0.0.0.0`, set
+  `TREADLE_TOKEN`, which Treadle requires on any address other than loopback, and publish
+  the port on the host's loopback address only, as in `-p 127.0.0.1:8765:8765`.
+- Keep the project directory outside the container, as the example's `-v` option does, so
+  the run history in `.treadle/treadle.db` outlives the container. Keep it on a local disk,
+  as [Before you start](#before-you-start) explains.
+- `--memory` and `--cpus` limit Treadle and every step it starts, as `MemoryMax=` and
+  `CPUQuota=` do under systemd.
+- Set `timezone` in `treadle.toml` instead of `local`. A container's local time zone is
+  often UTC, so with `local`, schedules fire in UTC.
 
 ## Logs
 

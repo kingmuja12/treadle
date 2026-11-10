@@ -78,7 +78,7 @@ doesn't exist exits 4, with `error: run 99 doesn't exist`,
 ## Output conventions
 
 - Results, including a run's progress, go to standard output. Errors, warnings, and notes
-  such as `Cancelling run #19 (press Ctrl-C again to force)` go to standard error.
+  such as `Cancelling run #19 (press Ctrl+C again to force)` go to standard error.
 - An error prints as `error: <message>`, and the command exits with the error's
   [exit code](#exit-codes). A warning prints as `warning: <message>`.
 - An unexpected error prints `internal error: <type>: <message>` and exits 1. When it
@@ -176,7 +176,7 @@ workflows/deploy.yml:8:30: warning[W101]: `trigger.body.ref` puts untrusted data
    |
  8 |     run: echo "Deploying ${{ trigger.body.ref }}"
    |                              ^
-   = help: pass it through env instead: set `env: {VALUE: ${{ trigger.body.ref }}}`, then quote "$VALUE" in the script
+   = help: pass it through env instead: set `env: {VALUE: "${{ trigger.body.ref }}"}`, then quote "$VALUE" in the script
 
 2 valid, 1 invalid (1 error, 1 warning)
 ```
@@ -336,14 +336,16 @@ terminal sends, the same way. After a stop signal, the command exits 128 plus th
 signal's number: 130 for Ctrl+C, 143 for `SIGTERM`, and 129 for `SIGHUP`.
 
 - **During a run in this terminal**, the first stop signal cancels the run and prints
-  `Cancelling run #19 (press Ctrl-C again to force)`, or, for another signal, a line that
+  `Cancelling run #19 (press Ctrl+C again to force)`, or, for another signal, a line that
   names it, such as `Cancelling run #19 (SIGTERM; signal again to force)`. Cleanup steps,
   such as those with `if: always()`, still run. Ctrl+C cancels the run with the reason
   `user`, and `SIGTERM` or `SIGHUP` with the reason `shutdown`. The command exits once the
   run has ended.
-- **A second stop signal of any kind forces the cancellation.** Treadle records the run as
-  cancelled at once. When the command exits, it kills every step process that the forced
-  cancellation left behind, so none outlives the command.
+- **A second stop signal of any kind forces the cancellation.** Cleanup steps that haven't
+  started don't run. A step that is still stopping after the first signal gets `SIGKILL` at
+  once. A cleanup step that is running gets `SIGTERM`, and then `SIGKILL` after
+  `[runs] kill_grace`. When the command exits, it kills every step process that is still
+  left, so none outlives the command.
 - **While following a daemon's run**, a stop signal stops following, and the run keeps
   going:
 
@@ -518,7 +520,7 @@ and cleanup steps get the workflow's `cleanup_timeout` to finish.
 
 | Option | Effect |
 |---|---|
-| `--force` | Stops the run at once, without waiting for cleanup steps. |
+| `--force` | Stops the run without waiting for cleanup steps. |
 | `--wait SECONDS` | How long to wait for the answer of the process that runs the run. The default is 5. With `0`, the command sends the request, prints `Cancel requested.`, and exits. |
 | `--json` | Prints `{"run_id", "status", "accepted", "forced"}`. With `--wait 0`, `accepted` is `null`. |
 
@@ -543,10 +545,14 @@ asks that process:
   128 plus the signal's number, such as 130 for Ctrl+C. When the process took the request
   first, the command reports its answer, and still exits with the signal's code.
 
-A forced cancel records the run as cancelled at once. When a `treadle run` in another
-terminal ran it, that command kills the step processes that are left as it exits. In a
-daemon that keeps running, a step process that ignores `SIGTERM` can outlive the run by up
-to `[runs] kill_grace`, and the daemon kills what is left when it shuts down.
+A forced cancel skips the cleanup steps that haven't started, and stops the running steps:
+
+- A step that is already stopping, as after a `treadle cancel` without `--force`, gets
+  `SIGKILL` at once.
+- A step that the force stops first gets `SIGTERM`, and then `SIGKILL` after
+  `[runs] kill_grace`. That includes every running step after a single `--force`, and a
+  cleanup step that runs after an earlier cancel. A step that ignores `SIGTERM` keeps the
+  run going until then.
 
 When no Treadle process is running, the command cancels a queued run in the database
 directly. A run that a crashed process left running then reports

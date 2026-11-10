@@ -252,7 +252,7 @@ def test_a_run_first_recovers_what_a_crashed_process_left(
 
 @contextlib.contextmanager
 def _pressed_at_once(callback: Callable[[int], None]) -> Iterator[None]:
-    """Stand in for the stop-signal handlers: Ctrl-C is pressed as soon as they're installed."""
+    """Stand in for the stop-signal handlers: Ctrl+C is pressed as soon as they're installed."""
     callback(signal.SIGINT)
     yield
 
@@ -266,14 +266,14 @@ def test_ctrl_c_cancels_the_run_and_exits_130(
     result = cli("run", "slow")
 
     assert result.code == ExitCode.INTERRUPTED
-    assert result.err == "Cancelling run #1 (press Ctrl-C again to force)\n"
+    assert result.err == "Cancelling run #1 (press Ctrl+C again to force)\n"
     assert "Run #1 cancelled (user) in " in result.out
     run = read_store(project.settings(), lambda repo: repo.get_run(1))
     assert run is not None
     assert run.status is RunStatus.CANCELLED
 
 
-# The cleanup step runs after a cancel, until a second Ctrl-C forces the run.
+# The cleanup step runs after a cancel, until a second Ctrl+C forces the run.
 CLEANUP = """\
 steps:
   - id: wait
@@ -309,7 +309,7 @@ def test_a_second_ctrl_c_forces_the_run_and_cuts_its_cleanup_short(
     result = cli("run", "cleanup")
 
     assert result.code == ExitCode.INTERRUPTED
-    assert result.err == "Cancelling run #1 (press Ctrl-C again to force)\n"  # only once
+    assert result.err == "Cancelling run #1 (press Ctrl+C again to force)\n"  # only once
     detail = read_store(project.settings(), lambda repo: repo.get_run_detail(1))
     assert detail is not None
     assert detail.run.status is RunStatus.CANCELLED
@@ -344,7 +344,7 @@ def _signalled_at_once(
             RunReason.SHUTDOWN,
             "Cancelling run #1 (SIGHUP; signal again to force)",
         ),
-        (signal.SIGINT, 130, RunReason.USER, "Cancelling run #1 (press Ctrl-C again to force)"),
+        (signal.SIGINT, 130, RunReason.USER, "Cancelling run #1 (press Ctrl+C again to force)"),
     ],
 )
 def test_a_stop_signal_cancels_the_run_and_exits_128_plus_its_number(
@@ -461,7 +461,7 @@ def test_ctrl_c_after_the_pipe_closed_still_cancels_the_run(
     code = main(["-C", str(project.root), "run", "slower"])
 
     assert code == ExitCode.INTERRUPTED
-    assert capsys.readouterr().err == "Cancelling run #1 (press Ctrl-C again to force)\n"
+    assert capsys.readouterr().err == "Cancelling run #1 (press Ctrl+C again to force)\n"
     run = read_store(project.settings(), lambda repo: repo.get_run(1))
     assert run is not None
     assert (run.status, run.reason) == (RunStatus.CANCELLED, RunReason.USER)

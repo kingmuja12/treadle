@@ -259,7 +259,7 @@ directory.
 | `defaults.timeout` | duration | `30m` | 1s–24h. Applies to each step attempt. |
 | `defaults.retry` | integer or retry mapping | `1` | An integer sets `attempts`. |
 | `defaults.shell` | `bash`, `sh`, `python`, or a list of strings | `bash` | See [`shell`](#shell). |
-| `defaults.cwd` | string | `.` | The working directory of `shell` steps. `~` expands, and a relative path resolves against the project directory. |
+| `defaults.cwd` | string | `.` | The working directory of `shell` steps. `~` expands, and a relative path resolves against the project directory. A `~user` whose home directory isn't known fails each step that uses it, without a retry, and the error names the path. |
 
 A retry mapping takes these keys:
 
@@ -374,11 +374,16 @@ Each skipped step records one reason:
   running, and pending steps with those conditions still start. These cleanup steps have
   `cleanup_timeout` to finish, and then Treadle forces the cancellation.
 - Each step's process runs in its own process group. To stop a step, Treadle sends
-  `SIGTERM` to the group, and then `SIGKILL` after `[runs] kill_grace` (default 5s).
+  `SIGTERM` to the group, and then `SIGKILL` after `[runs] kill_grace` (default 5s). When
+  Treadle forces the cancellation of a step that is already stopping, it sends `SIGKILL` at
+  once.
 - A `file` step runs in a thread, which a timeout or a cancel can't interrupt. Its attempt
   waits for the file operation to end, and logs whether it finished or failed. A timed-out
   `file` attempt ends `timed_out` without a retry. When Treadle forces the cancellation, the
-  attempt stops waiting, and the operation may still finish after the step ends.
+  attempt stops waiting, and the operation may still finish after the step ends. If the
+  operation ends before the run does, the step's log still says whether it finished or
+  failed. The Treadle process that runs the step waits for the operation before it exits,
+  unless a third signal stops `treadle serve`.
 - A process that a step starts in the background, such as `server >/dev/null 2>&1 &`, keeps
   running for the later steps of the run, and the step's log says so. When the run ends,
   whether it succeeded, failed, or was cancelled, Treadle stops such processes: `SIGTERM`,
@@ -428,7 +433,7 @@ invalid, the step fails without starting an attempt.
 | `run` | string | none | A script. Use exactly one of `run` and `argv` (E105, E106). |
 | `argv` | list of strings | none | Runs a program directly, without a shell. |
 | `shell` | `bash`, `sh`, `python`, or a list of strings | `defaults.shell` | Only with `run` (E407). |
-| `cwd` | string | `defaults.cwd` | `~` expands, and a relative path resolves against the project directory. |
+| `cwd` | string | `defaults.cwd` | `~` expands, and a relative path resolves against the project directory. A `~user` whose home directory isn't known fails the step without a retry, and the error names the path. |
 | `capture_stdout` | boolean | `false` | When `true`, the `stdout` output holds standard output, with one trailing newline removed. When standard output is longer than `[limits] stdout_capture_bytes` characters (default 64 KiB), the output holds only the complete lines among the last that many characters, so a single line longer than the limit captures nothing. |
 | `success_codes` | list of integers | `[0]` | Exit codes from 0 to 255 that count as success. |
 
@@ -531,7 +536,8 @@ Path rules:
 
 - `~` expands, a relative path resolves against the project directory, and symbolic links in
   the path resolve. For `delete`, Treadle doesn't follow a final symbolic link, so it deletes
-  the link itself.
+  the link itself. A `~user` whose home directory isn't known fails the step without a
+  retry, and the error names the path.
 - The resolved path must be inside a file root. Otherwise the step fails without a retry,
   and the error names the `[security] file_roots` setting.
 - The step never changes anything in the state directory. It never deletes or moves a file

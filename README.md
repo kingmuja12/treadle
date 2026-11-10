@@ -239,8 +239,8 @@ To report a vulnerability, follow [SECURITY.md](SECURITY.md).
 - [Architecture](docs/architecture.md): how Treadle runs, stores state, and recovers from
   crashes, and the HTTP API.
 - [Security model](docs/security-model.md): threats, mitigations, and safe patterns.
-- [Operations](docs/operations.md): systemd and launchd services, logs, backups, upgrades,
-  and TLS.
+- [Operations](docs/operations.md): systemd and launchd services, containers, logs,
+  backups, upgrades, and TLS.
 - [Coming from GitHub Actions](docs/coming-from-github-actions.md): what's the same, and
   every difference.
 

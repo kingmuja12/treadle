@@ -104,7 +104,7 @@ def test_ctrl_c_cancels_a_local_run_and_waits_for_its_cleanup(
     out, err = cli.communicate(timeout=30)
 
     assert cli.returncode == 130
-    assert err == "Cancelling run #1 (press Ctrl-C again to force)\n"
+    assert err == "Cancelling run #1 (press Ctrl+C again to force)\n"
     assert out.splitlines()[-1].startswith("Run #1 cancelled (user) in ")
     run = _run_json(project, treadle, 1)
     assert (run["status"], run["reason"]) == ("cancelled", "user")
@@ -158,7 +158,7 @@ def test_a_second_stop_signal_forces_the_run_and_kills_its_processes(
     assert cli.returncode == 128 + number
     assert time.monotonic() - started < 10  # well under the 30-second kill grace
     first = (
-        "Cancelling run #1 (press Ctrl-C again to force)"
+        "Cancelling run #1 (press Ctrl+C again to force)"
         if number == signal.SIGINT
         else f"Cancelling run #1 ({number.name}; signal again to force)"
     )
