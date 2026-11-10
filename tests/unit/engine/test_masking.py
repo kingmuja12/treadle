@@ -11,7 +11,7 @@ import pytest
 from treadle.engine.masking import MASK, MIN_SECRET_LENGTH, Masker
 
 
-def test_the_mask_and_the_minimum_length_match_the_design() -> None:
+def test_the_mask_and_the_minimum_length_are_the_documented_values() -> None:
     assert (MASK, MIN_SECRET_LENGTH) == ("***", 4)
 
 

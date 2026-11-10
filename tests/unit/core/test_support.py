@@ -208,6 +208,8 @@ async def test_workflow_source() -> None:
     assert [entry.workflow_id for entry in source.entries()] == ["a", "b", "broken"]
     assert source.get("b") == make_entry(first)
     assert await source.version(first.digest) == first
+    assert await source.version(first.digest, workflow_id="b") == first
+    assert await source.version(first.digest, workflow_id="a") is None
     source.remove("b")
     assert source.get("b") is None
     assert await source.version(first.digest) == first
@@ -449,6 +451,19 @@ class TestFixtures:
         assert response.json() == {"ok": True}
         assert seen[0].headers["user-agent"] == f"treadle/{__version__}"
         assert client.max_redirects == 5
+
+    async def test_mock_http_keeps_no_cookie(
+        self, mock_http: Callable[..., httpx.AsyncClient]
+    ) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, headers={"Set-Cookie": "session=s1; Path=/"})
+
+        async with mock_http(handler) as client:
+            await client.get("https://example.net/login")
+            response = await client.get("https://example.net/home")
+
+        assert "cookie" not in response.request.headers
+        assert len(client.cookies.jar) == 0
 
     def test_secret_snapshot(self, secret_snapshot: Callable[..., SecretSnapshot]) -> None:
         snapshot = secret_snapshot(NTFY_URL="https://ntfy.sh/x", environ={"HOME": "/h"})

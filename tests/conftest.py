@@ -1,7 +1,4 @@
-"""Fixtures that every test package shares.
-
-A fixture that calls a later package's API works once that package lands.
-"""
+"""Fixtures that every test package shares."""
 
 from __future__ import annotations
 
