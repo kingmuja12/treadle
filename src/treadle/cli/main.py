@@ -12,8 +12,8 @@ from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Final
 
-from treadle.cli.commands import COMMANDS, CliContext, cmd_version
-from treadle.cli.output import Output, _render_issue, use_color
+from treadle.cli.commands import COMMANDS, CliContext, _closed_output, cmd_version
+from treadle.cli.output import Output, _discard, _render_issue, use_color
 from treadle.cli.parser import build_parser
 from treadle.config import CONFIG_FILENAME, Overrides, find_config
 from treadle.errors import ConfigError, CronError, TreadleError, UsageError
@@ -30,9 +30,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     """Parse arguments, dispatch through `COMMANDS`, and return the exit code.
 
     A TreadleError prints its message (and rendered issues) and returns its `exit_code`.
-    KeyboardInterrupt returns 130, and a closed output pipe returns 1 without a message. Any
-    other exception prints `internal error: <type>: <message>`, with the traceback only
-    under `--debug`, and returns 1.
+    KeyboardInterrupt returns 130, and output that nobody reads any more, such as a closed
+    pipe or a terminal that hung up, returns 1 without a message. Any other exception prints
+    `internal error: <type>: <message>` and the notes it carries, such as the file it was
+    loading, with the traceback only under `--debug`, and returns 1.
     """
     parser = build_parser()
     try:
@@ -60,15 +61,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             return int(exc.exit_code)
         except KeyboardInterrupt:
             return ExitCode.INTERRUPTED
-        except BrokenPipeError:
-            # The reader of the output went away, as `treadle logs 42 | head` does.
-            _discard_stdout()
+        except OSError as exc:
+            if not _closed_output(exc):
+                return _internal_error(out, exc, debug=args.debug)
+            # The reader of the output went away, as `treadle logs 42 | head` does, or the
+            # terminal hung up.
+            _discard(sys.stdout)
+            _discard(sys.stderr)
             return ExitCode.FAILURE
         except Exception as exc:
-            out.line(f"internal error: {type(exc).__name__}: {exc}", err=True)
-            if args.debug:
-                out.line(traceback.format_exc().rstrip(), err=True)
-            return ExitCode.FAILURE
+            return _internal_error(out, exc, debug=args.debug)
+
+
+def _internal_error(out: Output, exc: Exception, *, debug: bool) -> int:
+    """Report an exception that Treadle didn't expect, and return 1.
+
+    The notes it carries, such as the file it was loading, follow the message, and the
+    traceback follows them under `--debug`.
+    """
+    out.line(f"internal error: {type(exc).__name__}: {exc}", err=True)
+    for note in getattr(exc, "__notes__", ()):
+        out.line(f"  {note}", err=True)
+    if debug:
+        out.line(traceback.format_exc().rstrip(), err=True)
+    return ExitCode.FAILURE
 
 
 def _context(args: argparse.Namespace, environ: Mapping[str, str], out: Output) -> CliContext:
@@ -156,17 +172,6 @@ class _CliFormatter(logging.Formatter):
 def _quiet_registry(record: logging.LogRecord) -> bool:
     """Drop the registry's warnings about workflow files, which other commands report."""
     return not record.name.startswith(_REGISTRY_LOGGER) or record.levelno >= logging.ERROR
-
-
-def _discard_stdout() -> None:
-    """Point stdout at /dev/null, so the interpreter's final flush doesn't fail again."""
-    try:
-        fileno = sys.stdout.fileno()
-    except (OSError, ValueError):  # a stream without a descriptor, such as a test capture
-        return
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(devnull, fileno)
-    os.close(devnull)
 
 
 def _exit_status(code: object) -> int:

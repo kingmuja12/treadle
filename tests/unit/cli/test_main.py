@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from tests.support.project import ProjectFactory
-from tests.unit.cli.helpers import Cli
+from tests.unit.cli.helpers import GREET, Cli, HungUp
 
 from treadle import __version__
 from treadle.cli import commands
@@ -17,6 +17,7 @@ from treadle.cli.commands import CliContext
 from treadle.cli.main import main
 from treadle.errors import WorkflowInvalidError
 from treadle.types import ExitCode
+from treadle.workflow.loader import LoadResult, WorkflowLoader
 
 
 def test_no_command_prints_the_usage_and_exits_2(cli: Cli) -> None:
@@ -190,12 +191,34 @@ class _ClosedPipe(io.StringIO):
         raise BrokenPipeError(32, "Broken pipe")
 
 
-def test_a_closed_pipe_ends_the_command_quietly(
-    cli: Cli, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+@pytest.mark.parametrize("stream", [_ClosedPipe, HungUp])
+def test_output_that_nobody_reads_ends_the_command_quietly(
+    cli: Cli,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    stream: type[io.StringIO],
 ) -> None:
-    monkeypatch.setattr("sys.stdout", _ClosedPipe())
+    monkeypatch.setattr("sys.stdout", stream())
 
     code = main(["-C", str(cli.project.root), "version"])
 
     assert code == ExitCode.FAILURE
     assert capsys.readouterr().err == ""
+
+
+def test_an_internal_error_while_loading_a_file_names_the_file(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("greet", GREET)
+
+    def broken(self: WorkflowLoader, path: Path) -> LoadResult:
+        raise ValueError("boom")
+
+    monkeypatch.setattr(WorkflowLoader, "load_file", broken)
+
+    plain = cli("validate")
+    debug = cli.anywhere("-C", str(project.root), "--debug", "validate")
+
+    assert plain.code == debug.code == ExitCode.FAILURE
+    assert plain.err == "internal error: ValueError: boom\n  while loading workflows/greet.yml\n"
+    assert debug.err.startswith(plain.err + "Traceback (most recent call last):")

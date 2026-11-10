@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
+import signal
+import threading
 import time
 from collections.abc import Callable, Iterator
 
@@ -15,17 +18,20 @@ from tests.unit.cli.helpers import (
     GREET,
     SLOW,
     Cli,
+    HungUp,
     InProcessDaemon,
     control_rows,
     read_store,
     store_runs,
 )
+from tests.unit.store.helpers import T0, Runs
 
 from treadle import __version__
 from treadle.cli import commands
+from treadle.cli.main import main
 from treadle.clock import SystemClock, iso_utc
 from treadle.lock import InstanceLock
-from treadle.models import ControlRequest, RunStatus
+from treadle.models import ControlRequest, RunReason, RunStatus
 from treadle.types import ExitCode, JSONObject, LockHolder
 
 
@@ -226,9 +232,9 @@ def test_a_maintenance_holder_makes_run_and_cancel_wait_then_give_up(
 
 
 @contextlib.contextmanager
-def _pressed_at_once(callback: Callable[[], None]) -> Iterator[None]:
-    """Stand in for the SIGINT handler: Ctrl-C is pressed as soon as it's installed."""
-    callback()
+def _pressed_at_once(callback: Callable[[int], None]) -> Iterator[None]:
+    """Stand in for the stop-signal handlers: Ctrl-C is pressed as soon as they're installed."""
+    callback(signal.SIGINT)
     yield
 
 
@@ -236,7 +242,7 @@ def test_ctrl_c_before_the_daemon_answers_withdraws_the_request(
     cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project.write_workflow("greet", GREET)
-    monkeypatch.setattr(commands, "_on_interrupt", _pressed_at_once)
+    monkeypatch.setattr(commands, "_on_stop_signals", _pressed_at_once)
 
     with InProcessDaemon(project.settings(), poll=False) as daemon:
         result = cli("run", "greet")
@@ -248,8 +254,293 @@ def test_ctrl_c_before_the_daemon_answers_withdraws_the_request(
     assert control_rows(project.settings())[0]["consumed"] is True
 
 
+def _pressed_after(
+    seconds: float, number: int = signal.SIGINT
+) -> Callable[[Callable[[int], None]], contextlib.AbstractContextManager[None]]:
+    """Stand in for the stop-signal handlers: the signal, Ctrl-C by default, comes `seconds`
+    after they're installed."""
+
+    @contextlib.contextmanager
+    def handlers(callback: Callable[[int], None]) -> Iterator[None]:
+        timer = asyncio.get_running_loop().call_later(seconds, callback, number)
+        try:
+            yield
+        finally:
+            timer.cancel()
+
+    return handlers
+
+
+def test_a_run_request_claimed_just_before_the_withdrawal_is_still_followed(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("greet", GREET)
+    monkeypatch.setattr(commands, "_RUN_REPLY_WAIT", 0.3)
+
+    # The holder claims the request at once, so the CLI can't withdraw it after 0.3 seconds,
+    # and answers after 0.8 seconds, while the CLI still waits for the claimed request.
+    with InProcessDaemon(project.settings(), delay=0.8):
+        result = cli("run", "greet")
+
+    assert result.code == ExitCode.OK
+    assert "Run #1 succeeded in " in result.out
+    (request,) = control_rows(project.settings())
+    assert request["result"] == {"run_id": 1, "outcome": "queued"}
+
+
+def test_a_claimed_run_request_without_an_answer_says_the_run_may_start(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("greet", GREET)
+    monkeypatch.setattr(commands, "_RUN_REPLY_WAIT", 0.3)
+    monkeypatch.setattr(commands, "_CLAIMED_WAIT", 0.3)
+
+    with InProcessDaemon(project.settings(), delay=1.5):
+        result = cli("run", "greet")
+        _eventually(lambda: read_store(project.settings(), lambda repo: repo.latest_run_id()) == 1)
+
+    assert result.code == ExitCode.BUSY
+    assert result.err == (
+        f"error: the daemon (pid {os.getpid()}) took the request but didn't answer, so it may "
+        "still start the run; `treadle runs --workflow greet` lists it\n"
+    )
+
+
+def test_ctrl_c_after_the_daemon_claimed_the_request_doesnt_claim_no_run_started(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("greet", GREET)
+    monkeypatch.setattr(commands, "_on_stop_signals", _pressed_after(0.3))
+    monkeypatch.setattr(commands, "_CLAIMED_WAIT", 0.3)
+
+    with InProcessDaemon(project.settings(), delay=1.5):
+        result = cli("run", "greet")
+
+    assert result.code == ExitCode.INTERRUPTED
+    assert result.err == (
+        f"error: the daemon (pid {os.getpid()}) took the request but didn't answer, so it may "
+        "still start the run; `treadle runs --workflow greet` lists it\n"
+    )
+
+
+def test_sighup_while_following_a_daemon_run_exits_129_without_a_terminal(
+    project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("slow", SLOW)
+    monkeypatch.setattr(commands, "_on_stop_signals", _pressed_after(0.5, signal.SIGHUP))
+    monkeypatch.setattr("sys.stderr", HungUp())
+
+    with InProcessDaemon(project.settings()):
+        code = main(["-C", str(project.root), "run", "slow"])
+
+    assert code == 128 + signal.SIGHUP
+
+
+def _stop_after(seconds: float, daemon: InProcessDaemon) -> threading.Timer:
+    """Stop `daemon` `seconds` from now, as if the system killed it, while the CLI follows."""
+    stopper = threading.Timer(seconds, daemon.__exit__, (None, None, None))
+    stopper.start()
+    return stopper
+
+
+@pytest.mark.parametrize(
+    ("seed", "fate"),
+    [
+        ("running", "run #1 will be marked interrupted when Treadle starts again"),
+        ("queued", "run #1 stays queued until `treadle serve` starts again"),
+    ],
+)
+def test_following_ends_when_the_daemon_stops_before_the_run_does(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch, seed: str, fate: str
+) -> None:
+    project.write_workflow("greet", GREET)
+    settings = project.settings()
+    store_runs(settings, "greet", lambda runs: getattr(runs, seed)())
+    monkeypatch.setattr(commands, "_HOLDER_CHECK", 0.05)
+    # The holder says it started run 1, which then never finishes.
+    daemon = InProcessDaemon(settings, answers=_answer({"run_id": 1, "outcome": "queued"}))
+    daemon.__enter__()
+    stopper = _stop_after(0.5, daemon)
+    try:
+        result = cli("run", "greet")
+    finally:
+        stopper.join()
+
+    assert result.code == ExitCode.BUSY
+    assert result.out == "Run #1  greet  (manual)\n"
+    assert result.err == f"error: the daemon (pid {os.getpid()}) stopped; {fate}\n"
+
+
+def test_ctrl_c_after_the_daemon_stopped_doesnt_say_the_run_continues(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("greet", GREET)
+    settings = project.settings()
+    store_runs(settings, "greet", lambda runs: runs.running())
+    monkeypatch.setattr(commands, "_HOLDER_CHECK", 30.0)  # the follower doesn't notice first
+    monkeypatch.setattr(commands, "_on_stop_signals", _pressed_after(1.0))
+    daemon = InProcessDaemon(settings, answers=_answer({"run_id": 1, "outcome": "queued"}))
+    daemon.__enter__()
+    stopper = _stop_after(0.3, daemon)
+    try:
+        result = cli("run", "greet")
+    finally:
+        stopper.join()
+
+    assert result.code == ExitCode.INTERRUPTED
+    assert result.err == (
+        f"error: the daemon (pid {os.getpid()}) stopped; run #1 will be marked interrupted "
+        "when Treadle starts again\n"
+    )
+
+
+def test_following_logs_ends_when_no_process_runs_the_run(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store_runs(project.settings(), "wf", lambda runs: runs.running())
+    monkeypatch.setattr(commands, "_HOLDER_CHECK", 0.05)
+    monkeypatch.setattr(commands, "_LOGS_POLL", 0.02)
+
+    result = cli("logs", "1", "-f")
+
+    assert result.code == ExitCode.BUSY
+    assert result.err == (
+        "error: no Treadle process is running run #1 any more; it will be marked interrupted "
+        "when Treadle starts again\n"
+    )
+
+
+def test_following_logs_waits_for_a_queued_run_without_a_lock_holder(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A queued run starts once `treadle serve` does, so the follower keeps waiting; here, the
+    # wait ends when the run is cancelled.
+    settings = project.settings()
+    store_runs(settings, "wf", lambda runs: runs.queued())
+    monkeypatch.setattr(commands, "_HOLDER_CHECK", 0.05)
+    monkeypatch.setattr(commands, "_LOGS_POLL", 0.02)
+
+    def cancel(runs: Runs) -> None:
+        runs.repo.cancel_queued([1], reason=RunReason.USER, at_ms=T0)
+
+    canceller = threading.Timer(0.5, store_runs, (settings, "wf", cancel))
+    canceller.start()
+    try:
+        result = cli("logs", "1", "-f")
+    finally:
+        canceller.join()
+
+    assert (result.code, result.err) == (ExitCode.OK, "")
+    assert _status(project, 1) is RunStatus.CANCELLED
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_a_claimed_cancel_without_an_answer_says_it_may_still_happen(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch, interrupted: bool
+) -> None:
+    settings = project.settings()
+    store_runs(settings, "wf", lambda runs: runs.queued())
+    monkeypatch.setattr(commands, "_CLAIMED_WAIT", 0.3)
+    if interrupted:
+        monkeypatch.setattr(commands, "_on_stop_signals", _pressed_after(0.3))
+
+    with InProcessDaemon(settings, delay=1.5):
+        result = cli("cancel", "1", "--wait", "5" if interrupted else "0.3")
+
+    assert result.code == (ExitCode.INTERRUPTED if interrupted else ExitCode.BUSY)
+    assert result.err == (
+        f"error: the daemon (pid {os.getpid()}) took the cancel request but didn't answer, so "
+        "it may still cancel run #1\n"
+    )
+
+
+def test_ctrl_c_while_the_daemon_answers_a_claimed_request_leaves_the_run_to_it(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("slow", SLOW)
+    monkeypatch.setattr(commands, "_on_stop_signals", _pressed_after(0.3))
+
+    # Ctrl-C comes after the claim and before the answer, which then still arrives.
+    with InProcessDaemon(project.settings(), delay=0.8):
+        result = cli("run", "slow")
+        running = _status(project, 1)
+
+    assert result.code == ExitCode.INTERRUPTED
+    assert result.err == "Run #1 continues in the daemon. Follow it with `treadle logs 1 -f`.\n"
+    assert running is RunStatus.RUNNING
+
+
+def test_ctrl_c_after_the_daemon_finished_the_run_says_so(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("greet", GREET)
+    store_runs(project.settings(), "greet", lambda runs: runs.finished(RunStatus.SUCCEEDED))
+    monkeypatch.setattr(commands, "_on_stop_signals", _pressed_after(0.3))
+
+    # The holder answers with run 1, which has finished, after Ctrl-C.
+    with InProcessDaemon(
+        project.settings(), answers=_delayed_answer({"run_id": 1, "outcome": "queued"}, 0.6)
+    ):
+        result = cli("run", "greet")
+
+    assert result.code == ExitCode.INTERRUPTED
+    assert result.err == "Run #1 already finished (succeeded).\n"
+
+
+def test_ctrl_c_while_cancel_waits_withdraws_the_request(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = project.settings()
+    store_runs(settings, "wf", lambda runs: runs.queued())
+    monkeypatch.setattr(commands, "_on_stop_signals", _pressed_at_once)
+
+    with InProcessDaemon(settings, poll=False) as daemon:
+        result = cli("cancel", "1", "--wait", "5")
+        handled = daemon.process_requests()
+
+    assert result.code == ExitCode.INTERRUPTED
+    assert result.err == (
+        "Stopped before the lock holder answered; the cancel request was withdrawn.\n"
+    )
+    assert handled == 0
+    (request,) = control_rows(settings)
+    assert (request["kind"], request["consumed"]) == ("cancel", True)
+    assert request["result"] == {
+        "error": {
+            "code": "expired",
+            "message": "the CLI stopped waiting for an answer",
+            "details": None,
+        }
+    }
+    assert _status(project, 1) is RunStatus.QUEUED
+
+
+def test_ctrl_c_after_the_holder_claimed_a_cancel_reports_its_answer(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = project.settings()
+    store_runs(settings, "wf", lambda runs: runs.queued())
+    monkeypatch.setattr(commands, "_on_stop_signals", _pressed_after(0.3))
+
+    with InProcessDaemon(settings, delay=0.8):
+        result = cli("cancel", "1", "--wait", "5")
+
+    assert (result.code, result.out) == (ExitCode.INTERRUPTED, "Cancelled queued run #1.\n")
+    assert _status(project, 1) is RunStatus.CANCELLED
+
+
 def _answer(result: JSONObject) -> Callable[[ControlRequest], JSONObject]:
     return lambda request: result
+
+
+def _delayed_answer(result: JSONObject, seconds: float) -> Callable[[ControlRequest], JSONObject]:
+    """Answer each request with `result`, `seconds` after the holder claimed it."""
+
+    def answer(request: ControlRequest) -> JSONObject:
+        time.sleep(seconds)  # blocks the holder's own loop, as a busy holder would
+        return result
+
+    return answer
 
 
 def _error(code: str, message: str = "") -> JSONObject:

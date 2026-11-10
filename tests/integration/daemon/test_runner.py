@@ -1,4 +1,8 @@
-"""`LocalRunner`: a foreground run with real processes, threads, and a second process."""
+"""`LocalRunner`: a foreground run with real processes, threads, and a second process.
+
+Also what a local run leaves behind: no step process after a forced cancel, no cookies in
+the shared HTTP client, and none of the daemon's HTTP stack imported.
+"""
 
 from __future__ import annotations
 
@@ -6,29 +10,38 @@ import asyncio
 import sqlite3
 import subprocess
 import sys
+import textwrap
 from collections.abc import Callable, Iterator
+from typing import Any
 
+import httpx
 import pytest
-from tests.integration.daemon.helpers import child_environ, kill_group, recorded_process_groups
+from tests.integration.daemon.conftest import STUBBORN
+from tests.integration.daemon.helpers import (
+    child_environ,
+    kill_unfinished_steps,
+    surviving_process_groups,
+)
 from tests.integration.triggers.helpers import eventually
 from tests.support.project import ProjectFactory
 from tests.unit.store.helpers import DAY, Runs, project_workflow
 
+from treadle import runner as runner_module
 from treadle.clock import SystemClock, to_ms
 from treadle.config import Settings
 from treadle.errors import LockHeldError, NotFoundError
 from treadle.lock import InstanceLock
 from treadle.models import RunReason, RunStatus
 from treadle.runner import LocalRunner
+from treadle.steps.procs import ProcessRegistry
 from treadle.store.async_store import AsyncStore
 
 
 @pytest.fixture(autouse=True)
 def _kill_leftover_steps(daemon_project: ProjectFactory) -> Iterator[None]:
-    """Kill every step process group that the runner recorded, even after a failure."""
+    """Kill the step process groups of attempts that never finished, even after a failure."""
     yield
-    for pgid in recorded_process_groups(daemon_project.settings().db_path):
-        kill_group(pgid)
+    kill_unfinished_steps(daemon_project.settings().db_path)
 
 
 async def _seed(settings: Settings, workflow_id: str, make: Callable[[Runs], object]) -> None:
@@ -97,6 +110,114 @@ async def test_a_cancel_from_another_process_reaches_the_run(
     assert status is RunStatus.CANCELLED
     assert detail is not None
     assert detail.run.reason is RunReason.USER
+    assert surviving_process_groups(settings.db_path) == []
+
+
+async def test_a_forced_cancel_leaves_no_process_behind_once_the_runner_closes(
+    daemon_project: ProjectFactory,
+) -> None:
+    daemon_project.write_workflow("stubborn", STUBBORN)
+    daemon_project.write_config('timezone = "UTC"\n[runs]\nkill_grace = "30s"\n')
+    settings = daemon_project.settings()
+    loop = asyncio.get_running_loop()
+
+    async with LocalRunner(settings) as runner:
+        submission = await runner.start("stubborn", {})
+        assert submission.run is not None
+        run_id = submission.run.id
+        await eventually((daemon_project.root / "stubborn.pid").exists, within=20)
+        await runner.cancel(run_id)
+        await asyncio.sleep(0.3)
+        await runner.cancel(run_id, force=True)
+        status = await asyncio.wait_for(runner.wait(run_id), 10)
+        started = loop.time()
+
+    # The step ignores SIGTERM and has 30 seconds of kill grace, yet closing kills it.
+    assert status is RunStatus.CANCELLED
+    assert loop.time() - started < 5
+    assert surviving_process_groups(settings.db_path) == []
+
+
+async def test_a_tracked_group_that_no_step_forgets_delays_closing_only_briefly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(runner_module, "_LEFTOVER_WAIT", 0.3)
+    gone = await asyncio.create_subprocess_exec("true")
+    await gone.wait()
+    processes = ProcessRegistry()
+    processes.add(gone.pid)  # tracked, but the group has no members
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    await runner_module._kill_leftovers(processes)
+
+    assert 0.25 < loop.time() - started < 2
+
+
+async def test_the_shared_http_client_keeps_no_cookies(
+    daemon_project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def answer(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nSet-Cookie: session=abc; Path=/\r\n"
+            b"Content-Length: 2\r\nConnection: close\r\n\r\nok"
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(answer, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    daemon_project.write_workflow(
+        "fetch",
+        f"steps:\n  - id: get\n    uses: http\n    with:\n      url: http://127.0.0.1:{port}/\n",
+    )
+    clients: list[httpx.AsyncClient] = []
+    original = httpx.AsyncClient.__init__
+
+    def recording(self: httpx.AsyncClient, *args: Any, **kwargs: Any) -> None:
+        original(self, *args, **kwargs)
+        clients.append(self)
+
+    monkeypatch.setattr(httpx.AsyncClient, "__init__", recording)
+
+    try:
+        async with LocalRunner(daemon_project.settings()) as runner:
+            submission = await runner.start("fetch", {})
+            assert submission.run is not None
+            status = await runner.wait(submission.run.id)
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert status is RunStatus.SUCCEEDED
+    assert len(clients) == 1
+    assert list(clients[0].cookies.jar) == []
+
+
+def test_a_local_run_doesnt_import_the_http_stack(daemon_project: ProjectFactory) -> None:
+    script = textwrap.dedent(
+        """
+        import sys
+        from treadle.cli.main import main
+
+        code = main(["-C", sys.argv[1], "run", "hello"])
+        stack = ("uvicorn", "starlette", "jinja2")
+        imported = sorted(name for name in stack if name in sys.modules)
+        print(code, imported)
+        """
+    )
+
+    done = subprocess.run(
+        [sys.executable, "-c", script, str(daemon_project.root)],
+        capture_output=True,
+        text=True,
+        env=child_environ(),
+        timeout=60,
+        check=False,
+    )
+
+    assert done.stdout.splitlines()[-1] == "0 []", done.stderr
 
 
 async def test_opening_recovers_crashed_runs_and_leaves_queued_ones(

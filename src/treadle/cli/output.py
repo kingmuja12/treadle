@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections.abc import Mapping, Sequence
 from typing import Final, TextIO
@@ -123,6 +124,23 @@ def use_color(stream: TextIO, environ: Mapping[str, str], *, disabled: bool) -> 
 def _render_issue(out: Output, issue: Issue, file: str, source: str | None) -> str:
     """Render an issue in the diagnostic format, in color when `out` uses color."""
     return issue.render(file, source, color=out._color)
+
+
+def _discard(stream: TextIO) -> None:
+    """Point a stream's file descriptor at /dev/null, because nothing reads it any more.
+
+    Buffered output and the interpreter's final flush then go nowhere instead of failing
+    again. A stream without a descriptor, such as a test's capture, stays as it is.
+    """
+    try:
+        fileno = stream.fileno()
+    except (OSError, ValueError):
+        return
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, fileno)
+    finally:
+        os.close(devnull)
 
 
 def _can_encode(stream: TextIO, text: str) -> bool:

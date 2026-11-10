@@ -179,3 +179,66 @@ def test_an_unreadable_file_is_a_config_error(cli: Cli, project: ProjectFactory)
 
     assert result.code == ExitCode.CONFIG
     assert result.err.startswith("error: can't read workflows/secret.yml: ")
+
+
+def _link(project: ProjectFactory, tmp_path: Path, name: str = "linked.yml") -> Path:
+    """Put a symbolic link in the workflows directory, to a valid workflow elsewhere."""
+    target = tmp_path / "shared.yml"
+    target.write_text(GREET)
+    link = project.workflows_dir / name
+    link.symlink_to(target)
+    return link
+
+
+_W060 = [
+    "workflows/linked.yml: warning[W060]: the file is a symbolic link, so Treadle skips it",
+    "   = help: copy the file into the workflows directory instead",
+    "",
+]
+
+
+def test_a_symbolic_link_gets_w060_and_counts_only_as_a_warning(
+    cli: Cli, project: ProjectFactory, tmp_path: Path
+) -> None:
+    project.write_workflow("greet", GREET)
+    _link(project, tmp_path)
+
+    lenient, strict, directory = (
+        cli("validate"),
+        cli("validate", "--strict"),
+        cli("validate", "workflows"),
+    )
+
+    assert lenient.code == directory.code == ExitCode.OK
+    assert lenient.out.splitlines() == [*_W060, "1 valid, 0 invalid (1 warning)"]
+    assert directory.out == lenient.out
+    assert (strict.code, strict.out) == (ExitCode.FAILURE, lenient.out)
+
+
+def test_json_lists_a_symbolic_link_without_a_workflow(
+    cli: Cli, project: ProjectFactory, tmp_path: Path
+) -> None:
+    project.write_workflow("greet", GREET)
+    _link(project, tmp_path)
+
+    document = cli("validate", "--json").json()
+
+    assert (document["valid"], document["errors"], document["warnings"]) == (True, 0, 1)
+    greet, linked = document["files"]
+    assert (greet["path"], greet["valid"]) == ("workflows/greet.yml", True)
+    assert {key: linked[key] for key in ("path", "workflow", "valid")} == {
+        "path": "workflows/linked.yml",
+        "workflow": None,
+        "valid": False,
+    }
+    assert [issue["code"] for issue in linked["issues"]] == ["W060"]
+
+
+def test_a_symbolic_link_given_by_its_path_is_checked_as_it_is(
+    cli: Cli, project: ProjectFactory, tmp_path: Path
+) -> None:
+    _link(project, tmp_path)
+
+    result = cli("validate", "workflows/linked.yml")
+
+    assert (result.code, result.out) == (ExitCode.OK, "1 valid, 0 invalid\n")

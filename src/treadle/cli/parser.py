@@ -8,7 +8,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Final, TypeAlias
 
-from treadle.cli.commands import _RUNS_LIMIT
+from treadle.cli.commands import _MAX_RUN_ID, _RUNS_LIMIT
 from treadle.models import RunStatus, TriggerKind
 
 _RUN_HELP: Final = "a run: 42, #42, last, or last:<workflow>"
@@ -123,7 +123,9 @@ def _runs(commands: _Commands) -> None:
         metavar="N",
         help=f"at most N runs (1-200, default: {_RUNS_LIMIT})",
     )
-    parser.add_argument("--before", type=_integer(1), metavar="ID", help="only runs older than ID")
+    parser.add_argument(
+        "--before", type=_integer(1, _MAX_RUN_ID), metavar="ID", help="only runs older than ID"
+    )
     _json(parser)
 
 
@@ -138,7 +140,7 @@ def _logs(commands: _Commands) -> None:
     parser.add_argument("run", metavar="RUN", help=_RUN_HELP)
     parser.add_argument("--step", metavar="ID", help="only this step's lines")
     parser.add_argument(
-        "--attempt", type=_integer(1), metavar="N", help="only this attempt's lines"
+        "--attempt", type=_integer(1, _MAX_RUN_ID), metavar="N", help="only this attempt's lines"
     )
     parser.add_argument(
         "-f", "--follow", action="store_true", help="keep printing until the run ends"

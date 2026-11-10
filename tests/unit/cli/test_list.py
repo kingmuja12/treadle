@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from tests.support.project import ProjectFactory
 from tests.unit.cli.helpers import BROKEN, GREET, Cli, store_runs
@@ -89,3 +90,19 @@ def test_an_empty_project(cli: Cli) -> None:
 
     assert result.code == ExitCode.OK
     assert result.out == "No workflows in workflows.\n"
+
+
+def test_a_symbolic_link_is_skipped_with_a_warning(
+    cli: Cli, project: ProjectFactory, tmp_path: Path
+) -> None:
+    project.write_workflow("greet", GREET)
+    target = tmp_path / "shared.yml"
+    target.write_text(GREET)
+    (project.workflows_dir / "linked.yml").symlink_to(target)
+
+    result, as_json = cli("list"), cli("list", "--json")
+
+    warning = "warning: workflows/linked.yml: the file is a symbolic link, so Treadle skips it\n"
+    assert (result.code, result.err, as_json.err) == (ExitCode.OK, warning, warning)
+    assert [line.split()[0] for line in result.out.splitlines()[1:]] == ["greet"]
+    assert [workflow["id"] for workflow in as_json.json()["workflows"]] == ["greet"]

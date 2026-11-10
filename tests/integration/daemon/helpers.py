@@ -1,8 +1,9 @@
-"""A real `treadle serve` process for daemon tests, and polling helpers.
+"""A real `treadle serve` process for daemon tests, and polling and process-group helpers.
 
 Each daemon runs in its own process group, binds port 0, and is found through `holder.json`.
-Cleanup kills the daemon's group and every step process group it recorded, so a failed test
-leaves nothing running.
+Cleanup kills the daemon's group and the step process groups whose attempts never finished,
+so a failed test leaves nothing running. Groups of finished attempts are left alone, because
+their IDs may belong to other processes by now; lifecycle tests assert that none survived.
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ import hmac
 import json
 import os
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -59,18 +61,65 @@ def kill_group(pgid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
 
 
-def recorded_process_groups(db_path: Path) -> list[int]:
-    """Return the step process groups that the database recorded."""
+def recorded_process_groups(db_path: Path, *, unfinished: bool = False) -> list[int]:
+    """Return the step process groups that the database recorded.
+
+    With `unfinished`, only the groups of attempts that are still `running`, or that crash
+    recovery marked `interrupted`: Treadle never stopped those, so they may still run.
+    """
     if not db_path.exists():
         return []
+    query = "SELECT DISTINCT pgid FROM step_attempts WHERE pgid IS NOT NULL"
+    if unfinished:
+        query += " AND status IN ('running', 'interrupted')"
     conn = sqlite3.connect(db_path)
     try:
-        rows = conn.execute("SELECT DISTINCT pgid FROM step_attempts WHERE pgid IS NOT NULL")
-        return [row[0] for row in rows]
+        return [row[0] for row in conn.execute(query)]
     except sqlite3.Error:
         return []
     finally:
         conn.close()
+
+
+def group_exists(pgid: int) -> bool:
+    """True while a process group has a member that isn't a zombie.
+
+    Like Treadle, this counts PermissionError as gone: macOS answers it for a group that
+    only zombies are left in.
+    """
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    return True
+
+
+def surviving_process_groups(db_path: Path, *, within: float = 3.0) -> list[int]:
+    """Return the recorded step process groups that still exist after up to `within` seconds.
+
+    Lifecycle tests assert that this is empty before any teardown kills what's left.
+    """
+    deadline = time.monotonic() + within
+    while True:
+        alive = [pgid for pgid in recorded_process_groups(db_path) if group_exists(pgid)]
+        if not alive or time.monotonic() > deadline:
+            return alive
+        time.sleep(0.05)
+
+
+def kill_unfinished_steps(db_path: Path) -> None:
+    """SIGKILL the step process groups of attempts that never finished, after a failed test."""
+    for pgid in recorded_process_groups(db_path, unfinished=True):
+        kill_group(pgid)
+
+
+def has_ipv6_loopback() -> bool:
+    """True when this machine can listen on ::1."""
+    try:
+        with socket.create_server(("::1", 0), family=socket.AF_INET6):
+            return True
+    except OSError:
+        return False
 
 
 def sign(secret: str, body: bytes) -> str:
@@ -166,13 +215,12 @@ class Daemon:
         return eventually(reached)
 
     def cleanup(self) -> None:
-        """Kill the daemon's process group and every step group it started."""
+        """Kill the daemon's process group and the step groups of unfinished attempts."""
         if self.process is not None and self.process.poll() is None:
             kill_group(self.process.pid)
             with contextlib.suppress(subprocess.TimeoutExpired):
                 self.process.wait(timeout=10)
-        for pgid in recorded_process_groups(self.settings.db_path):
-            kill_group(pgid)
+        kill_unfinished_steps(self.settings.db_path)
 
     def _holder(self) -> dict[str, Any] | None:
         assert self.process is not None

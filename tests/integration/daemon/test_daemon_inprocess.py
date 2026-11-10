@@ -1,26 +1,43 @@
-"""The `Daemon` class on the test's own event loop: serving, draining, forcing, and refusals."""
+"""The `Daemon` class on the test's own event loop: serving, draining, forcing, and refusals.
+
+Also how it treats a token that `.env` changes, startup steps that fail, `localhost`, and the
+processes that a forced cancel leaves behind.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import errno
+import gc
 import json
 import logging
+import os
+import signal
 import socket
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from contextlib import asynccontextmanager
+from pathlib import Path
+from types import FrameType
 
 import httpx
 import pytest
 from tests.integration.daemon.conftest import HOOK_SECRET, STUBBORN
-from tests.integration.daemon.helpers import kill_group, recorded_process_groups, sign
+from tests.integration.daemon.helpers import (
+    has_ipv6_loopback,
+    kill_unfinished_steps,
+    sign,
+    surviving_process_groups,
+)
 from tests.support.project import ProjectFactory
 from tests.unit.store.helpers import Runs
 
 from treadle import __version__
+from treadle import daemon as daemon_module
 from treadle.clock import SystemClock, iso_utc
 from treadle.config import Settings
 from treadle.daemon import Daemon
-from treadle.errors import BusyError, ConfigError, LockHeldError
+from treadle.engine.manager import RunManager
+from treadle.errors import BusyError, ConfigError, LockHeldError, StoreError
 from treadle.lock import InstanceLock
 from treadle.models import RunReason, RunStatus, Workflow
 from treadle.steps.builtin import builtin_registry
@@ -35,10 +52,9 @@ UNREACHABLE = "192.0.2.10"  # TEST-NET-1: never an address of this machine
 
 @pytest.fixture(autouse=True)
 def _kill_leftover_steps(daemon_project: ProjectFactory) -> Iterator[None]:
-    """Kill every step process group that the test's daemon recorded, even after a failure."""
+    """Kill the step process groups of attempts that never finished, even after a failure."""
     yield
-    for pgid in recorded_process_groups(daemon_project.settings().db_path):
-        kill_group(pgid)
+    kill_unfinished_steps(daemon_project.settings().db_path)
 
 
 async def _eventually(check: Callable[[], Awaitable[bool]], *, within: float = 20.0) -> None:
@@ -163,6 +179,63 @@ async def test_a_second_shutdown_request_forces_the_runs(daemon_project: Project
         await store.close()
     assert detail is not None
     assert (detail.run.status, detail.run.reason) == (RunStatus.CANCELLED, RunReason.SHUTDOWN)
+    assert surviving_process_groups(settings.db_path) == []
+
+
+async def test_a_forced_cancel_leaves_no_process_behind_when_the_daemon_stops(
+    daemon_project: ProjectFactory,
+) -> None:
+    daemon_project.write_workflow("stubborn", STUBBORN)
+    settings = _configure(daemon_project, extra='[runs]\nkill_grace = "30s"')
+    daemon = Daemon(settings, environ={})
+    pid_file = daemon_project.root / "stubborn.pid"
+
+    async with serving(daemon, settings) as client:
+        run_id = (await client.post("/api/v1/workflows/stubborn/runs", json={})).json()["run"]["id"]
+
+        async def holding() -> bool:
+            return pid_file.exists()
+
+        await _eventually(holding)
+        cancelled = await client.post(f"/api/v1/runs/{run_id}/cancel", json={})
+        forced = await client.post(f"/api/v1/runs/{run_id}/cancel", json={"force": True})
+
+        async def finished() -> bool:
+            return await _status(client, run_id) == "cancelled"
+
+        await _eventually(finished, within=10)
+        # The daemon stops well within the step's 30-second kill grace.
+
+    assert (cancelled.status_code, forced.status_code) == (202, 202)
+    assert surviving_process_groups(settings.db_path) == []
+
+
+async def test_sighup_while_the_daemon_starts_up_is_handled(
+    daemon_project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = _configure(daemon_project)
+    received: list[int] = []
+
+    def record(number: int, frame: FrameType | None) -> None:
+        received.append(number)
+
+    real_load = daemon_module.load_secret_key
+
+    def hang_up_then_load(path: Path) -> bytes:
+        os.kill(os.getpid(), signal.SIGHUP)  # a reload request in the middle of startup
+        return real_load(path)
+
+    monkeypatch.setattr(daemon_module, "load_secret_key", hang_up_then_load)
+    # The test's own handler stands in for the default action, which would end the test run.
+    previous = signal.signal(signal.SIGHUP, record)
+    try:
+        async with serving(Daemon(settings, environ={}), settings) as client:
+            health = await client.get("/api/v1/health")
+    finally:
+        signal.signal(signal.SIGHUP, previous)
+
+    assert received == []
+    assert health.status_code == 200
 
 
 async def test_a_token_protects_the_api(daemon_project: ProjectFactory) -> None:
@@ -327,3 +400,203 @@ def _loaded(settings: Settings, workflow_id: str) -> Workflow:
     result = loader.load_file(settings.workflows_dir / f"{workflow_id}.yml")
     assert result.workflow is not None
     return result.workflow
+
+
+OLD_TOKEN = "o" * 40
+NEW_TOKEN = "n" * 40
+
+
+@pytest.fixture
+def quick_token_checks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Check `.env` for a changed token every few milliseconds instead of every second."""
+    monkeypatch.setattr(daemon_module, "_TOKEN_CHECK", 0.02)
+
+
+async def _logged(caplog: pytest.LogCaptureFixture, text: str) -> None:
+    async def appears() -> bool:
+        return text in caplog.text
+
+    await _eventually(appears, within=10)
+
+
+@pytest.mark.usefixtures("quick_token_checks")
+async def test_a_token_added_to_env_warns_that_it_needs_a_restart(
+    daemon_project: ProjectFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _configure(daemon_project)
+    caplog.set_level(logging.INFO, logger="treadle")
+    daemon = Daemon(settings, environ={})
+
+    async with serving(daemon, settings) as client:
+        daemon_project.write_env({"DEPLOY_SECRET": HOOK_SECRET, "TREADLE_TOKEN": NEW_TOKEN})
+        daemon.request_reload()
+        await _logged(caplog, "reloaded the secrets")
+        await _logged(caplog, "TREADLE_TOKEN changed in .env")
+        anonymous = await client.get("/api/v1/status")
+
+    assert (
+        "TREADLE_TOKEN changed in .env; restart Treadle to apply it. Until then, the API "
+        "doesn't require a token."
+    ) in caplog.text
+    assert anonymous.status_code == 200  # as the warning says
+    assert NEW_TOKEN not in caplog.text
+
+
+_ECHO_OLD_TOKEN = f"""\
+steps:
+  - id: leak
+    run: echo "the old token is {OLD_TOKEN}"
+"""
+
+
+@pytest.mark.usefixtures("quick_token_checks")
+async def test_a_rotated_token_works_and_stays_masked_until_a_restart(
+    daemon_project: ProjectFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    daemon_project.write_env({"DEPLOY_SECRET": HOOK_SECRET, "TREADLE_TOKEN": OLD_TOKEN})
+    daemon_project.write_workflow("leak", _ECHO_OLD_TOKEN)
+    settings = _configure(daemon_project)
+    caplog.set_level(logging.INFO, logger="treadle")
+    daemon = Daemon(settings, environ={})
+    old = {"Authorization": f"Bearer {OLD_TOKEN}"}
+    new = {"Authorization": f"Bearer {NEW_TOKEN}"}
+
+    async with serving(daemon, settings) as client:
+        daemon_project.write_env({"DEPLOY_SECRET": HOOK_SECRET, "TREADLE_TOKEN": NEW_TOKEN})
+        daemon.request_reload()
+        await _logged(caplog, "TREADLE_TOKEN changed in .env")
+        with_old = await client.get("/api/v1/status", headers=old)
+        with_new = await client.get("/api/v1/status", headers=new)
+        run_id = (await client.post("/api/v1/workflows/leak/runs", json={}, headers=old)).json()[
+            "run"
+        ]["id"]
+
+        async def finished() -> bool:
+            run = await client.get(f"/api/v1/runs/{run_id}", headers=old)
+            return run.json()["status"] == "succeeded"
+
+        await _eventually(finished)
+        lines = (await client.get(f"/api/v1/runs/{run_id}/logs", headers=old)).json()["lines"]
+        daemon_project.write_env({"DEPLOY_SECRET": HOOK_SECRET, "TREADLE_TOKEN": OLD_TOKEN})
+        daemon.request_reload()
+        await _logged(caplog, "TREADLE_TOKEN in .env is the token in use again")
+
+    assert (
+        "TREADLE_TOKEN changed in .env; restart Treadle to apply it. Until then, the API "
+        "accepts only the previous token."
+    ) in caplog.text
+    assert (with_old.status_code, with_new.status_code) == (200, 401)
+    assert [line["text"] for line in lines] == ["the old token is ***"]
+    assert OLD_TOKEN not in caplog.text
+    assert NEW_TOKEN not in caplog.text
+
+
+@pytest.mark.usefixtures("quick_token_checks")
+async def test_other_changes_to_env_say_nothing_about_the_token(
+    daemon_project: ProjectFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    daemon_project.write_env({"DEPLOY_SECRET": HOOK_SECRET, "TREADLE_TOKEN": OLD_TOKEN})
+    settings = _configure(daemon_project)
+    caplog.set_level(logging.INFO, logger="treadle")
+    daemon = Daemon(settings, environ={})
+
+    async with serving(daemon, settings):
+        daemon_project.write_env(
+            {"DEPLOY_SECRET": "another-hook-secret-0123456789", "TREADLE_TOKEN": OLD_TOKEN}
+        )
+        daemon.request_reload()
+        await _logged(caplog, "reloaded the secrets")
+        await asyncio.sleep(0.2)  # ten token checks
+
+    assert "TREADLE_TOKEN" not in caplog.text
+
+
+@pytest.mark.usefixtures("quick_token_checks")
+async def test_a_token_too_short_to_start_with_warns_so(
+    daemon_project: ProjectFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    daemon_project.write_env({"DEPLOY_SECRET": HOOK_SECRET, "TREADLE_TOKEN": OLD_TOKEN})
+    settings = _configure(daemon_project)
+    caplog.set_level(logging.WARNING, logger="treadle")
+    daemon = Daemon(settings, environ={})
+
+    async with serving(daemon, settings) as client:
+        daemon_project.write_env({"DEPLOY_SECRET": HOOK_SECRET, "TREADLE_TOKEN": "short"})
+        daemon.request_reload()
+        await _logged(caplog, "TREADLE_TOKEN changed in .env")
+        anonymous = await client.get("/api/v1/status")
+
+    assert (
+        "TREADLE_TOKEN changed in .env, but Treadle can't start with the new value: "
+        "TREADLE_TOKEN must be at least 32 characters long. Until a restart, the API accepts "
+        "only the previous token."
+    ) in caplog.text
+    assert anonymous.status_code == 401  # authentication stays on
+
+
+async def _refuse_readmission(self: RunManager) -> int:
+    raise StoreError("disk I/O error")
+
+
+def _refuse_the_port_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    original = InstanceLock.update
+
+    def update(self: InstanceLock, holder: LockHolder) -> None:
+        if holder.port is not None:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        original(self, holder)
+
+    monkeypatch.setattr(InstanceLock, "update", update)
+
+
+@pytest.mark.parametrize(
+    ("break_it", "error"),
+    [
+        (
+            lambda monkeypatch: monkeypatch.setattr(RunManager, "readmit", _refuse_readmission),
+            "StoreError: disk I/O error",
+        ),
+        (_refuse_the_port_record, "No space left on device"),
+    ],
+)
+async def test_a_failed_startup_step_in_the_task_group_drains_the_daemon(
+    daemon_project: ProjectFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    recwarn: pytest.WarningsRecorder,
+    break_it: Callable[[pytest.MonkeyPatch], None],
+    error: str,
+) -> None:
+    break_it(monkeypatch)
+    settings = _configure(daemon_project)
+    caplog.set_level(logging.INFO, logger="treadle.daemon")
+
+    code = await asyncio.wait_for(Daemon(settings, environ={}).run(), 30)
+    gc.collect()  # an unawaited coroutine warns when it's collected
+
+    assert code == ExitCode.FAILURE
+    assert "starting the services failed" in caplog.text
+    assert error in caplog.text
+    assert "stopped" in caplog.messages
+    assert InstanceLock.probe(settings.state_dir) is None
+    assert [
+        str(warning.message) for warning in recwarn if "never awaited" in str(warning.message)
+    ] == []
+
+
+@pytest.mark.skipif(not has_ipv6_loopback(), reason="no IPv6 loopback here")
+async def test_localhost_serves_on_both_loopback_addresses(
+    daemon_project: ProjectFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _configure(daemon_project, host="localhost")
+    caplog.set_level(logging.INFO, logger="treadle.daemon")
+    daemon = Daemon(settings, environ={})
+
+    async with serving(daemon, settings) as client:
+        port = daemon.bound_port
+        ipv4 = await client.get("/api/v1/health")
+        async with httpx.AsyncClient(base_url=f"http://[::1]:{port}", timeout=10) as other:
+            ipv6 = await other.get("/api/v1/health")
+
+    assert (ipv4.status_code, ipv6.status_code) == (200, 200)
+    assert f"listening on http://localhost:{port}" in caplog.text

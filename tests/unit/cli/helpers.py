@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import io
 import json
 import os
 import random
@@ -25,7 +27,15 @@ from treadle.control import ControlPoller
 from treadle.engine.executor import Executor, ExecutorDeps
 from treadle.engine.manager import RunManager
 from treadle.lock import InstanceLock
-from treadle.models import ControlRequest
+from treadle.models import (
+    CancelOutcome,
+    CancelReason,
+    ControlRequest,
+    ManagerStats,
+    RunRequest,
+    Submission,
+)
+from treadle.protocols import RunControl
 from treadle.registry import WorkflowRegistry
 from treadle.secrets import SecretStore
 from treadle.steps.builtin import builtin_registry
@@ -108,6 +118,13 @@ stpes:
 """
 
 
+class HungUp(io.StringIO):
+    """A terminal that hung up: every write fails, as after SIGHUP."""
+
+    def write(self, text: str) -> int:
+        raise OSError(errno.EIO, "Input/output error")
+
+
 @dataclass(frozen=True)
 class Result:
     """What one `treadle` invocation returned and printed."""
@@ -177,7 +194,9 @@ class InProcessDaemon:
     The CLI delegates `run` and `cancel` to it as it would to `treadle serve`. It starts no
     trigger and no HTTP server. With `poll=False`, nothing answers control requests until a
     test calls `process_requests`. With `answers`, each request gets the result that the
-    function returns instead, like a lock holder that a test scripts.
+    function returns instead, like a lock holder that a test scripts. With `delay`, the
+    holder claims each request at once but acts on it, and answers, only `delay` seconds
+    later, like a slow lock holder.
     """
 
     def __init__(
@@ -187,12 +206,14 @@ class InProcessDaemon:
         kind: Literal["serve", "run"] = "serve",
         poll: bool = True,
         answers: Callable[[ControlRequest], JSONObject] | None = None,
+        delay: float = 0.0,
     ) -> None:
         self.settings = settings
         self.pid = os.getpid()
         self._kind = kind
         self._poll = poll
         self._answers = answers
+        self._delay = delay
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._ready = threading.Event()
         self._failure: BaseException | None = None
@@ -286,9 +307,10 @@ class InProcessDaemon:
             )
             self.manager = manager
             actor = asyncio.create_task(manager.run())
+            control: RunControl = manager if not self._delay else _Delayed(manager, self._delay)
             self._poller = ControlPoller(
                 store=store,
-                control=manager,
+                control=control,
                 clock=clock,
                 accept_runs=self._kind == "serve",
                 interval=0.05,
@@ -321,6 +343,31 @@ class InProcessDaemon:
                     )
                 )
             await asyncio.sleep(0.05)
+
+
+class _Delayed:
+    """A RunControl that waits `delay` seconds before it passes each call on."""
+
+    def __init__(self, control: RunControl, delay: float) -> None:
+        self._control = control
+        self._delay = delay
+
+    async def submit(self, request: RunRequest) -> Submission:
+        await asyncio.sleep(self._delay)
+        return await self._control.submit(request)
+
+    async def cancel(
+        self, run_id: int, reason: CancelReason = CancelReason.USER, *, force: bool = False
+    ) -> CancelOutcome:
+        await asyncio.sleep(self._delay)
+        return await self._control.cancel(run_id, reason, force=force)
+
+    async def rerun(self, run_id: int) -> Submission:
+        await asyncio.sleep(self._delay)
+        return await self._control.rerun(run_id)
+
+    def stats(self) -> ManagerStats:
+        return self._control.stats()
 
 
 def control_rows(settings: Settings) -> list[dict[str, JSONValue]]:

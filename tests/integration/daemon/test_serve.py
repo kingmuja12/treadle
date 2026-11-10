@@ -1,4 +1,7 @@
-"""`treadle serve` as a real process: HTTP, webhooks, signals, restarts, and hot reload."""
+"""`treadle serve` as a real process: HTTP, webhooks, signals, restarts, and hot reload.
+
+Also signals during startup, and the readiness notice that systemd's `Type=notify` waits for.
+"""
 
 from __future__ import annotations
 
@@ -6,13 +9,20 @@ import json
 import signal
 import socket
 import sqlite3
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from tests.integration.daemon.conftest import HOOK_SECRET, STUBBORN
-from tests.integration.daemon.helpers import Daemon, eventually, kill_group, sign
+from tests.integration.daemon.helpers import (
+    Daemon,
+    eventually,
+    kill_group,
+    sign,
+    surviving_process_groups,
+)
 from tests.support.project import ProjectFactory
 
 from treadle import __version__
@@ -88,10 +98,73 @@ def test_sigterm_during_a_step_cancels_the_run_and_exits_0(start_daemon: StartDa
 
     assert code == 0  # not -SIGTERM: uvicorn didn't re-raise the signal
     assert _stored_run(daemon.settings.db_path, run_id) == ("cancelled", "shutdown")
+    assert surviving_process_groups(daemon.settings.db_path) == []
     assert InstanceLock.probe(daemon.settings.state_dir) is None
     assert not daemon.settings.holder_path.exists()
     assert "shutting down; signal again to stop the runs at once" in daemon.log()
     assert daemon.log().rstrip().endswith("INFO treadle.daemon stopped")
+
+
+def _holder(daemon: Daemon) -> dict[str, Any] | None:
+    """The daemon's `holder.json`, once it names the daemon, even before the port is known."""
+    try:
+        holder = json.loads(daemon.settings.holder_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return dict(holder) if holder.get("pid") == daemon.pid else None
+
+
+def test_sighup_during_startup_doesnt_stop_the_daemon(
+    start_daemon: StartDaemon, daemon_project: ProjectFactory
+) -> None:
+    # Many workflows make startup, between taking the lock and listening, take a while.
+    for number in range(100):
+        daemon_project.write_workflow(f"extra-{number:03}", "steps:\n  - id: a\n    run: 'true'\n")
+    daemon = start_daemon()
+    assert daemon.process is not None
+    eventually(lambda: _holder(daemon), every=0.005)
+
+    # Reload requests, as from `systemctl reload` right after a restart, until it listens.
+    sent = 0
+    while daemon.process.poll() is None and not (_holder(daemon) or {}).get("port"):
+        daemon.signal(signal.SIGHUP)
+        sent += 1
+        time.sleep(0.01)
+    daemon.wait_ready()
+    with daemon.client() as client:
+        health = client.get("/api/v1/health")
+    daemon.signal(signal.SIGTERM)
+
+    assert sent > 0
+    assert health.status_code == 200
+    assert daemon.wait_exit() == 0
+
+
+def test_systemd_hears_ready_once_the_daemon_listens(
+    start_daemon: StartDaemon, daemon_project: ProjectFactory
+) -> None:
+    daemon_project.write_workflow(
+        "notify-env", 'steps:\n  - id: show\n    run: echo "${NOTIFY_SOCKET:-unset}"\n'
+    )
+    # A short directory, because a socket path holds about 100 characters at most.
+    with tempfile.TemporaryDirectory(prefix="tn-", dir="/tmp") as directory:
+        path = f"{directory}/notify"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
+            listener.bind(path)
+            listener.settimeout(20)
+            daemon = start_daemon(environ={"NOTIFY_SOCKET": path})
+            message = listener.recv(64)
+            at_ready = _holder(daemon)
+    daemon.wait_ready()
+    with daemon.client() as client:
+        run_id = client.post("/api/v1/workflows/notify-env/runs", json={}).json()["run"]["id"]
+        daemon.wait_for_run(run_id, "succeeded", "failed")
+        lines = client.get(f"/api/v1/runs/{run_id}/logs").json()["lines"]
+
+    assert message == b"READY=1"
+    assert at_ready is not None
+    assert at_ready["port"] == daemon.port  # bound and recorded before READY=1
+    assert [line["text"] for line in lines] == ["unset"]  # the socket is the daemon's alone
 
 
 def test_a_third_signal_exits_130_at_once(

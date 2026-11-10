@@ -1,11 +1,16 @@
-"""`treadle run` in the foreground: progress, exit codes, inputs, and re-runs."""
+"""`treadle run` in the foreground: progress, exit codes, inputs, re-runs, and stop signals."""
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import errno
+import io
 import os
 import re
+import signal
 from collections.abc import Callable, Iterator
+from pathlib import Path
 
 import pytest
 from tests.support.project import ProjectFactory
@@ -16,16 +21,35 @@ from tests.unit.cli.helpers import (
     GREET,
     SLOW,
     Cli,
+    HungUp,
     read_store,
     store_runs,
 )
 from tests.unit.store.helpers import T0, Runs
 
 from treadle.cli import commands
-from treadle.models import RunStatus
+from treadle.cli.main import main
+from treadle.models import RunReason, RunStatus
 from treadle.types import ExitCode
 
 _DURATION = r"\d+(\.\d+)?m?s"
+
+# The middle step takes a moment, so the run is still going when its first lines print.
+SLOWER = """\
+steps:
+  - id: one
+    uses: log
+    with:
+      message: one
+  - id: two
+    uses: sleep
+    with:
+      duration: 500ms
+  - id: three
+    uses: log
+    with:
+      message: three
+"""
 
 
 def test_a_run_prints_its_progress_and_succeeds(cli: Cli, project: ProjectFactory) -> None:
@@ -227,9 +251,9 @@ def test_a_run_first_recovers_what_a_crashed_process_left(
 
 
 @contextlib.contextmanager
-def _pressed_at_once(callback: Callable[[], None]) -> Iterator[None]:
-    """Stand in for the SIGINT handler: Ctrl-C is pressed as soon as it's installed."""
-    callback()
+def _pressed_at_once(callback: Callable[[int], None]) -> Iterator[None]:
+    """Stand in for the stop-signal handlers: Ctrl-C is pressed as soon as they're installed."""
+    callback(signal.SIGINT)
     yield
 
 
@@ -237,7 +261,7 @@ def test_ctrl_c_cancels_the_run_and_exits_130(
     cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     project.write_workflow("slow", SLOW)
-    monkeypatch.setattr(commands, "_on_interrupt", _pressed_at_once)
+    monkeypatch.setattr(commands, "_on_stop_signals", _pressed_at_once)
 
     result = cli("run", "slow")
 
@@ -249,11 +273,257 @@ def test_ctrl_c_cancels_the_run_and_exits_130(
     assert run.status is RunStatus.CANCELLED
 
 
+# The cleanup step runs after a cancel, until a second Ctrl-C forces the run.
+CLEANUP = """\
+steps:
+  - id: wait
+    uses: sleep
+    with:
+      duration: 30s
+  - id: cleanup
+    needs: [wait]
+    if: always()
+    uses: sleep
+    with:
+      duration: 30s
+"""
+
+
+def test_a_second_ctrl_c_forces_the_run_and_cuts_its_cleanup_short(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("cleanup", CLEANUP)
+
+    @contextlib.contextmanager
+    def pressed_twice(callback: Callable[[int], None]) -> Iterator[None]:
+        loop = asyncio.get_running_loop()
+        timers = [loop.call_later(delay, callback, signal.SIGINT) for delay in (0.3, 0.8)]
+        try:
+            yield
+        finally:
+            for timer in timers:
+                timer.cancel()
+
+    monkeypatch.setattr(commands, "_on_stop_signals", pressed_twice)
+
+    result = cli("run", "cleanup")
+
+    assert result.code == ExitCode.INTERRUPTED
+    assert result.err == "Cancelling run #1 (press Ctrl-C again to force)\n"  # only once
+    detail = read_store(project.settings(), lambda repo: repo.get_run_detail(1))
+    assert detail is not None
+    assert detail.run.status is RunStatus.CANCELLED
+    assert [step.status.value for step in detail.steps] == ["cancelled", "cancelled"]
+
+
+def _signalled_at_once(
+    number: int,
+) -> Callable[[Callable[[int], None]], contextlib.AbstractContextManager[None]]:
+    """Stand in for the stop-signal handlers: `number` arrives as soon as they're installed."""
+
+    @contextlib.contextmanager
+    def handlers(callback: Callable[[int], None]) -> Iterator[None]:
+        callback(number)
+        yield
+
+    return handlers
+
+
+@pytest.mark.parametrize(
+    ("number", "code", "reason", "message"),
+    [
+        (
+            signal.SIGTERM,
+            143,
+            RunReason.SHUTDOWN,
+            "Cancelling run #1 (SIGTERM; signal again to force)",
+        ),
+        (
+            signal.SIGHUP,
+            129,
+            RunReason.SHUTDOWN,
+            "Cancelling run #1 (SIGHUP; signal again to force)",
+        ),
+        (signal.SIGINT, 130, RunReason.USER, "Cancelling run #1 (press Ctrl-C again to force)"),
+    ],
+)
+def test_a_stop_signal_cancels_the_run_and_exits_128_plus_its_number(
+    cli: Cli,
+    project: ProjectFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    number: int,
+    code: int,
+    reason: RunReason,
+    message: str,
+) -> None:
+    project.write_workflow("slow", SLOW)
+    monkeypatch.setattr(commands, "_on_stop_signals", _signalled_at_once(number))
+
+    result = cli("run", "slow")
+
+    assert (result.code, result.err) == (code, f"{message}\n")
+    assert f"Run #1 cancelled ({reason}) in " in result.out
+    run = read_store(project.settings(), lambda repo: repo.get_run(1))
+    assert run is not None
+    assert (run.status, run.reason) == (RunStatus.CANCELLED, reason)
+
+
+def test_a_hung_up_terminal_doesnt_stop_the_cancellation(
+    project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("slow", SLOW)
+    monkeypatch.setattr(commands, "_on_stop_signals", _signalled_at_once(signal.SIGHUP))
+    monkeypatch.setattr("sys.stdout", HungUp())
+    monkeypatch.setattr("sys.stderr", HungUp())
+
+    code = main(["-C", str(project.root), "run", "slow"])
+
+    assert code == 128 + signal.SIGHUP
+    run = read_store(project.settings(), lambda repo: repo.get_run(1))
+    assert run is not None
+    assert (run.status, run.reason) == (RunStatus.CANCELLED, RunReason.SHUTDOWN)
+
+
+class _ReaderLeaves(io.StringIO):
+    """Standard output whose reader goes away after the first line, as with `| head -1`.
+
+    `left` is called when the first write fails.
+    """
+
+    def __init__(self, left: Callable[[], None] = lambda: None) -> None:
+        super().__init__()
+        self._left = left
+        self._closed = False
+
+    def write(self, text: str) -> int:
+        if self.getvalue():
+            if not self._closed:
+                self._closed = True
+                self._left()
+            raise BrokenPipeError(errno.EPIPE, "Broken pipe")
+        return super().write(text)
+
+
+def test_a_closed_pipe_lets_the_run_finish_and_exits_1(
+    project: ProjectFactory, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project.write_workflow("slower", SLOWER)
+    stdout = _ReaderLeaves()
+    monkeypatch.setattr("sys.stdout", stdout)
+
+    code = main(["-C", str(project.root), "run", "slower"])
+
+    assert code == ExitCode.FAILURE
+    assert stdout.getvalue() == "Run #1  slower  (manual)\n"
+    assert capsys.readouterr().err == ""
+    run = read_store(project.settings(), lambda repo: repo.get_run(1))
+    assert run is not None
+    assert (run.status, run.reason) == (RunStatus.SUCCEEDED, None)
+
+
+class _DiskFull(io.StringIO):
+    """Standard output that fails after the first line for a reason other than a closed pipe."""
+
+    def write(self, text: str) -> int:
+        if self.getvalue():
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return super().write(text)
+
+
+def test_another_write_error_is_an_internal_error(
+    project: ProjectFactory, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project.write_workflow("slower", SLOWER)
+    monkeypatch.setattr("sys.stdout", _DiskFull())
+
+    code = main(["-C", str(project.root), "run", "slower"])
+
+    assert code == ExitCode.FAILURE
+    assert capsys.readouterr().err == (
+        "internal error: OSError: [Errno 28] No space left on device\n"
+    )
+
+
+def test_ctrl_c_after_the_pipe_closed_still_cancels_the_run(
+    project: ProjectFactory, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project.write_workflow("slower", SLOWER)
+    handlers: list[Callable[[int], None]] = []
+
+    @contextlib.contextmanager
+    def installed(callback: Callable[[int], None]) -> Iterator[None]:
+        handlers.append(callback)
+        yield
+
+    monkeypatch.setattr(commands, "_on_stop_signals", installed)
+    monkeypatch.setattr("sys.stdout", _ReaderLeaves(lambda: handlers[0](signal.SIGINT)))
+
+    code = main(["-C", str(project.root), "run", "slower"])
+
+    assert code == ExitCode.INTERRUPTED
+    assert capsys.readouterr().err == "Cancelling run #1 (press Ctrl-C again to force)\n"
+    run = read_store(project.settings(), lambda repo: repo.get_run(1))
+    assert run is not None
+    assert (run.status, run.reason) == (RunStatus.CANCELLED, RunReason.USER)
+
+
+def test_a_run_warns_when_other_users_can_read_env_or_the_state_directory(
+    cli: Cli, project: ProjectFactory
+) -> None:
+    project.write_workflow("greet", GREET)
+    settings = project.settings()
+    assert settings.env_file is not None
+    settings.env_file.chmod(0o644)
+    settings.state_dir.mkdir(mode=0o755)
+    settings.state_dir.chmod(0o755)
+
+    result = cli("run", "greet")
+
+    assert result.code == ExitCode.OK
+    env, state = settings.env_file, settings.state_dir
+    assert result.err.splitlines() == [
+        f"warning: {state} is accessible by other users; run `chmod 700 {state}`",
+        f"warning: {env} is readable by other users; run `chmod 600 {env}`",
+    ]
+
+
+def test_a_private_project_runs_without_warnings(cli: Cli, project: ProjectFactory) -> None:
+    project.write_workflow("greet", GREET)
+
+    first, second = cli("run", "greet"), cli("run", "greet")
+
+    assert (first.code, first.err) == (ExitCode.OK, "")
+    assert (second.code, second.err) == (ExitCode.OK, "")
+
+
+def test_a_workflow_whose_file_is_a_symbolic_link_doesnt_exist(
+    cli: Cli, project: ProjectFactory, tmp_path: Path
+) -> None:
+    target = tmp_path / "shared.yml"
+    target.write_text(GREET)
+    (project.workflows_dir / "linked.yml").symlink_to(target)
+
+    result = cli("run", "linked")
+
+    assert result.code == ExitCode.NOT_FOUND
+    assert result.err == (
+        "error: workflow 'linked' doesn't exist: workflows/linked.yml is a symbolic link, "
+        "which Treadle skips; copy the file into workflows instead\n"
+    )
+
+
 @pytest.mark.parametrize(
     ("args", "message"),
     [
         (("runs", "--limit", "many"), "--limit: expected a whole number, got 'many'"),
-        (("runs", "--before", "0"), "--before: must be at least 1"),
+        (("runs", "--before", "0"), f"--before: must be between 1 and {2**63 - 1}"),
+        # Beyond SQLite's integers, which used to end in an internal OverflowError.
+        (("runs", "--before", str(2**63)), f"--before: must be between 1 and {2**63 - 1}"),
+        (("logs", "1", "--attempt", str(2**63)), f"--attempt: must be between 1 and {2**63 - 1}"),
+        (
+            ("logs", "1", "--step", "a", "--attempt", "99999999999999999999"),
+            f"--attempt: must be between 1 and {2**63 - 1}",
+        ),
         (("cancel", "1", "--wait", "soon"), "--wait: expected a number of seconds, got 'soon'"),
         (("cancel", "1", "--wait", "-1"), "--wait: must be a non-negative number of seconds"),
         (("cancel", "1", "--wait", "inf"), "--wait: must be a non-negative number of seconds"),

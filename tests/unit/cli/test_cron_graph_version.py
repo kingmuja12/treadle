@@ -107,7 +107,16 @@ def test_an_invalid_expression_points_at_the_bad_field(cli: Cli) -> None:
 @pytest.mark.parametrize(
     ("args", "message"),
     [
-        (("--tz", "Mars/Olympus"), "unknown time zone 'Mars/Olympus'"),
+        (
+            ("--tz", "Mars/Olympus"),
+            "error: unknown time zone 'Mars/Olympus'; use an IANA name such as Europe/London\n",
+        ),
+        # The spelling must match the time zone database, also where file names ignore case.
+        (("--tz", "utc"), "error: unknown time zone 'utc'; did you mean 'UTC'?\n"),
+        (
+            ("--tz", "europe/london"),
+            "error: unknown time zone 'europe/london'; did you mean 'Europe/London'?\n",
+        ),
         (("--after", "yesterday"), "--after: invalid date or time 'yesterday'"),
     ],
 )
@@ -200,3 +209,21 @@ def test_version_text_and_json(cli: Cli) -> None:
         "sqlite": sqlite,
         "schema_version": 1,
     }
+
+
+def test_graph_by_id_skips_a_symbolic_link_as_every_command_does(
+    cli: Cli, project: ProjectFactory, tmp_path: Path
+) -> None:
+    target = tmp_path / "shared.yml"
+    target.write_text(_DAG)
+    (project.workflows_dir / "linked.yml").symlink_to(target)
+
+    by_id, by_path = cli("graph", "linked"), cli("graph", "workflows/linked.yml")
+
+    assert (by_id.code, by_id.err) == (
+        ExitCode.NOT_FOUND,
+        "error: workflow 'linked' doesn't exist: workflows/linked.yml is a symbolic link, "
+        "which Treadle skips; copy the file into workflows instead\n",
+    )
+    assert by_path.code == ExitCode.OK
+    assert by_path.out.startswith("[0] build  log")

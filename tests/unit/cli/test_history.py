@@ -2,20 +2,32 @@
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import re
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 import pytest
+from tests.support.builders import make_run
+from tests.support.fakes import MemoryRunReader
 from tests.support.project import ProjectFactory
 from tests.unit.cli.helpers import FLAKY, GREET, Cli, store_runs
 from tests.unit.store.helpers import T0, Runs
 
+from treadle.cli import commands
+from treadle.cli.commands import CliContext
 from treadle.cli.main import main
-from treadle.models import LogStream, RunStatus
+from treadle.cli.output import Output
+from treadle.config import Overrides, Settings
+from treadle.models import LogLine, LogStream, RunStatus
+from treadle.protocols import RunReader
 from treadle.store.repo import NewLogLine
 from treadle.types import ExitCode
 
 _TIME = r"\d\d:\d\d:\d\d"
+T0_TIME = make_run().created_at
 
 
 @pytest.fixture(scope="module")
@@ -63,6 +75,18 @@ def test_runs_filters(cli: Cli, args: tuple[str, ...], ids: list[str]) -> None:
     result = cli("runs", *args)
 
     assert [row.split()[0] for row in result.out.splitlines()[1:]] == ids
+
+
+def test_the_largest_ids_sqlite_holds_are_accepted(cli: Cli) -> None:
+    largest = str(2**63 - 1)
+
+    runs, logs = cli("runs", "--before", largest), cli("logs", "1", "--attempt", largest)
+
+    assert (runs.code, [row.split()[0] for row in runs.out.splitlines()[1:]]) == (
+        ExitCode.OK,
+        ["3", "2", "1"],
+    )
+    assert (logs.code, logs.out, logs.err) == (ExitCode.OK, "", "")
 
 
 def test_runs_with_no_match(cli: Cli) -> None:
@@ -249,3 +273,67 @@ def test_logs_page_through_long_runs(capsys: pytest.CaptureFixture[str], tmp_pat
     printed = result.out.splitlines()
     assert len(printed) == 1205
     assert printed[-1].endswith("build#1 stdout | line 1205")
+
+
+class _Events(io.StringIO):
+    """Standard output that records, in `events`, each line written and each page read."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self._events = events
+
+    def write(self, text: str) -> int:
+        self._events.append("line")
+        return super().write(text)
+
+
+class _PagedReader(MemoryRunReader):
+    """A RunReader whose `logs` calls show up in `events`."""
+
+    def __init__(self, events: list[str]) -> None:
+        super().__init__()
+        self._events = events
+
+    async def logs(
+        self,
+        run_id: int,
+        *,
+        step_id: str | None = None,
+        attempt: int | None = None,
+        after_seq: int = 0,
+        limit: int = 1000,
+        tail: bool = False,
+    ) -> list[LogLine]:
+        self._events.append("page")
+        return await super().logs(
+            run_id, step_id=step_id, attempt=attempt, after_seq=after_seq, limit=limit, tail=tail
+        )
+
+
+async def test_logs_print_each_page_before_they_read_the_next(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    events: list[str] = []
+    reader = _PagedReader(events)
+    run = make_run(1, status=RunStatus.SUCCEEDED, started_at=T0_TIME, finished_at=T0_TIME)
+    lines = [
+        LogLine(seq, T0_TIME, None, None, LogStream.SYSTEM, f"line {seq}") for seq in range(1, 2501)
+    ]
+    reader.add(run, lines)
+
+    @contextlib.asynccontextmanager
+    async def history(settings: Settings) -> AsyncIterator[RunReader]:
+        yield reader
+
+    monkeypatch.setattr(commands, "_history", history)
+    stdout = _Events(events)
+    ctx = CliContext(
+        settings.project_dir, {}, Output(stdout, io.StringIO(), color=False), Overrides()
+    )
+    args = argparse.Namespace(run="1", step=None, attempt=None, follow=False, json=False)
+
+    assert await commands._logs(args, ctx, settings) == ExitCode.OK
+
+    # Three pages, each printed in full before the next one is read.
+    assert events == ["page", *["line"] * 1000, "page", *["line"] * 1000, "page", *["line"] * 500]
+    assert stdout.getvalue().splitlines()[-1].endswith("- system | line 2500")

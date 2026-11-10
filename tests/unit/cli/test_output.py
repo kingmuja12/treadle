@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import io
 import json
+from pathlib import Path
 
 import pytest
 
-from treadle.cli.output import Output, use_color
+from treadle.cli.output import Output, _discard, use_color
 
 
 def _streams(encoding: str = "utf-8") -> tuple[io.TextIOWrapper, io.TextIOWrapper]:
@@ -164,3 +165,23 @@ def test_no_color_on_a_closed_stream() -> None:
     stream.close()
 
     assert not use_color(stream, {}, disabled=False)
+
+
+def test_a_discarded_stream_writes_to_dev_null(tmp_path: Path) -> None:
+    path = tmp_path / "out.txt"
+
+    with path.open("w", encoding="utf-8") as stream:
+        stream.write("buffered\n")
+        _discard(stream)
+        stream.write("after\n")
+
+    assert path.read_text(encoding="utf-8") == ""
+
+
+def test_a_stream_without_a_descriptor_stays_as_it_is() -> None:
+    stream = io.StringIO()
+
+    _discard(stream)
+    stream.write("kept")
+
+    assert stream.getvalue() == "kept"

@@ -1,19 +1,27 @@
-"""The daemon's building blocks: sockets, uvicorn, the session key, logging, and Host rules."""
+"""The daemon's building blocks: sockets, uvicorn, the session key, logging, and Host rules.
+
+Also the messages about API token changes and the readiness notice for systemd.
+"""
 
 from __future__ import annotations
 
 import dataclasses
+import errno
 import io
 import logging
+import os
 import signal
 import socket
 import stat
 import sys
+import tempfile
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
 import pytest
+from tests.integration.daemon.helpers import has_ipv6_loopback
 from tests.support.clock import FakeClock
 from tests.support.fakes import (
     FakeRunControl,
@@ -25,11 +33,14 @@ from tests.support.fakes import (
 from tests.support.project import ProjectFactory
 
 from treadle import __version__
+from treadle import daemon as daemon_module
 from treadle.config import ServerSettings, Settings
 from treadle.daemon import (
     EmbeddedServer,
     MaskingFilter,
-    _web_settings,
+    _bind_sockets,
+    _notify_service_manager,
+    _token_change,
     bind_socket,
     configure_logging,
     load_secret_key,
@@ -58,6 +69,169 @@ def test_bind_socket_listens_on_ipv6(host: str) -> None:
         pytest.skip(f"no IPv6 loopback here: {exc}")
     with sock:
         assert sock.family == socket.AF_INET6
+
+
+def _close_all(sockets: list[socket.socket]) -> None:
+    for sock in sockets:
+        sock.close()
+
+
+@pytest.mark.skipif(not has_ipv6_loopback(), reason="no IPv6 loopback here")
+def test_localhost_binds_both_loopback_addresses_on_one_port() -> None:
+    sockets = _bind_sockets("localhost", 0)
+    try:
+        ipv4, ipv6 = sockets
+        port = ipv4.getsockname()[1]
+        assert (ipv4.family, ipv4.getsockname()) == (socket.AF_INET, ("127.0.0.1", port))
+        assert (ipv6.family, ipv6.getsockname()[:2]) == (socket.AF_INET6, ("::1", port))
+        # Nobody else can take [::1] at the port that `localhost` URLs reach.
+        with pytest.raises(OSError, match=os.strerror(errno.EADDRINUSE)) as caught:
+            socket.create_server(("::1", port), family=socket.AF_INET6)
+        assert caught.value.errno == errno.EADDRINUSE
+    finally:
+        _close_all(sockets)
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "::1"])
+def test_an_address_gets_one_socket(host: str) -> None:
+    try:
+        sockets = _bind_sockets(host, 0)
+    except OSError as exc:
+        pytest.skip(f"can't bind {host} here: {exc}")
+    try:
+        (sock,) = sockets
+        assert sock.getsockname()[0] == host
+    finally:
+        _close_all(sockets)
+
+
+def test_localhost_without_ipv6_listens_on_ipv4_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    def bind(host: str, port: int) -> socket.socket:
+        if ":" in host:
+            raise OSError(errno.EADDRNOTAVAIL, "can't assign the address")
+        return bind_socket(host, port)
+
+    monkeypatch.setattr(daemon_module, "bind_socket", bind)
+
+    sockets = _bind_sockets("localhost", 0)
+    try:
+        assert [sock.family for sock in sockets] == [socket.AF_INET]
+    finally:
+        _close_all(sockets)
+
+
+def test_localhost_fails_when_ipv6_is_taken(monkeypatch: pytest.MonkeyPatch) -> None:
+    opened: list[socket.socket] = []
+
+    def bind(host: str, port: int) -> socket.socket:
+        if ":" in host:
+            raise OSError(errno.EADDRINUSE, "in use")
+        opened.append(bind_socket(host, port))
+        return opened[-1]
+
+    monkeypatch.setattr(daemon_module, "bind_socket", bind)
+
+    with pytest.raises(OSError, match="in use") as caught:
+        _bind_sockets("localhost", 0)
+
+    assert caught.value.errno == errno.EADDRINUSE
+    assert [sock.fileno() for sock in opened] == [-1]  # the IPv4 socket was closed
+
+
+_LOOPBACK = ServerSettings(host="127.0.0.1")
+_PUBLIC = ServerSettings(host="192.0.2.10")
+_OLD, _NEW = "o" * 32, "n" * 32
+
+
+@pytest.mark.parametrize(
+    ("server", "in_use", "new", "message"),
+    [
+        (
+            _LOOPBACK,
+            None,
+            _NEW,
+            "TREADLE_TOKEN changed in .env; restart Treadle to apply it. Until then, the API "
+            "doesn't require a token.",
+        ),
+        (
+            _LOOPBACK,
+            _OLD,
+            _NEW,
+            "TREADLE_TOKEN changed in .env; restart Treadle to apply it. Until then, the API "
+            "accepts only the previous token.",
+        ),
+        (
+            _LOOPBACK,
+            _OLD,
+            None,
+            "TREADLE_TOKEN changed in .env; restart Treadle to apply it. Until then, the API "
+            "accepts only the previous token.",
+        ),
+        (
+            _LOOPBACK,
+            _OLD,
+            "short",
+            "TREADLE_TOKEN changed in .env, but Treadle can't start with the new value: "
+            "TREADLE_TOKEN must be at least 32 characters long. Until a restart, the API "
+            "accepts only the previous token.",
+        ),
+        (
+            _PUBLIC,
+            _OLD,
+            None,
+            "TREADLE_TOKEN changed in .env, but Treadle can't start with the new value: set "
+            "TREADLE_TOKEN (at least 32 characters) or bind 127.0.0.1. Until a restart, the API "
+            "accepts only the previous token.",
+        ),
+        (_LOOPBACK, _OLD, _OLD, "TREADLE_TOKEN in .env is the token in use again"),
+    ],
+)
+def test_a_token_change_says_what_the_api_accepts_until_a_restart(
+    server: ServerSettings, in_use: str | None, new: str | None, message: str
+) -> None:
+    text = _token_change(server, ".env", in_use, new)
+
+    assert text == message
+    assert _OLD not in text
+    assert _NEW not in text
+
+
+@pytest.fixture
+def notify_socket() -> Iterator[tuple[str, socket.socket]]:
+    """A datagram socket that plays systemd's notification socket.
+
+    It lives in a short directory, because a socket path holds about 100 characters at most.
+    """
+    with tempfile.TemporaryDirectory(prefix="tn-", dir="/tmp") as directory:
+        path = f"{directory}/notify"
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as listener:
+            listener.bind(path)
+            listener.settimeout(5)
+            yield path, listener
+
+
+def test_the_service_manager_hears_the_state(notify_socket: tuple[str, socket.socket]) -> None:
+    path, listener = notify_socket
+
+    _notify_service_manager({"NOTIFY_SOCKET": path}, "READY=1")
+
+    assert listener.recv(64) == b"READY=1"
+
+
+def test_without_a_notification_socket_nothing_is_sent(caplog: pytest.LogCaptureFixture) -> None:
+    _notify_service_manager({}, "READY=1")
+
+    assert caplog.records == []
+
+
+def test_an_unreachable_notification_socket_only_warns(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    missing = str(tmp_path / "gone")
+
+    _notify_service_manager({"NOTIFY_SOCKET": missing}, "READY=1")
+
+    assert f"can't notify the service manager at {missing}: " in caplog.text
 
 
 def test_uvicorn_runs_without_lifespan_proxy_headers_or_its_own_logging(
@@ -189,16 +363,10 @@ def test_an_unknown_log_level_is_refused(root_logging: logging.Logger) -> None:
         configure_logging("loud", Masker)
 
 
-def test_a_non_loopback_bind_keeps_its_allowlist(settings: Settings) -> None:
-    remote = dataclasses.replace(settings, server=ServerSettings(host="192.0.2.10"))
-
-    assert _web_settings(remote) is remote
-
-
 async def test_the_dashboard_answers_its_own_loopback_address(settings: Settings) -> None:
     bound = dataclasses.replace(settings, server=ServerSettings(host="127.0.0.2"))
     context = WebContext(
-        settings=_web_settings(bound),
+        settings=bound,
         workflows=FakeWorkflowSource(),
         runs=FakeRunControl(),
         reader=MemoryRunReader(),
