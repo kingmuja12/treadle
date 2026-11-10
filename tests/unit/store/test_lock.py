@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import stat
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +62,40 @@ def test_a_second_lock_fails_with_the_current_holder(state_dir: Path) -> None:
 
     with InstanceLock(state_dir, RUN):
         assert InstanceLock.probe(state_dir) == RUN
+
+
+def shared_lock(state_dir: Path) -> int:
+    """Take the shared lock that `probe` takes for a moment, and return its descriptor."""
+    state_dir.mkdir(exist_ok=True)
+    fd = os.open(state_dir / "treadle.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    return fd
+
+
+def test_a_probe_in_progress_doesnt_make_acquire_fail(state_dir: Path) -> None:
+    fd = shared_lock(state_dir)
+    (state_dir / "holder.json").write_text(json.dumps(RUN.to_json()))  # left by a crash
+    probe_ends = threading.Timer(0.03, os.close, (fd,))
+    probe_ends.start()
+
+    try:
+        with InstanceLock(state_dir, SERVE):
+            assert InstanceLock.probe(state_dir) == SERVE
+    finally:
+        probe_ends.join()
+
+
+def test_a_shared_lock_that_stays_still_fails_acquire_quickly(state_dir: Path) -> None:
+    fd = shared_lock(state_dir)
+    started = time.monotonic()
+
+    try:
+        with pytest.raises(LockHeldError):
+            InstanceLock(state_dir, SERVE).acquire()
+    finally:
+        os.close(fd)
+
+    assert time.monotonic() - started < 1
 
 
 def test_probe_without_a_lock_file_finds_no_holder(tmp_path: Path) -> None:

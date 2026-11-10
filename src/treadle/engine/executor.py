@@ -1,4 +1,4 @@
-"""The executor: runs one admitted run's step graph (section 5, "Executor algorithm")."""
+"""The executor: runs one admitted run's step graph."""
 
 from __future__ import annotations
 
@@ -25,7 +25,7 @@ from treadle.engine.context import (
     step_values,
     treadle_env,
 )
-from treadle.engine.logsink import AttemptLog, LogSink
+from treadle.engine.logsink import MAX_RUNTIME_MASKS, AttemptLog, LogSink
 from treadle.engine.masking import Masker
 from treadle.errors import EvaluationError, StepError
 from treadle.expr.analysis import calls
@@ -46,7 +46,7 @@ from treadle.models import (
 from treadle.schema import validate
 from treadle.secrets import SecretSnapshot
 from treadle.steps.base import StepRegistry, StepRuntime, StepType
-from treadle.steps.procs import ProcessRegistry
+from treadle.steps.procs import LeftoverGroups, ProcessRegistry
 from treadle.store.async_store import AsyncStore
 from treadle.store.repo import Repository, StepUpdate
 from treadle.types import JSONObject, JSONValue, Severity, YamlPath, format_path
@@ -61,6 +61,7 @@ _PENDING: Final = frozenset({StepStatus.PENDING})
 _ACTIVE: Final = frozenset({StepStatus.RUNNING, StepStatus.RETRYING})
 _UNFINISHED: Final = _PENDING | _ACTIVE
 _FAILED: Final = frozenset({StepStatus.FAILED, StepStatus.TIMED_OUT})
+_TOO_MANY_MASKS: Final = f"too many ::add-mask:: values: a run masks at most {MAX_RUNTIME_MASKS}"
 _ATTEMPT_STATUS: Final = {
     StepStatus.SUCCEEDED: AttemptStatus.SUCCEEDED,
     StepStatus.FAILED: AttemptStatus.FAILED,
@@ -130,7 +131,7 @@ class RunHandle:
         """
         if self._forced:
             return False
-        # Design note: a forced run ends cancelled, which needs a reason; nothing in Treadle
+        # A forced run ends cancelled, which needs a reason; nothing in Treadle
         # forces a run before requesting a cancel, so a bare force counts as the user's.
         if self._reason is None:
             self._reason = CancelReason.USER
@@ -138,18 +139,11 @@ class RunHandle:
         self._notify()
         return True
 
-    async def wait_changed(self) -> None:
-        """Return at the next change of `reason` or `forced`.
+    def wait_changed(self) -> Coroutine[Any, Any, bool]:
+        """Return a coroutine that finishes at the next change of `reason` or `forced`.
 
-        The wait begins when the coroutine starts running; `_next_change` begins at once.
-        """
-        await self._changed.wait()
-
-    def _next_change(self) -> Coroutine[Any, Any, bool]:
-        """Return a wait for the next change that is bound now, not when it first runs.
-
-        A task made from `wait_changed()` would miss a change that lands before its first
-        step, which can happen after the executor has read the handle's state.
+        The wait begins when this method is called, not when the coroutine first runs, so a
+        task made from it sees a change that lands before the task's first step.
         """
         return self._changed.wait()
 
@@ -201,7 +195,12 @@ def backoff_delay(policy: RetryPolicy, failed_attempt: int, rng: RandomSource) -
 
 
 def conclude(state: RunState, reason: CancelReason | None) -> tuple[RunStatus, str | None]:
-    """Return the run's terminal status and one-line error by the rules in section 5."""
+    """Return the run's terminal status and one-line error.
+
+    A run timed out when its timeout fired, and was cancelled for any other cancel reason.
+    Otherwise it failed when a step failed or timed out without being tolerated, and the
+    error names the first such step; else it succeeded.
+    """
     workflow = state.workflow
     if reason is CancelReason.TIMEOUT:
         return RunStatus.TIMED_OUT, f"run timed out after {format_duration(workflow.timeout)}"
@@ -258,7 +257,8 @@ class _StepFailure(Exception):
 class _AttemptProcesses:
     """Tracks one attempt's process groups in the registry, and records each in the store.
 
-    Recovery after a crash warns about the recorded groups that still exist.
+    Recovery after a crash warns about the recorded groups that still exist. `live` holds
+    the groups that the attempt hasn't released, which outlive it when it ends.
     """
 
     def __init__(
@@ -268,10 +268,12 @@ class _AttemptProcesses:
         self._store = store
         self._key = (run_id, step_id, attempt)
         self._writes: set[asyncio.Task[None]] = set()
+        self.live: set[int] = set()
 
     def add(self, pgid: int) -> None:
         """Track a process group, and start recording it on the attempt."""
         self._registry.add(pgid)
+        self.live.add(pgid)
         task = asyncio.get_running_loop().create_task(self._record(pgid))
         self._writes.add(task)
         task.add_done_callback(self._writes.discard)
@@ -279,6 +281,7 @@ class _AttemptProcesses:
     def discard(self, pgid: int) -> None:
         """Stop tracking a process group."""
         self._registry.discard(pgid)
+        self.live.discard(pgid)
 
     async def _record(self, pgid: int) -> None:
         run_id, step_id, attempt = self._key
@@ -338,6 +341,8 @@ class _Execution:
         self._running: dict[asyncio.Task[None], Step] = {}
         self._timers: list[asyncio.TimerHandle] = []
         self._forced = False
+        # Process groups that steps left running in the background, until the run ends.
+        self._leftovers = LeftoverGroups(deps.processes)
 
     async def run(self) -> RunStatus:
         self._flusher = asyncio.create_task(self._sink.run())
@@ -405,7 +410,7 @@ class _Execution:
             )
         )
         # The waiter exists before each read of the handle, so no change goes unseen.
-        changed = asyncio.create_task(self._handle._next_change())
+        changed = asyncio.create_task(self._handle.wait_changed())
         try:
             while True:
                 self._follow_handle()
@@ -416,7 +421,7 @@ class _Execution:
                     {changed, *self._running}, return_when=asyncio.FIRST_COMPLETED
                 )
                 if changed in done:
-                    changed = asyncio.create_task(self._handle._next_change())
+                    changed = asyncio.create_task(self._handle.wait_changed())
                 self._collect(done)
         finally:
             changed.cancel()
@@ -440,7 +445,7 @@ class _Execution:
         """
         self._state.cancelling = True
         workflow = self._workflow
-        # Design note: the cleanup timer bounds the rest of the run, so the run timer stops;
+        # The cleanup timer bounds the rest of the run, so the run timer stops;
         # otherwise it would force a user-cancelled run before its cleanup budget ran out.
         for timer in self._timers:
             timer.cancel()
@@ -509,7 +514,11 @@ class _Execution:
             return False
 
     def _skip_reason(self, step: Step) -> SkipReason:
-        """Return why a step whose condition is false is skipped (section 5's rules)."""
+        """Return why a step whose condition is false is skipped.
+
+        That is `run_cancelled` while the run cancels, `upstream_failed` when a failed
+        ancestor made a success-only condition false, and `condition` otherwise.
+        """
         if self._state.cancelling or self._handle.forced:
             return SkipReason.RUN_CANCELLED
         if _success_only(step.condition) and AncestorStatus(self._state, step.id).failure():
@@ -625,6 +634,10 @@ class _Execution:
             )
         )
         outcome = await self._run_attempt(step, step_type, env, params, number, log)
+        if log.refused_mask:
+            # The outputs may hold the value that the run couldn't mask, so they're dropped,
+            # and a retry would only refuse it again.
+            outcome = _Outcome(StepStatus.FAILED, _TOO_MANY_MASKS, exit_code=outcome.exit_code)
         if outcome.status is StepStatus.FAILED:
             log.system(f"attempt {number} failed: {outcome.error}")
         elif outcome.status is StepStatus.TIMED_OUT:
@@ -649,19 +662,40 @@ class _Execution:
         number: int,
         log: AttemptLog,
     ) -> _Outcome:
-        """Run the step type under the step timeout, and classify how the attempt ended."""
+        """Run the step type under the step timeout, and classify how the attempt ended.
+
+        Process groups that outlive an attempt stay tracked until the run ends. A cancelled
+        attempt has none: its step type stops its processes, even after a forced cancel.
+        """
+        deps, run_id = self._deps, self._state.run.id
+        processes = _AttemptProcesses(deps.processes, deps.store, run_id, step.id, number)
+        outcome = await self._classify(step, step_type, env, params, number, log, processes)
+        for pgid in processes.live:
+            self._leftovers.adopt(pgid)
+        return outcome
+
+    async def _classify(
+        self,
+        step: Step,
+        step_type: StepType,
+        env: dict[str, str],
+        params: dict[str, JSONValue],
+        number: int,
+        log: AttemptLog,
+        processes: _AttemptProcesses,
+    ) -> _Outcome:
+        """Run the step type under the step timeout, and return how the attempt ended."""
         timeout = asyncio.timeout(step.timeout)
         try:
-            # Design note: section 5 creates the attempt's files before `start_attempt`.
-            # Creating them here, once the attempt exists, makes a file-system error a
-            # failed attempt with a traceback instead of an unrecorded crash.
-            runtime = self._runtime(step, number, env, log)
+            # The attempt's files are created here, once the attempt is recorded, so that a
+            # file-system error is a failed attempt with a traceback, not an unrecorded crash.
+            runtime = self._runtime(step, number, env, log, processes)
             async with timeout:
                 result = await step_type.run(params, runtime)
         except TimeoutError as exc:
             if timeout.expired():
                 error = f"timed out after {format_duration(step.timeout)}"
-                return _Outcome(StepStatus.TIMED_OUT, error, retryable=True)
+                return _Outcome(StepStatus.TIMED_OUT, error, retryable=_interruptible(step_type))
             return _Outcome(StepStatus.FAILED, _describe(exc), retryable=True)
         except StepError as exc:
             return _Outcome(
@@ -679,7 +713,12 @@ class _Execution:
         )
 
     def _runtime(
-        self, step: Step, number: int, env: dict[str, str], log: AttemptLog
+        self,
+        step: Step,
+        number: int,
+        env: dict[str, str],
+        log: AttemptLog,
+        processes: _AttemptProcesses,
     ) -> StepRuntime:
         """Create the attempt directory (0700) and its empty output file (0600)."""
         deps, settings, run_id = self._deps, self._deps.settings, self._state.run.id
@@ -714,7 +753,7 @@ class _Execution:
             kill_grace=settings.runs.kill_grace,
             limits=settings.limits,
             log=log,
-            processes=_AttemptProcesses(deps.processes, deps.store, run_id, step.id, number),
+            processes=processes,
             http=deps.http,
         )
 
@@ -742,7 +781,7 @@ class _Execution:
         if outcome.status is StepStatus.SUCCEEDED:
             self._system(f"step failed: {error}", step_id=step.id)
             return dataclasses.replace(outcome, status=StepStatus.FAILED, error=error, outputs={})
-        # Design note: a failed step keeps the partial outputs of its last StepError, but
+        # A failed step keeps the partial outputs of its last StepError, but
         # never more than the cap; larger ones are dropped, as for a success.
         self._system(f"dropped the outputs: {error}", step_id=step.id)
         return dataclasses.replace(outcome, outputs={})
@@ -816,6 +855,7 @@ class _Execution:
         handle.finalizing = True
         self._cancel_timers()
         await self._skip_pending(SkipReason.RUN_CANCELLED)  # what an aborted loop left
+        await self._stop_leftovers()
         error: str | None
         reason: RunReason | None
         if setup_error is not None:
@@ -852,11 +892,19 @@ class _Execution:
         """Release what an execution that failed unexpectedly holds; the manager ends the run."""
         self._handle.finalizing = True
         self._cancel_timers()
+        await self._stop_leftovers()
         try:
             await self._close_sink()
         except Exception:
             _log.exception("run=%d: couldn't write the last log lines", self._state.run.id)
         await self._remove_run_dir()
+
+    async def _stop_leftovers(self) -> None:
+        """Stop the processes that steps left running in the background."""
+        stopped = await self._leftovers.stop(grace=self._deps.settings.runs.kill_grace)
+        if stopped:
+            attempts = "attempt" if stopped == 1 else "attempts"
+            self._system(f"stopped the background processes of {stopped} step {attempts}")
 
     async def _close_sink(self) -> None:
         self._flusher.cancel()
@@ -921,10 +969,9 @@ def _close_attempt(
 
 def _success_only(condition: Condition) -> bool:
     """True when a condition calls no status function other than `success()`."""
-    # Design note: section 5 gives `upstream_failed` to a condition without a status
-    # function, yet section 2's example gives it to steps with the default `if`, which the
-    # loader stores as `success()`. Both hold when `success()` alone doesn't count, as the
-    # implicit `success() &&` of a bare expression doesn't.
+    # `upstream_failed` is the reason both for a condition without a status function and for
+    # the default `if`, which the loader stores as `success()`. Both hold when `success()`
+    # alone doesn't count, as the implicit `success() &&` of a bare expression doesn't.
     return all(
         call.name == "success"
         for call in calls(condition.expression)
@@ -971,6 +1018,11 @@ def _json_size(value: JSONValue) -> int:
     """Return the UTF-8 size of a value in the compact JSON form that the store writes."""
     text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     return len(text.encode("utf-8", "surrogatepass"))
+
+
+def _interruptible(step_type: StepType) -> bool:
+    """True unless the step type sets `interruptible = False`; see StepType."""
+    return getattr(step_type, "interruptible", True) is not False
 
 
 def _describe(exc: BaseException) -> str:

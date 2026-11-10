@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import gzip
 import json
+import tracemalloc
+import zlib
 from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 from typing import Any, TypeAlias, cast
@@ -11,11 +15,12 @@ import pytest
 from tests.support.builders import make_runtime, static_template
 from tests.support.fakes import RecordingLog
 
+from treadle import __version__
 from treadle.errors import StepConfigError, StepError
 from treadle.models import LogStream
 from treadle.schema import validate
 from treadle.steps.base import StepResult
-from treadle.steps.http import HttpStep, status_matches
+from treadle.steps.http import HttpStep, shared_client, status_matches
 from treadle.types import JSONValue
 
 URL = "https://example.net/healthz"
@@ -53,7 +58,13 @@ def params(**raw: object) -> dict[str, JSONValue]:
 
 
 def reply(status: int = 200, **kwargs: Any) -> Handler:
+    """Answer with an `httpx.Response`. A `bytes` or `text` body is read in advance."""
     return lambda request: httpx.Response(status, **kwargs)
+
+
+def raw(body: bytes, headers: dict[str, str]) -> Handler:
+    """Answer 200 with a body that arrives undecoded in one chunk, as a network read gives it."""
+    return lambda request: httpx.Response(200, headers=headers, stream=httpx.ByteStream(body))
 
 
 def nested(levels: int) -> str:
@@ -221,16 +232,47 @@ async def test_an_expected_error_status_succeeds(
 async def test_an_unexpected_status_fails_with_the_outputs_and_a_body_excerpt(
     exchange: Callable[[Handler], Exchange],
 ) -> None:
-    http = exchange(reply(503, text="  " + "x" * 5000))
+    body = "  " + "x" * 1500 + "\n" + "y" * 100 + "\n" + "z" * 5000
+    http = exchange(reply(503, text=body))
 
     with pytest.raises(StepError) as caught:
         await http.run()
 
     error = caught.value
-    assert error.message == f"GET {URL} returned 503, expected 2xx: " + "x" * 2046
+    excerpt = "x" * 1500 + "\n" + "y" * 100
+    assert error.message == f"GET {URL} returned 503, expected 2xx: {excerpt}"
     assert error.retryable is True
     assert error.outputs["status"] == 503
-    assert error.outputs["body"] == "  " + "x" * 5000
+    assert error.outputs["body"] == body
+
+
+SECRET_KEY = "tok_LIVE_9f8e7d6c5b4a39281706f5e4d3c2b1a0"
+
+
+@pytest.mark.parametrize(
+    ("body", "excerpt"),
+    [
+        pytest.param(
+            "Unauthorized\n" + "x" * 2020 + f" key {SECRET_KEY} rejected\n",
+            "Unauthorized",
+            id="secret-across-the-cut",
+        ),
+        pytest.param("x" * 2040 + f" key {SECRET_KEY}", "", id="one-long-line"),
+        pytest.param("a" * 2047 + "\n" + "b" * 10, "a" * 2047, id="cut-at-a-line-end"),
+        pytest.param("a" * 2048 + "\r\nb", "a" * 2048, id="cut-before-crlf"),
+    ],
+)
+async def test_the_body_excerpt_never_ends_inside_a_line_that_the_cut_splits(
+    exchange: Callable[[Handler], Exchange], body: str, excerpt: str
+) -> None:
+    http = exchange(reply(401, text=body))
+
+    with pytest.raises(StepError) as caught:
+        await http.run()
+
+    expected = f"GET {URL} returned 401, expected 2xx"
+    assert caught.value.message == (f"{expected}: {excerpt}" if excerpt else expected)
+    assert all(SECRET_KEY[:size] not in caught.value.message for size in range(5, 41))
 
 
 async def test_an_unexpected_empty_response_has_no_excerpt(
@@ -289,6 +331,217 @@ async def test_a_redirect_loop_is_a_retryable_failure(
     assert len(http.requests) == 6
 
 
+class LazyBody:
+    """A response body of `chunks` 64 KiB chunks that records how many were read."""
+
+    def __init__(self, chunks: int) -> None:
+        self.chunks = chunks
+        self.read = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for _ in range(self.chunks):
+            self.read += 1
+            yield bytes(64 * 1024)
+
+
+def gzipped(data: bytes, layers: int = 1) -> bytes:
+    for _ in range(layers):
+        data = gzip.compress(data, 6)
+    return data
+
+
+@functools.cache
+def compressed_zeros(encoding: str) -> bytes:
+    """Return 16 MiB of zero bytes, compressed to about 16 KiB."""
+    zeros = bytes(16 << 20)
+    return gzipped(zeros) if encoding == "gzip" else zlib.compress(zeros, 6)
+
+
+async def peak_memory(run: Callable[[], Awaitable[object]]) -> int:
+    """Await `run()` and return the peak of the memory that it allocated, in bytes."""
+    tracemalloc.start()
+    try:
+        await run()
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+async def test_a_redirect_body_is_never_read(exchange: Callable[[Handler], Exchange]) -> None:
+    redirect_body = LazyBody(chunks=256)  # 16 MiB, if anything read it
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/start":
+            return httpx.Response(302, headers={"Location": "/final"}, content=redirect_body)
+        return httpx.Response(200, text="done")
+
+    http = exchange(handler)
+    results: list[StepResult] = []
+
+    async def run() -> None:
+        start = params(url="https://example.net/start", follow_redirects=True)
+        results.append(await HttpStep().run({**start, "max_response_bytes": 1024}, http.rt))
+
+    peak = await peak_memory(run)
+
+    assert peak < 4 << 20
+    assert [(result.outputs["status"], result.outputs["body"]) for result in results] == [
+        (200, "done")
+    ]
+    assert redirect_body.read == 0
+    assert [request.url.path for request in http.requests] == ["/start", "/final"]
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "deflate"])
+async def test_a_compressed_body_never_inflates_past_the_limit(
+    exchange: Callable[[Handler], Exchange], encoding: str
+) -> None:
+    http = exchange(raw(compressed_zeros(encoding), {"Content-Encoding": encoding}))
+    caught: list[StepConfigError] = []
+
+    async def run() -> None:
+        try:
+            await http.run()
+        except StepConfigError as exc:
+            caught.append(exc)
+
+    peak = await peak_memory(run)
+
+    assert [error.message for error in caught] == [
+        "the response is larger than max_response_bytes (1.0 MiB)"
+    ]
+    assert peak < 4 << 20
+
+
+async def test_a_body_compressed_more_than_once_is_refused(
+    exchange: Callable[[Handler], Exchange],
+) -> None:
+    content = gzipped(bytes(16 << 20), layers=2)  # a few hundred bytes
+    http = exchange(raw(content, {"Content-Encoding": "gzip, gzip"}))
+
+    async def run() -> None:
+        with pytest.raises(StepConfigError) as caught:
+            await http.run()
+        assert caught.value.message == (
+            "the response is compressed more than once (Content-Encoding: gzip, gzip), "
+            "which the http step doesn't decode"
+        )
+
+    assert await peak_memory(run) < 4 << 20
+
+
+@pytest.mark.parametrize(
+    ("encoding", "content"),
+    [
+        pytest.param("gzip", gzipped(b"hello " * 1000), id="gzip"),
+        pytest.param("deflate", zlib.compress(b"hello " * 1000), id="zlib-deflate"),
+        pytest.param("deflate", zlib.compress(b"hello " * 1000)[2:-4], id="raw-deflate"),
+        pytest.param("identity, GZIP", gzipped(b"hello " * 1000), id="with-identity"),
+        pytest.param("br", b"hello " * 1000, id="unknown-passes-through"),
+    ],
+)
+async def test_compressed_bodies_are_decoded(
+    exchange: Callable[[Handler], Exchange], encoding: str, content: bytes
+) -> None:
+    http = exchange(raw(content, {"Content-Encoding": encoding}))
+
+    result = await http.run()
+
+    assert result.outputs["body"] == "hello " * 1000
+    assert http.request.headers["accept-encoding"] == "gzip, deflate"
+
+
+async def test_a_body_that_isnt_valid_gzip_is_a_retryable_failure(
+    exchange: Callable[[Handler], Exchange],
+) -> None:
+    http = exchange(raw(b"not gzip", {"Content-Encoding": "gzip"}))
+
+    with pytest.raises(StepError) as caught:
+        await http.run()
+
+    assert caught.value.message.startswith(f"GET {URL} failed: DecodingError: ")
+    assert caught.value.retryable is True
+
+
+def login(request: httpx.Request) -> httpx.Response:
+    """A server whose /login sets a session cookie, as a router's admin page might."""
+    if request.url.path == "/login":
+        return httpx.Response(200, headers={"Set-Cookie": "session=admin-77; Path=/"})
+    return httpx.Response(200, text="ok")
+
+
+async def test_a_cookie_that_one_step_receives_is_never_sent_by_another(
+    exchange: Callable[[Handler], Exchange],
+) -> None:
+    http = exchange(login)
+
+    await HttpStep().run(params(url="https://router.home.test/login"), http.rt)
+    await HttpStep().run(params(url="https://router.home.test/status"), http.rt)
+
+    assert [request.headers.get("cookie") for request in http.requests] == [None, None]
+
+
+async def test_an_explicit_cookie_header_is_sent_as_written(
+    exchange: Callable[[Handler], Exchange],
+) -> None:
+    http = exchange(login)
+    status = params(url="https://router.home.test/status", headers={"Cookie": "session=mine"})
+
+    await HttpStep().run(params(url="https://router.home.test/login"), http.rt)
+    await HttpStep().run(status, http.rt)
+
+    assert http.requests[1].headers.get_list("cookie") == ["session=mine"]
+
+
+async def test_a_cookie_that_a_redirect_sets_reaches_only_the_rest_of_that_request(
+    exchange: Callable[[Handler], Exchange],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/login":
+            cookie = "session=s1; Path=/"
+            return httpx.Response(302, headers={"Location": "/home", "Set-Cookie": cookie})
+        if request.url.path == "/home":
+            signed_in = request.headers.get("cookie") == "session=s1"
+            return httpx.Response(200 if signed_in else 401)
+        if request.url.host == "example.net":
+            return httpx.Response(302, headers={"Location": "https://elsewhere.test/"})
+        return httpx.Response(200)
+
+    http = exchange(handler)
+    sign_in = params(url="https://example.net/login", method="POST", follow_redirects=True)
+
+    result = await HttpStep().run(sign_in, http.rt)
+    await HttpStep().run(params(url="https://example.net/away", follow_redirects=True), http.rt)
+
+    assert result.outputs["status"] == 200
+    assert [(request.method, request.url.path) for request in http.requests] == [
+        ("POST", "/login"),
+        ("GET", "/home"),
+        ("GET", "/away"),
+        ("GET", "/"),
+    ]
+    assert [request.headers.get("cookie") for request in http.requests] == [
+        None,
+        "session=s1",
+        None,
+        None,
+    ]
+
+
+async def test_the_shared_client_never_keeps_a_cookie(tmp_path: Path) -> None:
+    client = shared_client(transport=httpx.MockTransport(login))
+    try:
+        rt = make_runtime(tmp_path, http=client)
+
+        await HttpStep().run(params(url="https://router.home.test/login"), rt)
+
+        assert len(client.cookies.jar) == 0
+        assert client.headers["user-agent"] == f"treadle/{__version__}"
+        assert client.max_redirects == 5
+    finally:
+        await client.aclose()
+
+
 async def test_a_large_response_aborts_while_it_streams(
     exchange: Callable[[Handler], Exchange],
 ) -> None:
@@ -311,14 +564,19 @@ async def test_a_large_response_aborts_while_it_streams(
     assert http.log.lines == [(LogStream.SYSTEM, f"GET {URL} -> {message}")]
 
 
-async def test_a_response_at_the_size_limit_is_kept(
-    exchange: Callable[[Handler], Exchange],
+@pytest.mark.parametrize("read_in_advance", [False, True], ids=["streamed", "read"])
+async def test_a_response_at_the_size_limit_is_kept_and_one_past_it_isnt(
+    exchange: Callable[[Handler], Exchange], read_in_advance: bool
 ) -> None:
-    http = exchange(reply(200, content=b"x" * 2048))
+    def body(size: int) -> Handler:
+        content = b"x" * size
+        return reply(200, content=content) if read_in_advance else raw(content, {})
 
-    result = await http.run(max_response_bytes="2KiB")
+    kept = await exchange(body(2048)).run(max_response_bytes="2KiB")
+    with pytest.raises(StepConfigError, match="larger than max_response_bytes"):
+        await exchange(body(2049)).run(max_response_bytes="2KiB")
 
-    assert result.outputs["body"] == "x" * 2048
+    assert kept.outputs["body"] == "x" * 2048
 
 
 @pytest.mark.parametrize(
@@ -363,6 +621,34 @@ async def test_the_body_uses_the_response_encoding_with_replacement(
 
     assert (await latin.run()).outputs["body"] == "café"
     assert (await broken.run()).outputs["body"] == "caf�"
+
+
+@pytest.mark.parametrize("charset", ["base64", "rot13", "zlib_codec", "hex", "idna", "undefined"])
+async def test_a_charset_that_cant_decode_text_falls_back_to_utf8(
+    exchange: Callable[[Handler], Exchange], charset: str
+) -> None:
+    headers = {"Content-Type": f"application/json; charset={charset}"}
+    http = exchange(reply(200, headers=headers, content=b'{"name": "caf\xc3\xa9"}\xff'))
+
+    result = await http.run()
+
+    assert result.outputs["body"] == '{"name": "café"}\N{REPLACEMENT CHARACTER}'
+    assert result.outputs["json"] is None
+    assert http.log.texts() == [
+        f"GET {URL} -> 200 (0 ms)",
+        f"the response charset {charset} can't decode text; decoded the body as UTF-8",
+    ]
+
+
+async def test_a_json_body_with_an_unusable_charset_still_parses(
+    exchange: Callable[[Handler], Exchange],
+) -> None:
+    headers = {"Content-Type": "application/json; charset=base64"}
+    http = exchange(reply(200, headers=headers, content=b'{"ok": true}'))
+
+    result = await http.run()
+
+    assert result.outputs["json"] == {"ok": True}
 
 
 async def test_transport_errors_are_retryable(exchange: Callable[[Handler], Exchange]) -> None:

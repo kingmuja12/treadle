@@ -1,4 +1,4 @@
-"""Retention: pruning old runs in small batches (section 7, "Retention")."""
+"""Retention: pruning old runs in small batches."""
 
 from __future__ import annotations
 
@@ -66,8 +66,8 @@ async def retention_loop(
                 store, policy, now_ms=to_ms(clock.now()), keep_digests=keep_digests()
             )
         except Exception:
-            # Design note: like each trigger task (section 8), the loop logs a failure and
-            # keeps its schedule, so one bad pass never stops retention for good.
+            # Like each trigger task, the loop logs a failure and keeps its schedule, so one
+            # bad pass never stops retention for good.
             _log.exception("retention failed; trying again in %s", format_duration(policy.interval))
         else:
             if stats != PruneStats():

@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import itertools
 import random
+from collections.abc import Callable
+from typing import ClassVar
 
 import pytest
 from tests.support.builders import make_step, make_workflow
@@ -188,6 +190,27 @@ async def test_the_step_timeout_bounds_each_attempt(engine: Engine, fake: FakeSt
     assert build.attempts[0].error == "timed out after 10s"
     assert [attempt.duration_ms for attempt in build.attempts] == [10_000, 10_000, 5_000]
     assert build.status is StepStatus.SUCCEEDED
+
+
+class StubbornStep(FakeStep):
+    """A fake step type whose attempts, like a file step's thread, can't be interrupted."""
+
+    interruptible: ClassVar[bool] = False
+
+
+async def test_a_timeout_of_a_step_type_that_cant_be_interrupted_is_final(
+    make_engine: Callable[..., Engine],
+) -> None:
+    engine = make_engine(StubbornStep("stubborn", default=Hang()))
+    policy = RetryPolicy(attempts=3, delay=1.0)
+
+    detail = await engine.execute(
+        make_workflow(make_step("copy", uses="stubborn", timeout=10, retry=policy))
+    )
+
+    copy = step_of(detail, "copy")
+    assert (copy.status, copy.error) == (StepStatus.TIMED_OUT, "timed out after 10s")
+    assert [attempt.status for attempt in copy.attempts] == [A.TIMED_OUT]
 
 
 async def test_a_final_timeout_makes_the_step_timed_out(engine: Engine, fake: FakeStep) -> None:

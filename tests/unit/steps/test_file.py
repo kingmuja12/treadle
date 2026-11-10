@@ -252,6 +252,88 @@ async def test_an_overwriting_directory_copy_merges(rt: StepRuntime, project: Pa
     assert (project / "copy" / "b.txt").read_text() == "old b"
 
 
+@pytest.fixture
+def build(project: Path) -> Path:
+    """A source tree: build/index.html and build/assets/app.js."""
+    (project / "build" / "assets").mkdir(parents=True)
+    (project / "build" / "index.html").write_text("new build")
+    (project / "build" / "assets" / "app.js").write_text("new app")
+    (project / "site").mkdir()
+    return project / "build"
+
+
+async def merge(rt: StepRuntime) -> StepResult:
+    return await perform(
+        rt, action="copy", source="build", path="site", recursive=True, overwrite=True
+    )
+
+
+async def test_a_merging_copy_never_follows_a_link_out_of_the_file_roots(
+    rt: StepRuntime, project: Path, tmp_path: Path, build: Path
+) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "index.html").write_text("someone else's page")
+    (project / "site" / "assets").symlink_to(outside)
+
+    with pytest.raises(PathNotAllowedError) as through_directory:
+        await merge(rt)
+    (project / "site" / "assets").unlink()
+    (project / "site" / "index.html").symlink_to(outside / "index.html")
+    with pytest.raises(PathNotAllowedError) as through_file:
+        await merge(rt)
+
+    site = project / "site"
+    assert through_directory.value.message == (
+        f"refusing to copy through {site / 'assets'}: it links to {outside}, outside the file roots"
+    )
+    assert through_file.value.message == (
+        f"refusing to copy through {site / 'index.html'}: it links to "
+        f"{outside / 'index.html'}, outside the file roots"
+    )
+    assert entries(outside) == ["index.html"]
+    assert (outside / "index.html").read_text() == "someone else's page"
+    assert entries(site) == ["index.html"]
+
+
+async def test_a_merging_copy_never_follows_a_link_into_the_state_directory(
+    rt: StepRuntime, project: Path, build: Path
+) -> None:
+    rt.state_dir.chmod(0o700)
+    (rt.state_dir / "treadle.db").write_text("live")
+    (rt.state_dir / "index.html").write_text("state file")
+    (project / "site" / "cache").symlink_to(rt.state_dir)
+    (build / "cache").mkdir()
+    (build / "cache" / "treadle.db").write_text("overwritten")
+
+    with pytest.raises(PathNotAllowedError) as caught:
+        await merge(rt)
+
+    assert caught.value.message == (
+        f"refusing to copy through {project / 'site' / 'cache'}: it links into the state "
+        f"directory {rt.state_dir}"
+    )
+    assert (rt.state_dir / "treadle.db").read_text() == "live"
+    assert mode_of(rt.state_dir) == 0o700
+    assert entries(project / "site") == ["cache"]
+
+
+async def test_a_merging_copy_follows_a_link_that_stays_in_the_file_roots(
+    rt: StepRuntime, project: Path, build: Path
+) -> None:
+    shared = project / "shared-assets"
+    shared.mkdir()
+    (project / "site" / "assets").symlink_to(shared)
+    (build / "latest").symlink_to("index.html")  # a link of the source is copied as a link
+
+    await merge(rt)
+
+    assert (shared / "app.js").read_text() == "new app"
+    assert (project / "site" / "index.html").read_text() == "new build"
+    assert (project / "site" / "assets").is_symlink()
+    assert os.readlink(project / "site" / "latest") == "index.html"
+
+
 async def test_copy_refuses_a_directory_into_itself(rt: StepRuntime, project: Path) -> None:
     (project / "tree").mkdir()
 
@@ -593,6 +675,102 @@ async def test_a_directory_copy_never_merges_into_the_state_directory(
     assert not (rt.state_dir / "treadle.db").exists()
 
 
+@pytest.mark.parametrize(
+    ("raw", "message"),
+    [
+        pytest.param(
+            {"action": "write", "path": "notes\0.txt"},
+            "path holds a NUL character, which the operating system doesn't accept",
+            id="path",
+        ),
+        pytest.param(
+            {"action": "delete", "path": "~user\0"},
+            "path holds a NUL character, which the operating system doesn't accept",
+            id="path-with-a-user",
+        ),
+        pytest.param(
+            {"action": "copy", "source": "in\ud800.txt", "path": "out.txt"},
+            "source holds text that isn't valid Unicode, which the operating system doesn't accept",
+            id="source",
+        ),
+        pytest.param(
+            {"action": "append", "path": "log.txt", "content": "bad \ud800"},
+            "content holds text that isn't valid Unicode, which can't be written as UTF-8",
+            id="content",
+        ),
+    ],
+)
+async def test_a_value_that_cant_reach_the_file_system_is_a_config_error(
+    rt: StepRuntime, project: Path, raw: dict[str, object], message: str
+) -> None:
+    with pytest.raises(StepConfigError) as caught:
+        await perform(rt, **raw)
+
+    assert caught.value.message == message
+    assert caught.value.retryable is False
+    assert entries(project) == [".treadle"]
+
+
+def case_insensitive(directory: Path) -> bool:
+    """True when the file system of `directory` ignores letter case, as APFS does by default."""
+    probe = directory / "case-probe"
+    probe.touch()
+    try:
+        return (directory / "CASE-PROBE").exists()
+    finally:
+        probe.unlink()
+
+
+@pytest.fixture
+def ignores_case(project: Path) -> None:
+    if not case_insensitive(project):
+        pytest.skip("the file system distinguishes letter case")
+
+
+@pytest.mark.usefixtures("ignores_case")
+async def test_letter_case_never_gets_past_the_protected_paths(
+    rt: StepRuntime, project: Path
+) -> None:
+    database = rt.state_dir / "treadle.db"
+    database.write_text("live")
+    (project / "copy-me").mkdir()
+
+    with pytest.raises(PathNotAllowedError, match="in the state directory"):
+        await perform(rt, action="write", path=".TREADLE/treadle.db", overwrite=True)
+    with pytest.raises(PathNotAllowedError, match="in the state directory"):
+        await perform(rt, action="delete", path=".Treadle", recursive=True)
+    with pytest.raises(PathNotAllowedError, match="protected path"):
+        await perform(rt, action="delete", path=str(project).upper(), recursive=True)
+    with pytest.raises(PathNotAllowedError, match="in the state directory"):
+        await perform(rt, action="copy", source="copy-me", path=".TREADLE/copy", recursive=True)
+
+    assert database.read_text() == "live"
+    assert (project / "copy-me").is_dir()
+
+
+@pytest.mark.usefixtures("ignores_case")
+async def test_another_spelling_of_a_file_root_is_the_same_root(
+    rt: StepRuntime, project: Path
+) -> None:
+    respelled = project.parent / project.name.upper()
+
+    result = await perform(rt, action="write", path=str(respelled / "notes.txt"), content="x")
+
+    assert result.outputs["path"] == str(respelled / "notes.txt")
+    assert (project / "notes.txt").read_text() == "x"
+
+
+async def test_deleting_a_symlink_to_a_protected_directory_removes_only_the_link(
+    rt: StepRuntime, project: Path
+) -> None:
+    (project / "state-link").symlink_to(rt.state_dir)
+
+    await perform(rt, action="delete", path="state-link")
+
+    assert not (project / "state-link").is_symlink()
+    assert rt.state_dir.is_dir()
+
+
 def test_resolve_path_follows_the_final_symlink_only_when_asked(
     rt: StepRuntime, project: Path
 ) -> None:
@@ -686,3 +864,4 @@ def test_the_step_type_attributes() -> None:
     assert step.name == "file"
     assert step.output_names == step.reserved_outputs == {"path", "bytes", "changed"}
     assert step.taint_sinks == {"path": "path", "source": "path"}
+    assert step.interruptible is False

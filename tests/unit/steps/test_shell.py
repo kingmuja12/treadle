@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from typing import cast
 
 import pytest
-from tests.support.builders import static_template
+from tests.support.builders import make_runtime, static_template
+from tests.support.fakes import RecordingProcesses
 
 from treadle.errors import StepConfigError
 from treadle.models import ShellSpec
@@ -228,6 +231,60 @@ def test_parse_output_file_rejects_malformed_content(text: str, message: str) ->
         parse_output_file(text)
 
     assert caught.value.retryable is False
+
+
+REFUSED = "which the operating system doesn't accept"
+
+
+@pytest.mark.parametrize(
+    ("raw", "env", "message"),
+    [
+        pytest.param(
+            {"run": "true"},
+            {"REF": "main\0"},
+            f"the environment variable REF holds a NUL character, {REFUSED}",
+            id="env-nul",
+        ),
+        pytest.param(
+            {"run": "true"},
+            {"REF": "main\ud800"},
+            f"the environment variable REF holds text that isn't valid Unicode, {REFUSED}",
+            id="env-surrogate",
+        ),
+        pytest.param(
+            {"argv": ["echo", "a\0b"]}, {}, f"argv[1] holds a NUL character, {REFUSED}", id="argv"
+        ),
+        pytest.param(
+            {"argv": ["\ud800"]},
+            {},
+            f"argv[0] holds text that isn't valid Unicode, {REFUSED}",
+            id="program",
+        ),
+        pytest.param(
+            {"run": "true", "cwd": "dir\0"}, {}, f"cwd holds a NUL character, {REFUSED}", id="cwd"
+        ),
+        pytest.param(
+            {"run": "true", "cwd": "~user\0"},
+            {},
+            f"cwd holds a NUL character, {REFUSED}",
+            id="cwd-with-a-user",
+        ),
+    ],
+)
+async def test_a_value_that_a_process_cant_receive_is_a_config_error(
+    tmp_path: Path, raw: dict[str, object], env: dict[str, str], message: str
+) -> None:
+    processes = RecordingProcesses()
+    rt = make_runtime(tmp_path, env={"PATH": os.defpath, **env}, processes=processes)
+    value, issues = validate(ShellStep().schema, raw)
+    assert issues == []
+
+    with pytest.raises(StepConfigError) as caught:
+        await ShellStep().run(cast(dict[str, JSONValue], value), rt)
+
+    assert caught.value.message == message
+    assert caught.value.retryable is False
+    assert processes.history == []
 
 
 def test_the_step_type_attributes() -> None:

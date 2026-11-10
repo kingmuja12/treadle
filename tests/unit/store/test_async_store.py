@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import stat
 import threading
+from collections.abc import Callable
 from contextlib import closing
 from pathlib import Path
 from typing import Literal
@@ -17,7 +18,7 @@ from treadle.store.async_store import AsyncStore
 from treadle.store.db import connect
 from treadle.store.migrations import CURRENT_VERSION, MIGRATIONS, Migration, migrate, schema_version
 from treadle.store.repo import NewLogLine, Repository
-from treadle.types import ExitCode
+from treadle.types import ExitCode, JSONObject
 
 
 def mode(path: Path) -> int:
@@ -94,6 +95,29 @@ async def test_client_mode_reads_and_writes_without_migrating(
     assert [(request.id, request.payload) for request in claimed] == [
         (request_id, {"run_id": run.id})
     ]
+
+
+async def test_a_client_withdraws_a_control_request_that_nothing_claimed(
+    settings: Settings, store: AsyncStore
+) -> None:
+    withdrawn: JSONObject = {"error": {"code": "expired", "message": "the CLI stopped waiting"}}
+
+    def withdraw(request_id: int) -> Callable[[Repository], bool]:
+        return lambda repo: repo.withdraw_control(request_id, withdrawn, at_ms=T0 + 1)
+
+    client = await AsyncStore.open(settings, mode="client", inline=True)
+    try:
+        claimed = await client.write(lambda repo: repo.enqueue_control("cancel", {}, at_ms=T0))
+        waiting = await client.write(lambda repo: repo.enqueue_control("cancel", {}, at_ms=T0))
+        await store.write(lambda repo: repo.claim_controls(at_ms=T0, limit=1))
+
+        assert not await client.write(withdraw(claimed))
+        assert await client.write(withdraw(waiting))
+    finally:
+        await client.close()
+
+    assert await store.read(lambda repo: repo.control_result(claimed)) is None
+    assert await store.read(lambda repo: repo.control_result(waiting)) == withdrawn
 
 
 @pytest.mark.parametrize("open_mode", ["owner", "client"])

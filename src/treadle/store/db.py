@@ -1,4 +1,4 @@
-"""SQLite connections with the pragmas of section 7 ("Connections and transactions")."""
+"""SQLite connections with Treadle's pragmas and explicit transaction control."""
 
 from __future__ import annotations
 
@@ -62,6 +62,10 @@ def connect(path: Path, *, query_only: bool = False) -> sqlite3.Connection:
 
 def _open(target: str, *, uri: bool) -> sqlite3.Connection:
     """Connect without implicit transactions; Treadle issues BEGIN and COMMIT itself."""
+    # An if/else lets mypy skip the branch that the target version rules out. A `return`
+    # after an `if` that always returns would be reported as unreachable on Python 3.12+.
     if sys.version_info >= (3, 12):
-        return sqlite3.connect(target, uri=uri, check_same_thread=False, autocommit=True)
-    return sqlite3.connect(target, uri=uri, check_same_thread=False, isolation_level=None)
+        conn = sqlite3.connect(target, uri=uri, check_same_thread=False, autocommit=True)
+    else:
+        conn = sqlite3.connect(target, uri=uri, check_same_thread=False, isolation_level=None)
+    return conn

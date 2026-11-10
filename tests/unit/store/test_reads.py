@@ -18,6 +18,7 @@ from treadle.models import (
     Workflow,
 )
 from treadle.store.repo import NewLogLine, Repository
+from treadle.types import JSONObject
 
 FAILED_OR_QUEUED = frozenset({RunStatus.FAILED, RunStatus.QUEUED})
 
@@ -254,3 +255,32 @@ def test_completing_an_unclaimed_request_consumes_it(repo: Repository) -> None:
 
     assert repo.claim_controls(at_ms=T0 + 2) == []
     assert repo.control_result(request_id) == {"error": {"code": "not_found"}}
+
+
+WITHDRAWN: JSONObject = {"error": {"code": "expired", "message": "the CLI stopped waiting"}}
+
+
+def test_withdrawing_an_unclaimed_request_consumes_it_with_the_result(repo: Repository) -> None:
+    request_id = repo.enqueue_control("run", {"workflow": "hello"}, at_ms=T0)
+
+    assert repo.withdraw_control(request_id, WITHDRAWN, at_ms=T0 + 1)
+
+    assert repo.claim_controls(at_ms=T0 + 2) == []
+    assert repo.control_result(request_id) == WITHDRAWN
+    assert not repo.withdraw_control(request_id, {"error": {"code": "again"}}, at_ms=T0 + 3)
+    assert repo.control_result(request_id) == WITHDRAWN
+
+
+def test_a_claimed_request_cant_be_withdrawn(repo: Repository) -> None:
+    request_id = repo.enqueue_control("cancel", {"run_id": 1, "force": False}, at_ms=T0)
+    repo.claim_controls(at_ms=T0 + 1)
+
+    assert not repo.withdraw_control(request_id, WITHDRAWN, at_ms=T0 + 2)
+    assert repo.control_result(request_id) is None
+
+    repo.complete_control(request_id, {"outcome": "cancelled"}, at_ms=T0 + 3)
+    assert repo.control_result(request_id) == {"outcome": "cancelled"}
+
+
+def test_withdrawing_a_missing_request_does_nothing(repo: Repository) -> None:
+    assert not repo.withdraw_control(404, WITHDRAWN, at_ms=T0)

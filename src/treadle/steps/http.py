@@ -5,12 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 import math
+import zlib
 from collections.abc import Mapping, Sequence
+from http.cookiejar import CookieJar, DefaultCookiePolicy
 from typing import ClassVar, Final, Literal, NoReturn, cast
 from urllib.parse import urlencode
 
 import httpx
 
+from treadle import __version__
 from treadle.errors import StepConfigError, StepError
 from treadle.schema import (
     AnyJSON,
@@ -26,20 +29,24 @@ from treadle.schema import (
     Size,
     Str,
 )
-from treadle.steps.base import StepResult, StepRuntime
+from treadle.steps.base import StepLog, StepResult, StepRuntime
 from treadle.types import Issue, JSONValue, Severity, YamlPath
 from treadle.units import format_duration, format_size
 
 _METHODS: Final = Str(choices=("GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"))
 _TEXT: Final = Str()
 _JSON: Final = AnyJSON()
-# Design note: status codes are 100-599.
+# Status codes are 100-599.
 _STATUS_CODE: Final = Int(min=100, max=599)
 _STATUS_CLASS: Final = Str(choices=("1xx", "2xx", "3xx", "4xx", "5xx"))
 _STATUS_EITHER: Final = AnyOf(_STATUS_CODE, _STATUS_CLASS)
 _BODY_EXCERPT: Final = 2048
 _MAX_JSON_DEPTH: Final = 64
 _OUTPUTS: Final = frozenset({"status", "headers", "body", "json", "url", "elapsed_ms"})
+MAX_REDIRECTS: Final = 5
+# The zlib window bits of each content encoding that the step decodes itself.
+_WBITS: Final[Mapping[str, int]] = {"gzip": zlib.MAX_WBITS | 16, "deflate": zlib.MAX_WBITS}
+_ACCEPT_ENCODING: Final = ", ".join(_WBITS)
 
 
 class _Method:
@@ -114,9 +121,9 @@ _SCHEMA: Final = Obj(
         "query": Field(MapOf(_QueryValue()), default={}),
         "json": Field(AnyJSON()),
         "body": Field(Str()),
-        # Design note: a request needs some time, and no step timeout is longer than 24h.
+        # A request needs some time, and no step timeout is longer than 24h.
         "timeout": Field(Duration(min=0.001, max=86400.0), default=30.0),
-        # Design note: an empty list could never succeed.
+        # An empty list could never succeed.
         "expect": Field(ListOf(_Status(), min_len=1), default=["2xx"]),
         "follow_redirects": Field(Bool(), default=False),
         "max_response_bytes": Field(Size(max=10 << 20), default=1 << 20),
@@ -138,24 +145,25 @@ class HttpStep:
 
     @property
     def schema(self) -> Obj:
-        """The `with` keys of the `http` table in section 2."""
+        """The `with` keys of an `http` step, such as `url`, `method`, and `expect`."""
         return _SCHEMA
 
     def check(self, params: Mapping[str, object], path: YamlPath) -> list[Issue]:
         """Return no issues: the schema covers every rule that the parameters alone decide.
 
-        Design note: comparing a static `timeout` with the step timeout needs the step, which
-        this signature doesn't receive, so the loader reports that E407 (section 2's E407 row).
+        Comparing a static `timeout` with the step timeout needs the step, which this
+        signature doesn't receive, so the loader reports that E407.
         """
         return []
 
     async def run(self, params: Mapping[str, JSONValue], rt: StepRuntime) -> StepResult:
         """Send the request, log one system line, and return the response outputs.
 
-        `timeout` covers the whole exchange, including the body. Transport errors and the
-        timeout raise a retryable StepError. A body larger than `max_response_bytes` raises
-        StepConfigError while it streams. A status outside `expect` raises a StepError that
-        carries the outputs.
+        `timeout` covers the whole exchange, including redirects and the body. Transport
+        errors and the timeout raise a retryable StepError. A body larger than
+        `max_response_bytes` raises StepConfigError while it streams. A status outside
+        `expect` raises a StepError that carries the outputs. The step sends no cookie that
+        the shared client's jar holds; see `_send`.
         """
         method, url = cast(str, params["method"]), cast(str, params["url"])
         timeout = cast(float, params["timeout"])
@@ -165,7 +173,7 @@ class HttpStep:
         started = loop.time()
         try:
             async with asyncio.timeout(timeout):
-                response = await rt.http.send(request, stream=True, follow_redirects=follow)
+                response = await _send(rt.http, request, follow=follow)
                 try:
                     body = await _read_capped(response, cast(int, params["max_response_bytes"]))
                 finally:
@@ -181,12 +189,28 @@ class HttpStep:
             raise
         elapsed_ms = round((loop.time() - started) * 1000)
         rt.log.system(f"{method} {url} -> {response.status_code} ({elapsed_ms} ms)")
-        outputs = _outputs(response, body, elapsed_ms)
+        outputs = _outputs(response, _text(response, body, rt.log), elapsed_ms)
         expect = cast("list[int | str]", params["expect"])
         if not status_matches(response.status_code, expect):
             message = _status_message(response, method, url, expect, str(outputs["body"]))
             raise StepError(message, outputs=outputs)
         return StepResult(outputs)
+
+
+def shared_client(*, transport: httpx.AsyncBaseTransport | None = None) -> httpx.AsyncClient:
+    """Return a client for every `http` step to share.
+
+    It sends `User-Agent: treadle/<version>`, lets a step follow up to `MAX_REDIRECTS`
+    redirects, and has a cookie jar that never stores or returns a cookie, so no cookie
+    passes from one request to another. `transport` replaces the network, as
+    `httpx.MockTransport` does in tests.
+    """
+    return httpx.AsyncClient(
+        transport=transport,
+        max_redirects=MAX_REDIRECTS,
+        headers={"User-Agent": f"treadle/{__version__}"},
+        cookies=CookieJar(policy=DefaultCookiePolicy(allowed_domains=[])),
+    )
 
 
 def status_matches(code: int, expect: Sequence[int | str]) -> bool:
@@ -212,19 +236,55 @@ def _build_request(
     url: str,
     timeout: float,
 ) -> httpx.Request:
-    """Build the request; a value that can't be sent, such as a non-ASCII header, fails it."""
+    """Build the request; a value that can't be sent, such as a non-ASCII header, fails it.
+
+    The request carries only the cookies that the workflow's headers set, never one from the
+    client's jar, and asks only for the content encodings that `_read_capped` decodes.
+    """
     content = params.get("body")
     try:
         headers = httpx.Headers(cast("dict[str, str]", params["headers"]))
         if "json" in params:
             content = json.dumps(params["json"], ensure_ascii=False, separators=(",", ":"))
             headers.setdefault("content-type", "application/json")
+        headers.setdefault("accept-encoding", _ACCEPT_ENCODING)
         target = _with_query(url, cast("dict[str, JSONValue]", params["query"]))
-        return client.build_request(
+        request = client.build_request(
             method, target, headers=headers, content=cast("str | None", content), timeout=timeout
         )
     except (ValueError, httpx.InvalidURL) as exc:
         raise StepConfigError(f"can't build the {method} request: {exc}") from exc
+    if "cookie" not in headers:
+        request.headers.pop("cookie", None)
+    return request
+
+
+async def _send(
+    client: httpx.AsyncClient, request: httpx.Request, *, follow: bool
+) -> httpx.Response:
+    """Send a request and, with `follow`, its redirects, up to the client's `max_redirects`.
+
+    The step follows redirects itself, so it can close each redirect response without
+    reading its body, which no limit would bound. httpx builds each next request, which
+    keeps its rules for the method and the `Authorization` header. Cookies that a redirect
+    sets reach the later requests of this exchange only, and the client's jar adds none.
+    Too many redirects raise httpx.TooManyRedirects.
+    """
+    cookies = httpx.Cookies()
+    redirects = 0
+    while True:
+        response = await client.send(request, stream=True, follow_redirects=False)
+        following = response.next_request
+        if not follow or following is None:
+            return response
+        cookies.extract_cookies(response)
+        await response.aclose()
+        if redirects == client.max_redirects:
+            raise httpx.TooManyRedirects("Exceeded maximum allowed redirects.", request=following)
+        redirects += 1
+        following.headers.pop("cookie", None)
+        cookies.set_cookie_header(following)
+        request = following
 
 
 def _with_query(url: str, query: Mapping[str, JSONValue]) -> httpx.URL:
@@ -242,7 +302,7 @@ def _with_query(url: str, query: Mapping[str, JSONValue]) -> httpx.URL:
 
 
 def _display(value: JSONValue) -> str:
-    """Section 3's display string of a scalar query value; null is an empty value."""
+    """Return a scalar query value as a template renders it; null is an empty value."""
     if value is None:
         return ""
     if isinstance(value, bool):
@@ -253,14 +313,69 @@ def _display(value: JSONValue) -> str:
 
 
 async def _read_capped(response: httpx.Response, limit: int) -> bytes:
-    """Read the decoded body, failing as soon as it grows past `limit` bytes."""
+    """Read and decode the body, failing as soon as it grows past `limit` bytes.
+
+    The step decodes gzip and deflate itself, and never inflates more than one byte past
+    the limit, so a small compressed body can't take much memory. Other encodings pass
+    through undecoded, as httpx passes those it doesn't support. A body compressed more than
+    once raises StepConfigError, and one that doesn't decode raises httpx.DecodingError.
+    """
+    if response.is_stream_consumed:
+        # A transport may hand over a body that it has read and decoded already, as
+        # httpx.MockTransport does. It's in memory by now, so only the limit is left to check.
+        if len(response.content) > limit:
+            raise _too_large(limit)
+        return response.content
+    decoder = _decoder(response)
     body = bytearray()
-    async for chunk in response.aiter_bytes():
-        body += chunk
+    async for chunk in response.aiter_raw():
+        body += chunk if decoder is None else decoder.decode(chunk, limit - len(body) + 1)
         if len(body) > limit:
-            message = f"the response is larger than max_response_bytes ({format_size(limit)})"
-            raise StepConfigError(message)
+            raise _too_large(limit)
     return bytes(body)
+
+
+def _too_large(limit: int) -> StepConfigError:
+    return StepConfigError(f"the response is larger than max_response_bytes ({format_size(limit)})")
+
+
+class _Inflater:
+    """Decodes one gzip or deflate layer, producing at most `max_length` bytes per call.
+
+    Like httpx, a deflate body may come with or without its zlib header.
+    """
+
+    def __init__(self, encoding: str) -> None:
+        self._raw_fallback = encoding == "deflate"
+        self._zlib = zlib.decompressobj(_WBITS[encoding])
+
+    def decode(self, data: bytes, max_length: int) -> bytes:
+        """Decode `data`. Raises httpx.DecodingError for data that isn't valid."""
+        fallback, self._raw_fallback = self._raw_fallback, False
+        try:
+            return self._zlib.decompress(data, max_length)
+        except zlib.error as exc:
+            if not fallback:
+                raise httpx.DecodingError(str(exc)) from exc
+        # The start of the deflate body had no zlib header, so it's raw deflate data.
+        self._zlib = zlib.decompressobj(-zlib.MAX_WBITS)
+        return self.decode(data, max_length)
+
+
+def _decoder(response: httpx.Response) -> _Inflater | None:
+    """Return the decoder for the response's gzip or deflate layer, or None without one.
+
+    Raises StepConfigError for a body with more than one such layer.
+    """
+    values = response.headers.get_list("content-encoding", split_commas=True)
+    encodings = [value.strip().lower() for value in values]
+    layers = [encoding for encoding in encodings if encoding in _WBITS]
+    if len(layers) > 1:
+        raise StepConfigError(
+            f"the response is compressed more than once (Content-Encoding: "
+            f"{', '.join(encodings)}), which the http step doesn't decode"
+        )
+    return _Inflater(layers[0]) if layers else None
 
 
 def _request_failed(rt: StepRuntime, method: str, url: str, problem: str) -> StepError:
@@ -268,8 +383,21 @@ def _request_failed(rt: StepRuntime, method: str, url: str, problem: str) -> Ste
     return StepError(f"{method} {url} failed: {problem}")
 
 
-def _outputs(response: httpx.Response, body: bytes, elapsed_ms: int) -> dict[str, JSONValue]:
-    text = body.decode(response.encoding or "utf-8", "replace")
+def _text(response: httpx.Response, body: bytes, log: StepLog) -> str:
+    """Decode the body with the response encoding and `errors="replace"`.
+
+    A charset that names a codec that can't decode text this way, such as `base64` or
+    `idna`, is ignored with a system line, and the body is decoded as UTF-8 instead.
+    """
+    encoding = response.encoding or "utf-8"
+    try:
+        return body.decode(encoding, "replace")
+    except (LookupError, UnicodeError):
+        log.system(f"the response charset {encoding} can't decode text; decoded the body as UTF-8")
+        return body.decode("utf-8", "replace")
+
+
+def _outputs(response: httpx.Response, text: str, elapsed_ms: int) -> dict[str, JSONValue]:
     headers: dict[str, JSONValue] = dict(response.headers.items())
     return {
         "status": response.status_code,
@@ -287,7 +415,7 @@ def _parse_json(response: httpx.Response, text: str) -> JSONValue:
     None also stands for a body that doesn't parse, holds NaN or an infinite number, or
     nests deeper than 64 levels.
     """
-    # Design note: response bodies are untrusted, so the `json` output keeps the limits that
+    # Response bodies are untrusted, so the `json` output keeps the limits that
     # fromJSON and webhook payloads have: finite numbers and at most 64 levels of nesting.
     media = response.headers.get("content-type", "").split(";")[0].strip().lower()
     if media != "application/json" and not media.endswith("+json"):
@@ -328,5 +456,17 @@ def _status_message(
     if response.next_request is not None:
         target = response.next_request.url
         message += f"; the server redirected to {target}; set follow_redirects: true to follow it"
-    excerpt = body[:_BODY_EXCERPT].strip()
+    excerpt = _excerpt(body)
     return f"{message}: {excerpt}" if excerpt else message
+
+
+def _excerpt(body: str) -> str:
+    """Return the first 2 KiB of the body, without a line that the cut splits.
+
+    The step can't mask, and masking only recognizes whole values, so the start of a secret
+    that the cut splits would otherwise be stored with the error.
+    """
+    head = body[:_BODY_EXCERPT]
+    if len(body) > _BODY_EXCERPT and body[_BODY_EXCERPT] not in "\r\n":
+        head = head[: head.rfind("\n") + 1]
+    return head.strip()

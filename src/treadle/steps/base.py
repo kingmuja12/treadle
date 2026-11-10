@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
 from treadle.config import Limits
+from treadle.errors import StepConfigError
 from treadle.models import LogStream, ShellSpec
 from treadle.protocols import ProcessTracker
 from treadle.schema import Obj
@@ -67,7 +69,13 @@ class StepResult:
 
 
 class StepType(Protocol):
-    """A kind of step, named by `uses:`."""
+    """A kind of step, named by `uses:`.
+
+    A step type whose work a cancellation can't stop, such as a file operation in a thread,
+    sets the class attribute `interruptible = False`. Its cancelled attempt waits for the work
+    to end, so a timeout is final: a retry would repeat work that may have finished. Without
+    the attribute, a step type is interruptible.
+    """
 
     @property
     def name(self) -> str:
@@ -123,3 +131,22 @@ class StepRegistry:
     def names(self) -> list[str]:
         """Return the registered names, sorted."""
         return sorted(self._types)
+
+
+def check_os_text(text: str, what: str) -> None:
+    """Raise StepConfigError when `text` can't be a path, an argument, or an environment value.
+
+    The operating system refuses text with a NUL character, or with a lone surrogate that the
+    file system encoding can't encode, and untrusted data, such as a webhook field, can hold
+    either. The message names `what`, never the text.
+    """
+    if "\0" in text:
+        problem = "a NUL character"
+    else:
+        try:
+            os.fsencode(text)
+        except UnicodeEncodeError:
+            problem = "text that isn't valid Unicode"
+        else:
+            return
+    raise StepConfigError(f"{what} holds {problem}, which the operating system doesn't accept")

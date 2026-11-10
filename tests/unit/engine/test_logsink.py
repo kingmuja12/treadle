@@ -14,14 +14,14 @@ from tests.support.vtime import current_loop
 from tests.unit.engine.helpers import Engine
 
 from treadle.config import Limits
-from treadle.engine.logsink import LogSink
+from treadle.engine.logsink import MAX_RUNTIME_MASKS, LogSink
 from treadle.engine.masking import Masker
 from treadle.models import LogLine, LogStream
+from treadle.steps.procs import TRUNCATION_MARKER as CUT
 from treadle.steps.procs import LineBuffer
 from treadle.store.async_store import AsyncStore
 
 OUT, ERR, SYSTEM = LogStream.STDOUT, LogStream.STDERR, LogStream.SYSTEM
-CUT = " [line truncated]"
 
 
 @pytest.fixture
@@ -154,10 +154,22 @@ async def test_a_line_the_step_already_cut_keeps_one_marker(
     log = sink.attempt_log("s", 1)
 
     log.write(OUT, "y" * 30 + CUT)
-    log.write(OUT, "short" + CUT)  # a short line that merely ends like a marker
+    log.write(OUT, "ok" + CUT)  # a short line that merely ends like a marker
 
     await sink.flush()
-    assert await texts(store, run_id) == ["y" * 20 + CUT, "short" + CUT]
+    assert await texts(store, run_id) == ["y" * 20 + CUT, "ok" + CUT]
+
+
+async def test_a_line_that_fits_the_limit_and_ends_like_a_marker_is_kept_whole(
+    store: AsyncStore, run_id: int, clock: FakeClock
+) -> None:
+    sink = make_sink(store, run_id, clock, masker=Masker(["SECRET-VALUE"]), line_bytes=20)
+    line = "xyz" + CUT  # exactly 20 bytes, which the line buffer never cuts
+
+    sink.attempt_log("s", 1).write(OUT, line)
+
+    await sink.flush()
+    assert await texts(store, run_id) == [line]
 
 
 async def test_a_secret_that_crosses_a_chunk_boundary_is_masked(
@@ -260,15 +272,67 @@ async def test_add_mask_masks_the_rest_of_the_run(
     ]
 
 
+async def test_a_run_masks_at_most_a_thousand_added_values(
+    store: AsyncStore, run_id: int, clock: FakeClock
+) -> None:
+    sink = make_sink(store, run_id, clock)
+    first, second = sink.attempt_log("a", 1), sink.attempt_log("b", 1)
+    first.add_mask("value-0000")
+    first.add_mask("value-0000")  # a known value doesn't count again
+    for index in range(1, MAX_RUNTIME_MASKS):
+        first.add_mask(f"value-{index:04d}")
+
+    first.add_mask("value-0000")  # known already, so nothing new to mask
+    first.add_mask("abc")  # too short to mask
+    first.write(OUT, "still kept: value-0999")
+    assert not first.refused_mask
+    second.add_mask("one-too-many")
+    second.write(OUT, "dropped: one-too-many")
+    second.add_mask("another-one")
+    first.write(OUT, "the first attempt goes on")
+
+    await sink.aclose()
+    assert (second.refused_mask, second.truncated, first.refused_mask) == (True, True, False)
+    assert await texts(store, run_id) == [
+        "still kept: ***",
+        "output truncated: the run masks at most 1000 values from ::add-mask::, so further "
+        "output from this step is dropped",
+        "the first attempt goes on",
+        f"dropped {len('dropped: one-too-many') + 1} bytes of output",
+    ]
+
+
+async def test_a_refused_mask_after_the_step_cap_adds_no_second_notice(
+    store: AsyncStore, run_id: int, clock: FakeClock
+) -> None:
+    sink = make_sink(store, run_id, clock, step_log_bytes=10)
+    log = sink.attempt_log("s", 1)
+    for index in range(MAX_RUNTIME_MASKS):
+        log.add_mask(f"value-{index:04d}")
+    log.write(OUT, "x" * 20)  # passes the step cap
+
+    log.add_mask("one-too-many")
+
+    await sink.aclose()
+    assert log.refused_mask
+    assert await texts(store, run_id) == [
+        "output truncated: further output from this step is dropped (limit 10 B)",
+        "dropped 21 bytes of output",
+    ]
+
+
 async def test_lone_surrogates_are_stored_as_replacement_characters(
     store: AsyncStore, run_id: int, clock: FakeClock
 ) -> None:
     sink = make_sink(store, run_id, clock)
 
-    sink.attempt_log("s", 1).write(OUT, "bad \ud800 char")
+    log = sink.attempt_log("s", 1)
+
+    log.write(OUT, "bad \ud800 char")
 
     await sink.flush()
-    assert await texts(store, run_id) == ["bad ? char"]
+    assert await texts(store, run_id) == ["bad \ufffd char"]
+    assert log.bytes_written == len("bad \ufffd char".encode()) + 1
 
 
 async def test_aclose_is_idempotent_and_later_lines_are_discarded(

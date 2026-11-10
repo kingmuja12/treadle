@@ -11,6 +11,7 @@ from tests.unit.engine.helpers import Engine, statuses, step_of
 
 from treadle.config import Limits
 from treadle.models import RunStatus, StepStatus, Workflow
+from treadle.secrets import SecretSnapshot
 
 
 async def test_declared_outputs_see_result_and_merge_over_the_raw_outputs(
@@ -172,6 +173,44 @@ async def test_outputs_are_masked_in_storage_but_not_downstream(
         "header": "Bearer ***",
     }
     assert fake.calls_for("call")[0].params == {"message": f"Bearer {API_TOKEN}"}
+
+
+async def test_a_number_that_holds_a_secret_is_masked_in_storage_but_not_downstream(
+    engine: Engine,
+    fake: FakeStep,
+    load_workflow: Callable[..., Workflow],
+    secret_snapshot: Callable[..., SecretSnapshot],
+) -> None:
+    engine.secrets.snapshot = secret_snapshot(CHAT_ID="834512907")
+    fake.script("send", Succeed({"chat": {"id": 834512907}, "ok": True, "count": 2}))
+    workflow = load_workflow(
+        """
+        steps:
+          - id: send
+            uses: fake
+          - id: use
+            uses: fake
+            with:
+              value: ${{ steps.send.outputs.chat.id }}
+        """
+    )
+
+    detail = await engine.execute(workflow)
+
+    assert step_of(detail, "send").outputs == {"chat": {"id": "***"}, "ok": True, "count": 2}
+    assert fake.calls_for("use")[0].params == {"value": 834512907}
+
+
+async def test_outputs_that_arent_valid_unicode_are_stored_with_replacement_characters(
+    engine: Engine, fake: FakeStep
+) -> None:
+    # A lone surrogate, as fromJSON or an http step's `json` output makes of "\\ud800".
+    fake.script("fetch", Succeed({"name": "bad \ud800"}))
+
+    detail = await engine.execute(make_workflow(make_step("fetch"), make_step("after")))
+
+    assert statuses(detail) == {"fetch": "succeeded", "after": "succeeded"}
+    assert step_of(detail, "fetch").outputs == {"name": "bad \ufffd"}
 
 
 async def test_errors_are_masked_in_storage(engine: Engine, fake: FakeStep) -> None:

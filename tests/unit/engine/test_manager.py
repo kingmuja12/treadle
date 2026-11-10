@@ -110,6 +110,38 @@ async def test_inputs_are_coerced_and_masked_for_storage_but_not_for_steps(
     }
 
 
+async def test_a_number_that_holds_a_secret_is_stored_masked_and_a_rerun_says_why_it_fails(
+    engine: Engine, load_workflow: Callable[..., Workflow]
+) -> None:
+    engine.secrets.snapshot = dataclasses.replace(
+        engine.secrets.snapshot, secrets={"PIN": "834512907"}
+    )
+    workflow = load_workflow(
+        """
+        inputs:
+          pin: {type: integer}
+        steps:
+          - id: a
+            uses: fake
+        """
+    )
+    trigger = {"kind": "webhook", "body": {"chat": 834512907}}
+    request = RunRequest("wf", TriggerKind.WEBHOOK, trigger, inputs={"pin": 834512907})
+
+    async with Manager(engine, workflow) as harness:
+        submission = await harness.manager.submit(request)
+        assert submission.run is not None
+        await harness.manager.wait(submission.run.id)
+        with pytest.raises(InputError, match="input 'pin'"):
+            await harness.manager.rerun(submission.run.id)
+
+    stored = (await engine.detail(submission.run.id)).run
+    assert (stored.inputs, stored.trigger) == (
+        {"pin": "***"},
+        {"kind": "webhook", "body": {"chat": "***"}},
+    )
+
+
 async def test_unknown_invalid_and_badly_called_workflows_are_rejected(engine: Engine) -> None:
     broken = make_entry(
         workflow_id="broken", issues=[Issue(Severity.ERROR, "E101", "unknown key 'on'")]
@@ -242,8 +274,8 @@ async def test_replace_cancels_queued_runs_and_links_them_to_the_new_one(
         await harness.manager.cancel(third.id)
         await harness.manager.wait(third.id)
 
-    first_run, second_run = (
-        (await engine.detail(first.id)).run,
+    first_detail, second_run = (
+        await engine.detail(first.id),
         (await engine.detail(second.id)).run,
     )
     assert second_status is RunStatus.CANCELLED
@@ -252,7 +284,40 @@ async def test_replace_cancels_queued_runs_and_links_them_to_the_new_one(
         third.id,
         None,
     )
-    assert first_run.replaced_by == third.id
+    assert first_detail.run.replaced_by == third.id
+    assert statuses(first_detail) == {"work": "cancelled", "cleanup": "succeeded"}
+
+
+async def test_another_replacement_leaves_the_cancelling_run_its_cleanup(
+    engine: Engine, fake: FakeStep
+) -> None:
+    fake.script("work", Hang()).script("cleanup", Sleep(60))
+    workflow = make_workflow(
+        make_step("work"),
+        make_step("cleanup", condition="always()"),
+        concurrency=Concurrency(REPLACE),
+    )
+    loop = current_loop()
+
+    async with Manager(engine, workflow) as harness:
+        first = await harness.submit()
+        await asyncio.sleep(1)
+        replaced_at = loop.time()
+        await harness.submit()
+        await asyncio.sleep(1)
+        third = await harness.submit()
+        await harness.manager.wait(first.id)
+        await asyncio.sleep(0)
+        await harness.manager.cancel(third.id)
+        await harness.manager.wait(third.id)
+
+    first_detail = await engine.detail(first.id)
+    assert (first_detail.run.status, first_detail.run.reason) == (
+        RunStatus.CANCELLED,
+        RunReason.REPLACED,
+    )
+    assert statuses(first_detail) == {"work": "cancelled", "cleanup": "succeeded"}
+    assert call_times(fake, "work")[1] == replaced_at + 60
 
 
 async def test_the_global_cap_holds_runs_in_run_id_order(

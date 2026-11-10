@@ -50,6 +50,8 @@ CANARY = "s3cr3t-canary"
         pytest.param('KEY="  padded  "', {"KEY": "  padded  "}, id="double keeps spaces"),
         pytest.param("KEY=first\nKEY=second", {"KEY": "second"}, id="the last value wins"),
         pytest.param("A=1\r\nB=2\r\n", {"A": "1", "B": "2"}, id="CRLF line endings"),
+        pytest.param("﻿API_KEY=abc123\nB=2", {"API_KEY": "abc123", "B": "2"}, id="BOM"),
+        pytest.param("﻿# a comment\nA=1", {"A": "1"}, id="BOM before a comment"),
     ],
 )
 def test_dotenv_grammar(text: str, expected: dict[str, str]) -> None:
@@ -79,6 +81,8 @@ def test_dotenv_grammar(text: str, expected: dict[str, str]) -> None:
         (f"A=1\n9KEY={CANARY}", ".env:2: expected KEY=VALUE, a comment, or a blank line"),
         (f"export {CANARY}", ".env:1: expected KEY=VALUE, a comment, or a blank line"),
         (f"KEY-NAME={CANARY}", ".env:1: expected KEY=VALUE, a comment, or a blank line"),
+        (f"A=1\n﻿B={CANARY}", ".env:2: expected KEY=VALUE, a comment, or a blank line"),
+        (f"﻿﻿B={CANARY}", ".env:1: expected KEY=VALUE, a comment, or a blank line"),
     ],
 )
 def test_dotenv_errors_name_the_line_but_never_the_value(text: str, message: str) -> None:
@@ -116,6 +120,15 @@ def test_secret_variables_win_over_dotenv(tmp_path: Path) -> None:
     assert snapshot.get("ONLY_DOTENV") == "dotenv-value"
     assert snapshot.get("MISSING") is None
     assert snapshot.get("") is None
+
+
+def test_a_dotenv_file_with_a_byte_order_mark_loads(tmp_path: Path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("API_KEY=abc123\nOTHER=x\n", encoding="utf-8-sig")
+
+    snapshot = SecretStore(env_file, {}).load()
+
+    assert dict(snapshot.secrets) == {"API_KEY": "abc123", "OTHER": "x"}
 
 
 def test_lookup_env_reads_the_environment_then_dotenv(tmp_path: Path) -> None:

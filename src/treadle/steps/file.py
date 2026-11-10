@@ -14,7 +14,7 @@ from typing import ClassVar, Final, Literal, TypeAlias, cast
 
 from treadle.errors import PathNotAllowedError, StepConfigError, StepError
 from treadle.schema import Bool, Field, Obj, Str
-from treadle.steps.base import StepResult, StepRuntime
+from treadle.steps.base import StepResult, StepRuntime, check_os_text
 from treadle.types import Issue, JSONValue, Severity, YamlPath
 
 _Params: TypeAlias = Mapping[str, JSONValue]
@@ -29,8 +29,8 @@ _APPLIES: Final[Mapping[str, tuple[str, ...]]] = {
     "mode": ("write", "mkdir"),
 }
 _OUTPUTS: Final = frozenset({"path", "bytes", "changed"})
-# Design note: the optional keys have no schema defaults, so `check` can tell which keys a
-# workflow set; the actions apply section 2's defaults themselves.
+# The optional keys have no schema defaults, so `check` can tell which keys a workflow set;
+# each action applies the documented defaults itself.
 _SCHEMA: Final = Obj(
     "file step",
     {
@@ -54,6 +54,8 @@ class FileStep:
     """
 
     name = "file"
+    # A thread can't be interrupted, so a timed-out attempt isn't retried; see StepType.
+    interruptible: ClassVar[bool] = False
     output_names: ClassVar[frozenset[str] | None] = _OUTPUTS
     reserved_outputs: ClassVar[frozenset[str]] = _OUTPUTS
     taint_sinks: ClassVar[Mapping[str, Literal["code", "path", "url"]]] = {
@@ -63,7 +65,7 @@ class FileStep:
 
     @property
     def schema(self) -> Obj:
-        """The `with` keys of the `file` table in section 2."""
+        """The `with` keys of a `file` step, such as `action`, `path`, and `source`."""
         return _SCHEMA
 
     def check(self, params: Mapping[str, object], path: YamlPath) -> list[Issue]:
@@ -87,40 +89,53 @@ class FileStep:
     async def run(self, params: Mapping[str, JSONValue], rt: StepRuntime) -> StepResult:
         """Perform the action in a worker thread and return `path`, `bytes`, and `changed`.
 
-        A thread can't be interrupted, so a cancelled step waits for the operation to end
-        before it re-raises, and a retry never overlaps it; a second cancellation stops the
-        wait. Path violations raise PathNotAllowedError. An existing destination without
-        `overwrite`, or a directory without `recursive`, raises StepConfigError. Other OS
-        errors raise a retryable StepError.
+        A thread can't be interrupted, so a cancelled step waits for the operation to end,
+        logs whether it finished, and re-raises; a retry never overlaps it, and a second
+        cancellation stops the wait. Path violations raise PathNotAllowedError. An existing
+        destination without `overwrite`, or a directory without `recursive`, raises
+        StepConfigError. Other OS errors raise a retryable StepError.
         """
         work = asyncio.create_task(asyncio.to_thread(_perform, params, rt))
         try:
             return await asyncio.shield(work)
         except asyncio.CancelledError:
-            with contextlib.suppress(Exception):
-                await work
+            await asyncio.wait([work])
+            rt.log.system(_late_outcome(work))
             raise
 
 
-def resolve_path(raw: str, rt: StepRuntime, *, modify: bool, follow_final: bool = True) -> Path:
+def _late_outcome(work: asyncio.Task[StepResult]) -> str:
+    """Describe how a file operation that outlived its step's cancellation ended."""
+    error = work.exception()
+    if error is None:
+        return "the file operation finished after the step was cancelled"
+    message = error.message if isinstance(error, StepError) else str(error)
+    return f"the file operation failed after the step was cancelled: {message}"
+
+
+def resolve_path(
+    raw: str, rt: StepRuntime, *, modify: bool, follow_final: bool = True, key: str = "path"
+) -> Path:
     """Expand and resolve a `file` step path, and check it against the file roots.
 
     `~` expands, and a relative path resolves against the project directory. Symlinks
     resolve, except a final one when `follow_final` is False. The result must be inside a
-    file root and, with `modify`, outside the state directory. Raises PathNotAllowedError.
+    file root and, with `modify`, outside the state directory. Raises PathNotAllowedError,
+    or StepConfigError naming `key` for a path that the operating system can't take.
     """
+    check_os_text(raw, key)
     path = rt.project_dir / Path(raw).expanduser()
     if follow_final or path.name in ("", ".."):
         resolved = _real(path)
     else:
         resolved = _real(path.parent) / path.name
-    if not any(resolved.is_relative_to(_real(root)) for root in rt.file_roots):
+    if not any(_within(resolved, _real(root)) for root in rt.file_roots):
         raise PathNotAllowedError(
             f"{resolved} is outside the file roots; to allow it, add a directory that "
             "contains it to [security] file_roots in treadle.toml"
         )
     state = _real(rt.state_dir)
-    if modify and resolved.is_relative_to(state):
+    if modify and _within(resolved, state):
         message = f"refusing to modify {resolved}: it is in the state directory {state}"
         raise PathNotAllowedError(message)
     return resolved
@@ -138,7 +153,7 @@ def _perform(params: _Params, rt: StepRuntime) -> StepResult:
 
 
 def _write(target: Path, params: _Params, rt: StepRuntime) -> tuple[int, bool]:
-    data = cast(str, params.get("content", "")).encode()
+    data = _content(params)
     _refuse_existing(target, params)
     _make_parents(target, params)
     _atomic_write(target, data, _mode(params))
@@ -146,7 +161,7 @@ def _write(target: Path, params: _Params, rt: StepRuntime) -> tuple[int, bool]:
 
 
 def _append(target: Path, params: _Params, rt: StepRuntime) -> tuple[int, bool]:
-    data = cast(str, params.get("content", "")).encode()
+    data = _content(params)
     _make_parents(target, params)
     with target.open("ab") as file:
         file.write(data)
@@ -158,12 +173,14 @@ def _copy(target: Path, params: _Params, rt: StepRuntime) -> tuple[int, bool]:
     if source.is_dir():
         if params.get("recursive") is not True:
             raise StepConfigError(f"{source} is a directory; set recursive: true to copy it")
-        if target.is_relative_to(source):
+        if _within(target, source):
             raise StepConfigError(f"can't copy {source} into itself")
-        if _real(rt.state_dir).is_relative_to(target):
+        if _within(_real(rt.state_dir), target):
             message = f"refusing to copy into {target}: it contains the state directory"
             raise PathNotAllowedError(message)
     _refuse_existing(target, params)
+    if source.is_dir() and not source.is_symlink() and target.is_dir():
+        _refuse_escaping_links(source, target, rt)
     _make_parents(target, params)
     _duplicate(source, target)
     return 0, True
@@ -214,7 +231,8 @@ _HANDLERS: Final[Mapping[str, Callable[[Path, _Params, StepRuntime], tuple[int, 
 
 def _source(params: _Params, rt: StepRuntime, *, move: bool) -> Path:
     """Resolve `source`. A move modifies its source, and a moved symlink isn't followed."""
-    source = resolve_path(cast(str, params["source"]), rt, modify=move, follow_final=not move)
+    raw = cast(str, params["source"])
+    source = resolve_path(raw, rt, modify=move, follow_final=not move, key="source")
     if move:
         _refuse_removal(source, rt, "move")
     if not os.path.lexists(source):
@@ -226,15 +244,60 @@ def _refuse_removal(path: Path, rt: StepRuntime, action: str) -> None:
     """Refuse to delete or move a protected path, or a directory that holds one.
 
     Protected paths are the state, workflows, and project directories and each file root.
+    `path`'s final component isn't followed, so a symlink to a protected path may go.
     """
-    # Design note: section 2 protects these paths from delete and move. Deleting or moving a
-    # parent takes them along, so a parent of a protected path is refused as well.
+    # Deleting or moving a parent takes the protected paths along, so a parent of a protected
+    # path is refused as well.
     for protected in map(_real, rt.protected_paths):
-        if protected.is_relative_to(path):
+        if _within(protected, path, follow_ancestor=False):
             message = (
                 f"refusing to {action} {path}: it is or contains the protected path {protected}"
             )
             raise PathNotAllowedError(message)
+
+
+def _content(params: _Params) -> bytes:
+    """Return `content` as UTF-8. Raises StepConfigError for text that isn't valid Unicode."""
+    try:
+        return cast(str, params.get("content", "")).encode()
+    except UnicodeEncodeError:
+        message = "content holds text that isn't valid Unicode, which can't be written as UTF-8"
+        raise StepConfigError(message) from None
+
+
+def _refuse_escaping_links(source: Path, target: Path, rt: StepRuntime) -> None:
+    """Refuse a merging copy that would write through a link out of the allowed paths.
+
+    Where the source has a file or a directory, the copy follows a symlink that the
+    destination holds at the same place. Each such link must lead inside a file root and
+    outside the state directory, so it's checked before anything is copied.
+    """
+    roots = [_real(root) for root in rt.file_roots]
+    state = _real(rt.state_dir)
+    pending = [Path()]
+    while pending:
+        relative = pending.pop()
+        with os.scandir(source / relative) as children:
+            for child in children:
+                if child.is_symlink():
+                    continue  # copied as a link, never followed
+                destination = target / relative / child.name
+                if destination.is_symlink():
+                    _check_link(destination, roots, state)
+                if child.is_dir(follow_symlinks=False):
+                    pending.append(relative / child.name)
+
+
+def _check_link(link: Path, roots: list[Path], state: Path) -> None:
+    """Raise PathNotAllowedError when `link` leads outside the file roots or into `state`."""
+    real = _real(link)
+    if not any(_within(real, root) for root in roots):
+        problem = f"it links to {real}, outside the file roots"
+    elif _within(real, state):
+        problem = f"it links into the state directory {state}"
+    else:
+        return
+    raise PathNotAllowedError(f"refusing to copy through {link}: {problem}")
 
 
 def _refuse_existing(target: Path, params: _Params) -> None:
@@ -297,8 +360,8 @@ def _duplicate(source: Path, target: Path) -> None:
 
     Symlinks inside a tree are copied as links, never followed.
     """
-    # Design note: section 2 doesn't define `overwrite` for directories; merging into the
-    # destination keeps every file there that the source doesn't replace.
+    # A directory copy with `overwrite` merges into the destination, which keeps every file
+    # there that the source doesn't replace.
     if source.is_dir() and not source.is_symlink():
         shutil.copytree(source, target, symlinks=True, dirs_exist_ok=True)
     else:
@@ -320,6 +383,33 @@ def _temp_path(target: Path) -> Path:
 
 def _real(path: Path) -> Path:
     return Path(os.path.realpath(path))
+
+
+def _within(path: Path, ancestor: Path, *, follow_ancestor: bool = True) -> bool:
+    """True when `path` is `ancestor` or inside it.
+
+    Both paths are resolved, except that a final symlink may be left unfollowed. They're
+    compared as text first, then by file identity (device and inode): `path` and each of its
+    parents that exists against `ancestor`, which counts as the link itself when
+    `follow_ancestor` is False. Text alone isn't enough, because a file system that ignores
+    letter case or Unicode normalization, as APFS does, gives one directory many spellings,
+    and `os.path.realpath` keeps the one it was given.
+    """
+    if path.is_relative_to(ancestor):
+        return True
+    try:
+        info = os.stat(ancestor) if follow_ancestor else os.lstat(ancestor)
+    except OSError:
+        return False
+    identity = (info.st_dev, info.st_ino)
+    for candidate in (path, *path.parents):
+        try:
+            candidate_info = os.lstat(candidate)
+        except OSError:
+            continue  # not created yet, or not reachable
+        if (candidate_info.st_dev, candidate_info.st_ino) == identity:
+            return True
+    return False
 
 
 def _invalid(message: str, path: YamlPath) -> Issue:

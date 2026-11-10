@@ -108,6 +108,40 @@ def test_terminal_states_never_change(repo: Repository, runs: Runs) -> None:
     assert runs.get(run.id) == run
 
 
+def test_finish_abandoned_run_closes_its_unfinished_steps_and_attempts(
+    repo: Repository, runs: Runs
+) -> None:
+    run = runs.running(steps=["done", "build", "retry", "later"])
+    set_status = StepUpdate(StepStatus.SUCCEEDED, ANY_STATUS, T0)
+    assert repo.update_step(run.id, "done", set_status)
+    assert repo.update_step(run.id, "build", StepUpdate(StepStatus.RUNNING, ANY_STATUS, T0))
+    assert repo.update_step(run.id, "retry", StepUpdate(StepStatus.RETRYING, ANY_STATUS, T0))
+    repo.start_attempt(run.id, "build", 1, at_ms=T0, delay_before_ms=0)
+    other = runs.running(steps=["build"])
+    repo.start_attempt(other.id, "build", 1, at_ms=T0, delay_before_ms=0)
+
+    assert repo.finish_abandoned_run(
+        run.id, RunStatus.FAILED, at_ms=T0 + SECOND, reason=None, error="internal error: X"
+    )
+    assert not repo.finish_abandoned_run(
+        run.id, RunStatus.CANCELLED, at_ms=T0 + 2 * SECOND, reason=None, error=None
+    )
+
+    detail = repo.get_run_detail(run.id)
+    assert detail is not None
+    assert (detail.run.status, detail.run.error) == (RunStatus.FAILED, "internal error: X")
+    statuses = {s.step_id: (s.status, s.skip_reason, s.finished_at) for s in detail.steps}
+    done_at, stopped_at = from_ms(T0), from_ms(T0 + SECOND)
+    assert statuses == {
+        "done": (StepStatus.SUCCEEDED, None, done_at),
+        "build": (StepStatus.INTERRUPTED, None, stopped_at),
+        "retry": (StepStatus.INTERRUPTED, None, stopped_at),
+        "later": (StepStatus.SKIPPED, SkipReason.RUN_INTERRUPTED, stopped_at),
+    }
+    assert [a.status for a in step(repo, run.id, "build").attempts] == [AttemptStatus.INTERRUPTED]
+    assert [a.status for a in step(repo, other.id, "build").attempts] == [AttemptStatus.RUNNING]
+
+
 def test_fail_queued_records_a_setup_failure(repo: Repository, runs: Runs) -> None:
     run = runs.queued()
 
@@ -319,6 +353,69 @@ def test_append_logs_and_last_log_seq(repo: Repository, runs: Runs) -> None:
         LogLine(1, from_ms(T0), "build", 1, LogStream.STDOUT, "compiling ✓"),
         LogLine(2, from_ms(T0 + 1), None, None, LogStream.SYSTEM, "step 'build' succeeded"),
     ]
+
+
+BAD = "bad \ud800 and \udcff"  # lone surrogates, as an untrusted JSON escape can produce
+REPAIRED = "bad \ufffd and \ufffd"
+
+
+def test_runtime_text_that_isnt_valid_unicode_is_stored_with_replacement_characters(
+    repo: Repository, runs: Runs
+) -> None:
+    run = runs.running(trigger={"body": {BAD: BAD}}, inputs={"name": BAD})
+    failed = runs.queued()
+    update = StepUpdate(
+        StepStatus.FAILED,
+        frozenset({StepStatus.PENDING}),
+        T0,
+        outputs={BAD: [BAD, 1]},
+        error=BAD,
+    )
+
+    repo.start_attempt(run.id, "build", 1, at_ms=T0, delay_before_ms=0)
+    assert repo.finish_attempt(
+        run.id,
+        "build",
+        1,
+        status=AttemptStatus.FAILED,
+        at_ms=T0,
+        exit_code=1,
+        error=BAD,
+        log_bytes=0,
+        log_truncated=False,
+    )
+    assert repo.update_step(run.id, "build", update)
+    repo.append_logs(run.id, [NewLogLine(1, T0, "build", 1, LogStream.STDOUT, BAD)])
+    assert repo.finish_run(run.id, RunStatus.FAILED, at_ms=T0, reason=None, error=BAD)
+    assert repo.fail_queued(failed.id, at_ms=T0, error=BAD)
+
+    detail = repo.get_run_detail(run.id)
+    assert detail is not None
+    build = step(repo, run.id, "build")
+    assert (detail.run.trigger, detail.run.inputs, detail.run.error) == (
+        {"body": {REPAIRED: REPAIRED}},
+        {"name": REPAIRED},
+        REPAIRED,
+    )
+    assert (build.outputs, build.error, build.attempts[0].error) == (
+        {REPAIRED: [REPAIRED, 1]},
+        REPAIRED,
+        REPAIRED,
+    )
+    assert [line.text for line in repo.logs(run.id)] == [REPAIRED]
+    assert runs.get(failed.id).error == REPAIRED
+
+
+def test_control_payloads_and_results_that_arent_valid_unicode_are_repaired(
+    repo: Repository,
+) -> None:
+    request_id = repo.enqueue_control("run", {"inputs": {"name": BAD}}, at_ms=T0)
+    [claimed] = repo.claim_controls(at_ms=T0)
+
+    repo.complete_control(request_id, {"error": {"message": BAD}}, at_ms=T0)
+
+    assert claimed.payload == {"inputs": {"name": REPAIRED}}
+    assert repo.control_result(request_id) == {"error": {"message": REPAIRED}}
 
 
 def enqueue_then_fail(repo: Repository, payload: JSONObject) -> None:

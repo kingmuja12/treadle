@@ -1,6 +1,7 @@
 """The run manager: the actor that admits, dispatches, and cancels runs.
 
-Section 5 ("Admission and dispatch") defines each concurrency policy and command.
+Each workflow's concurrency policy decides whether a new run queues, is skipped, or replaces
+the runs before it.
 """
 
 from __future__ import annotations
@@ -148,8 +149,12 @@ class RunManager:
     async def readmit(self) -> int:
         """Replay queued runs from the database through the policy.
 
-        Returns how many runs were admitted. It runs once at startup, before any run is
-        active, and binds each run to its stored workflow version.
+        Returns how many runs were admitted. It runs once at startup, after the workflows
+        load and before any run is active, and binds each run to its stored workflow version.
+        A run whose workflow has no entry was deleted while Treadle was stopped, and is
+        cancelled with reason `workflow_removed`, as a deletion at run time is. When the
+        source has no entry at all, the workflows directory may have been unreadable, so such
+        runs stay queued, with a warning.
         """
         return await self._call(self._readmit)
 
@@ -160,10 +165,12 @@ class RunManager:
     async def shutdown(self, *, grace: float) -> None:
         """Drain: cancel active runs with reason `shutdown`, wait up to `grace`, then force.
 
-        Queued runs stay queued in the database. Runs that outlast the force and the
-        cancellation of their tasks are recorded as cancelled. Then the actor loop exits.
-        Call it while `run()` runs. A second call, such as `grace=0` after a second signal,
-        cancels the active runs again, which forces them, and skips the remaining grace.
+        A run that is already cancelling keeps its reason, and its cleanup steps keep
+        running within the grace. Queued runs stay queued in the database. Runs that outlast
+        the force and the cancellation of their tasks are recorded as cancelled. Then the
+        actor loop exits. Call it while `run()` runs. A second call, such as `grace=0` after
+        a second signal, forces the active runs when its own grace ends, which skips the rest
+        of the first call's grace.
         """
         if self._stopped:
             return
@@ -333,8 +340,12 @@ class RunManager:
 
     async def _readmit(self) -> int:
         queued = await self._store.read(lambda repo: repo.queued_runs())
+        listed = bool(self._workflows.entries())
         readmitted: set[int] = set()
         for run in queued:
+            if self._workflows.get(run.workflow_id) is None:
+                await self._readmit_unlisted(run, listed=listed)
+                continue
             workflow = await self._workflows.version(run.digest)
             if workflow is None:
                 await self._fail_unloadable(run.id)
@@ -343,6 +354,19 @@ class RunManager:
         waiting = {item.run.id for queue in self._pending.values() for item in queue}
         await self._dispatch()
         return len(readmitted & waiting)
+
+    async def _readmit_unlisted(self, run: RunRecord, *, listed: bool) -> None:
+        """Cancel a queued run whose workflow is gone, or leave it while nothing is listed."""
+        if not listed:
+            _log.warning("run=%d stays queued: workflow '%s' isn't loaded", run.id, run.workflow_id)
+            return
+        now = self._now_ms()
+        cancelled = await self._store.write(
+            lambda repo: repo.cancel_queued([run.id], reason=RunReason.WORKFLOW_REMOVED, at_ms=now)
+        )
+        for run_id in cancelled:
+            _log.info("run=%d cancelled: workflow %s was removed", run_id, run.workflow_id)
+            self._resolve(run_id, RunStatus.CANCELLED)
 
     async def _remove(self, workflow_id: str) -> None:
         queue = self._pending.pop(workflow_id, None)
@@ -365,7 +389,7 @@ class RunManager:
                 )
         self._pending.clear()
         for active in self._active.values():
-            active.handle.request_cancel(CancelReason.SHUTDOWN)
+            _begin_cancel(active.handle, CancelReason.SHUTDOWN)
 
     async def _finished(self, workflow_id: str, run_id: int, status: RunStatus | None) -> None:
         del self._active[workflow_id]
@@ -399,7 +423,7 @@ class RunManager:
             return [
                 run_id
                 for run_id in run_ids
-                if repo.finish_run(
+                if repo.finish_abandoned_run(
                     run_id, RunStatus.CANCELLED, at_ms=now, reason=RunReason.SHUTDOWN, error=error
                 )
             ]
@@ -434,7 +458,7 @@ class RunManager:
         for item in self._pending.pop(workflow_id, deque()):
             self._resolve(item.run.id, RunStatus.CANCELLED)
         if active is not None:
-            active.handle.request_cancel(CancelReason.REPLACED)
+            _begin_cancel(active.handle, CancelReason.REPLACED)
 
     async def _replay(self, run: RunRecord, workflow: Workflow) -> bool:
         """Apply the policy to a re-admitted run, and return True when it stays queued."""
@@ -525,11 +549,14 @@ class RunManager:
             self._post(functools.partial(self._finished, item.workflow.id, run.id, status))
 
     async def _fail_run(self, run_id: int, exc: Exception) -> RunStatus | None:
-        """Finish a run whose executor failed unexpectedly as failed, if it's still running."""
+        """Finish a run whose executor failed unexpectedly as failed, if it's still running.
+
+        The steps and attempts that the executor left unfinished close in the same write.
+        """
         error, now = f"internal error: {type(exc).__name__}", self._now_ms()
         try:
             if await self._store.write(
-                lambda repo: repo.finish_run(
+                lambda repo: repo.finish_abandoned_run(
                     run_id, RunStatus.FAILED, at_ms=now, reason=None, error=error
                 )
             ):
@@ -614,6 +641,16 @@ def _create(repo: Repository, new: NewRun, now_ms: int) -> CreateResult:
     if result.outcome == "created" and new.replaced_active is not None:
         repo.mark_cancel_requested(new.replaced_active, at_ms=now_ms)
     return result
+
+
+def _begin_cancel(handle: RunHandle, reason: CancelReason) -> None:
+    """Start cancelling a run unless it already is.
+
+    A second request would force the run and cut its cleanup steps short; only a user's
+    second cancel, or the end of the shutdown grace, forces a run.
+    """
+    if handle.reason is None:
+        handle.request_cancel(reason)
 
 
 def _masked(masker: Masker, value: JSONObject) -> JSONObject:

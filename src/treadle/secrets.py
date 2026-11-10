@@ -14,8 +14,8 @@ from treadle.errors import ConfigError
 SECRET_PREFIX: Final = "TREADLE_SECRET_"  # noqa: S105 - a variable-name prefix, not a secret
 # One `.env` entry: a blank or comment line, or KEY=VALUE where the value is double-quoted
 # (escapes, may span lines), single-quoted (literal), or plain (trimmed; ` #` ends it).
-# Design note: section 4 lets only double-quoted values span lines, so single-quoted ones
-# end at the line; an escape other than \n, \t, \", and \\ stays as written.
+# Only double-quoted values may span lines, so single-quoted ones end at the line; an escape
+# other than \n, \t, \", and \\ stays as written.
 _ENTRY: Final = re.compile(
     r"""[ \t]*(?:\#[^\n]*)?\n
     | [ \t]*(?:export[ \t]+)?(?P<key>[A-Za-z_][A-Za-z0-9_]*)[ \t]*=
@@ -36,10 +36,11 @@ def parse_dotenv(text: str, *, source: str) -> dict[str, str]:
 
     Unquoted values are trimmed and ` #` starts a comment. Single quotes are literal; double
     quotes may span lines and support `\\n`, `\\t`, `\\"`, and `\\\\`, while other escapes
-    stay as written. A repeated key keeps the last value. Raises ConfigError naming `source`
-    and the line, never the value.
+    stay as written. A repeated key keeps the last value. One byte-order mark at the start,
+    which some editors write, is ignored. Raises ConfigError naming `source` and the line,
+    never the value.
     """
-    text = text.replace("\r\n", "\n")
+    text = text.removeprefix("﻿").replace("\r\n", "\n")
     text += "" if text.endswith("\n") else "\n"
     values: dict[str, str] = {}
     position = 0

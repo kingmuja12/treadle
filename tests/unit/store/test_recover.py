@@ -93,7 +93,31 @@ def test_recover_interrupts_what_a_stopped_process_left_running(
     untouched = repo.get_run_detail(finished.id)
     assert untouched is not None
     assert untouched.run == finished
-    assert [step.status for step in untouched.steps] == [StepStatus.PENDING]
+
+
+def test_recover_closes_what_an_executor_left_unfinished_in_a_finished_run(
+    repo: Repository, runs: Runs
+) -> None:
+    failed = runs.finished(RunStatus.FAILED, steps=["done", "build", "after"])
+    set_step(repo, failed.id, "done", StepStatus.SUCCEEDED)
+    set_step(repo, failed.id, "build", StepStatus.RUNNING)
+    start_attempt(repo, failed.id, "build", 1, pgid=GONE_PGID)
+
+    report = repo.recover(at_ms=NOW)
+
+    assert report.interrupted_runs == ()
+    detail = repo.get_run_detail(failed.id)
+    assert detail is not None
+    assert detail.run == failed
+    steps = {step.step_id: step for step in detail.steps}
+    assert {step_id: step.status for step_id, step in steps.items()} == {
+        "done": StepStatus.SUCCEEDED,
+        "build": StepStatus.INTERRUPTED,
+        "after": StepStatus.SKIPPED,
+    }
+    assert steps["after"].skip_reason is SkipReason.RUN_INTERRUPTED
+    assert [attempt.status for attempt in steps["build"].attempts] == [AttemptStatus.INTERRUPTED]
+    assert repo.logs(failed.id) == []
 
 
 def test_each_interrupted_run_gets_its_own_log_line(repo: Repository, runs: Runs) -> None:

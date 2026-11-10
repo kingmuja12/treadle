@@ -1,4 +1,4 @@
-"""Schema migrations. Migration 1 is the DDL in section 7."""
+"""Schema migrations. Migration 1 creates the initial schema."""
 
 from __future__ import annotations
 
@@ -185,7 +185,7 @@ def migrate(
     if conn.execute("SELECT 1 FROM sqlite_master").fetchone() is not None:
         _backup(conn, backup_dir, db_path.stem, found, now_ms=now_ms, keep=keep_backups)
     else:
-        # Design note: connect() already switched the new file to WAL, which writes its header,
+        # connect() already switched the new file to WAL, which writes its header,
         # so the auto_vacuum setting takes effect only through a VACUUM (instant while empty).
         conn.execute("PRAGMA auto_vacuum = INCREMENTAL")
         conn.execute("VACUUM")

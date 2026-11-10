@@ -1,4 +1,4 @@
-"""The `shell` step type: a `run` script through a shell, or an `argv` program (section 2)."""
+"""The `shell` step type: a `run` script through a shell, or an `argv` program."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import ClassVar, Final, Literal, cast
 from treadle.errors import StepConfigError, StepError
 from treadle.models import ShellSpec
 from treadle.schema import AnyOf, Bool, CheckContext, Field, Int, ListOf, Obj, Str
-from treadle.steps.base import StepResult, StepRuntime
+from treadle.steps.base import StepResult, StepRuntime, check_os_text
 from treadle.steps.procs import run_process
 from treadle.types import Issue, JSONValue, Severity, YamlPath
 from treadle.units import format_size
@@ -51,7 +51,7 @@ _SCHEMA: Final = Obj(
         "shell": Field(_Shell()),
         "cwd": Field(Str()),
         "capture_stdout": Field(Bool(), default=False),
-        # Design note: exit codes are 0-255, and an empty list could never succeed.
+        # Exit codes are 0-255, and an empty list could never succeed.
         "success_codes": Field(ListOf(Int(min=0, max=255), min_len=1), default=[0]),
     },
     exclusive=[("run", "argv")],
@@ -109,7 +109,7 @@ class ShellStep:
         except StepConfigError as exc:
             if succeeded:
                 raise StepConfigError(exc.message, outputs=outputs, exit_code=code) from None
-            # Design note: the failed exit already fails the attempt and keeps it retryable;
+            # The failed exit already fails the attempt and keeps it retryable;
             # a broken output file is usually a symptom of that same failure.
             rt.log.system(f"ignored the output file: {exc.message}")
         if not succeeded:
@@ -122,7 +122,7 @@ def build_argv(
 ) -> list[str]:
     """Return the command line for an `argv` list, or for a `run` script at `script_path`.
 
-    A named shell uses section 2's command table. A shell list replaces each element equal
+    A named shell runs with its flags, such as `sh -e`. A shell list replaces each element equal
     to `{0}` with the script path, or appends the path when no element is `{0}`. Raises
     ValueError for a script without `script_path`.
     """
@@ -193,9 +193,15 @@ def _write_script(params: Mapping[str, JSONValue], rt: StepRuntime) -> Path | No
 
 
 def _workdir(params: Mapping[str, JSONValue], rt: StepRuntime) -> Path:
-    """Return `cwd` with `~` expanded, relative to the project directory, or `defaults.cwd`."""
+    """Return `cwd` with `~` expanded, relative to the project directory, or `defaults.cwd`.
+
+    Raises StepConfigError for a `cwd` that the operating system can't take.
+    """
     cwd = params.get("cwd")
-    return rt.project_dir / Path(cwd).expanduser() if isinstance(cwd, str) else rt.default_cwd
+    if not isinstance(cwd, str):
+        return rt.default_cwd
+    check_os_text(cwd, "cwd")
+    return rt.project_dir / Path(cwd).expanduser()
 
 
 def _read_output(rt: StepRuntime) -> str:

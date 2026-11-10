@@ -1,14 +1,19 @@
-"""The synchronous repository: every SQL statement that Treadle runs (section 7).
+"""The synchronous repository: every SQL statement that Treadle runs.
 
 Every state write is a conditional UPDATE on the allowed predecessor statuses and returns
 whether it applied, so a stale or duplicate transition is harmless and the first terminal
 state always wins. Rows come back as `sqlite3.Row` and map to records by column name.
+
+Runtime data reaches every JSON and TEXT column through `storable_text`, so text that isn't
+valid Unicode, such as a lone surrogate from an untrusted JSON document, is stored with
+replacement characters instead of failing the write.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 from collections import defaultdict
 from collections.abc import Collection, Iterator, Mapping, Sequence
@@ -56,6 +61,9 @@ _INTERRUPTED_LINE: Final = "Run interrupted: the Treadle process stopped while t
 _EXPIRED_RESULT: Final[JSONObject] = {
     "error": {"code": "expired", "message": "no Treadle process handled the request in time"}
 }
+# Every UTF-16 surrogate code point. In a Python string each one stands alone, and SQLite
+# can't encode it as UTF-8.
+_SURROGATE: Final = re.compile("[\ud800-\udfff]")
 # A failed savepoint must be rolled back to and then released, or it stays open.
 _UNDO_SAVEPOINT: Final = ("ROLLBACK TO nested", "RELEASE nested")
 _LOG_QUERY: Final = """SELECT * FROM log_lines
@@ -64,15 +72,20 @@ _LOG_QUERY: Final = """SELECT * FROM log_lines
       AND (:attempt IS NULL OR attempt = :attempt)
     ORDER BY seq"""
 
-# Crash recovery (section 5), in this order. Each statement touches only running runs.
-_RECOVERY: Final = (
+# Closes what no executor will finish: running attempts and running or retrying steps become
+# interrupted, and pending steps skipped (run_interrupted). `:run` names one run, or is NULL
+# for every run, as in recovery, where no executor runs.
+_CLOSE_STEPS: Final = (
     """UPDATE step_attempts SET status = 'interrupted', finished_at = :now
-       WHERE status = 'running' AND run_id IN (SELECT id FROM runs WHERE status = 'running')""",
+       WHERE status = 'running' AND (:run IS NULL OR run_id = :run)""",
     """UPDATE steps SET status = 'interrupted', finished_at = :now
-       WHERE status IN ('running', 'retrying')
-         AND run_id IN (SELECT id FROM runs WHERE status = 'running')""",
+       WHERE status IN ('running', 'retrying') AND (:run IS NULL OR run_id = :run)""",
     """UPDATE steps SET status = 'skipped', skip_reason = 'run_interrupted', finished_at = :now
-       WHERE status = 'pending' AND run_id IN (SELECT id FROM runs WHERE status = 'running')""",
+       WHERE status = 'pending' AND (:run IS NULL OR run_id = :run)""",
+)
+# Crash recovery, after `_CLOSE_STEPS` for every run: running runs get a log line, and then
+# become interrupted.
+_RECOVERY: Final = (
     """INSERT INTO log_lines (run_id, seq, ts, stream, text)
        SELECT id, (SELECT COALESCE(MAX(seq), 0) + 1 FROM log_lines WHERE run_id = runs.id),
               :now, 'system', :text
@@ -217,9 +230,9 @@ class Repository:
         A nested call joins the enclosing transaction through a savepoint, so a nested block
         that raises undoes only its own writes, and the enclosing block decides the rest.
         """
-        # Design note: section 7 says nested calls join the outer transaction. A savepoint
-        # joins it too, and lets `create_run` roll back its own writes for `slot_taken`
-        # inside `AsyncStore.write`, which always wraps the call in a transaction.
+        # A nested call joins the outer transaction through a savepoint, which lets
+        # `create_run` roll back its own writes for `slot_taken` inside `AsyncStore.write`,
+        # which always wraps the call in a transaction.
         if self._conn.in_transaction:
             with self._bracket("SAVEPOINT nested", "RELEASE nested", _UNDO_SAVEPOINT):
                 yield
@@ -244,9 +257,10 @@ class Repository:
     def create_run(self, new: NewRun) -> CreateResult:
         """Insert a run, in one transaction with its delivery, slot, and replace work.
 
-        The writes follow section 7's order. A delivery seen within its window returns
-        `duplicate` with the earlier run, which is None when retention pruned it. A failed
-        slot compare-and-set rolls everything back and returns `slot_taken`.
+        The delivery is recorded first, then the slot advances, the workflow version and the
+        run are stored, and the replaced runs are cancelled. A delivery seen within its
+        window returns `duplicate` with the earlier run, which is None when retention pruned
+        it. A failed slot compare-and-set rolls everything back and returns `slot_taken`.
         """
         try:
             with self.transaction():
@@ -283,8 +297,31 @@ class Repository:
         return self._changed(
             """UPDATE runs SET status = ?, reason = ?, error = ?, finished_at = ?
                WHERE id = ? AND status = 'running'""",
-            (status, reason, error, at_ms, run_id),
+            (status, reason, _storable(error), at_ms, run_id),
         )
+
+    def finish_abandoned_run(
+        self,
+        run_id: int,
+        status: RunStatus,
+        *,
+        at_ms: int,
+        reason: RunReason | None,
+        error: str | None,
+    ) -> bool:
+        """Finish a run whose executor stopped before it finished, such as after an error.
+
+        In one transaction, the run moves as `finish_run` moves it, and what its executor
+        left unfinished closes as crash recovery closes it: running attempts and running or
+        retrying steps become `interrupted`, and pending steps `skipped` (`run_interrupted`).
+        The steps close even when another writer finished the run. Returns whether the run
+        moved.
+        """
+        with self.transaction():
+            finished = self.finish_run(run_id, status, at_ms=at_ms, reason=reason, error=error)
+            for statement in _CLOSE_STEPS:
+                self._conn.execute(statement, {"now": at_ms, "run": run_id})
+        return finished
 
     def fail_queued(self, run_id: int, *, at_ms: int, error: str) -> bool:
         """Move a `queued` run to `failed` with reason `setup_failed`."""
@@ -292,7 +329,7 @@ class Repository:
             """UPDATE runs SET status = 'failed', reason = 'setup_failed', error = ?,
                    finished_at = ?
                WHERE id = ? AND status = 'queued'""",
-            (error, at_ms, run_id),
+            (storable_text(error), at_ms, run_id),
         )
 
     def skip_queued(self, run_ids: Sequence[int], *, reason: RunReason, at_ms: int) -> list[int]:
@@ -352,7 +389,7 @@ class Repository:
                 "tolerated": update.tolerated,
                 "skip_reason": update.skip_reason,
                 "outputs": None if update.outputs is None else _dumps(update.outputs),
-                "error": update.error,
+                "error": _storable(update.error),
                 "at": update.at_ms,
                 "terminal": update.status.terminal,
                 "run_id": run_id,
@@ -397,7 +434,17 @@ class Repository:
             """UPDATE step_attempts SET status = ?, finished_at = ?, exit_code = ?, error = ?,
                    log_bytes = ?, log_truncated = ?
                WHERE run_id = ? AND step_id = ? AND attempt = ? AND status = 'running'""",
-            (status, at_ms, exit_code, error, log_bytes, log_truncated, run_id, step_id, attempt),
+            (
+                status,
+                at_ms,
+                exit_code,
+                _storable(error),
+                log_bytes,
+                log_truncated,
+                run_id,
+                step_id,
+                attempt,
+            ),
         )
 
     def append_logs(self, run_id: int, lines: Sequence[NewLogLine]) -> None:
@@ -414,7 +461,7 @@ class Repository:
                         line.step_id,
                         line.attempt,
                         line.stream,
-                        line.text,
+                        storable_text(line.text),
                     )
                     for line in lines
                 ],
@@ -425,8 +472,10 @@ class Repository:
 
         Running attempts and steps become `interrupted`, pending steps `skipped`
         (`run_interrupted`), and the runs `interrupted` (`executor_stopped`) after a system
-        log line. Unconsumed control requests older than 60 seconds expire. Recovery never
-        signals a recorded process group; it only reports the ones that still exist.
+        log line. A finished run's leftover attempts and steps, which an executor that failed
+        may leave, close the same way. Unconsumed control requests older than 60 seconds
+        expire. Recovery never signals a recorded process group; it only reports the ones
+        that still exist.
         """
         with self.transaction():
             runs = self._rows("SELECT id FROM runs WHERE status = 'running' ORDER BY id")
@@ -435,6 +484,8 @@ class Repository:
                    WHERE r.status = 'running' AND a.status = 'running' AND a.pgid IS NOT NULL
                    ORDER BY a.pgid"""
             )
+            for statement in _CLOSE_STEPS:
+                self._conn.execute(statement, {"now": at_ms, "run": None})
             for statement in _RECOVERY:
                 self._conn.execute(statement, {"now": at_ms, "text": _INTERRUPTED_LINE})
             expired = self._conn.execute(
@@ -542,6 +593,18 @@ class Repository:
             (_dumps(result), at_ms, request_id),
         )
 
+    def withdraw_control(self, request_id: int, result: JSONObject, *, at_ms: int) -> bool:
+        """Consume a control request that nothing has claimed yet, storing `result`.
+
+        Returns whether it applied. A lock holder that claimed the request first keeps it,
+        and the answer that it stores later stands. A withdrawn request is never claimed.
+        """
+        return self._changed(
+            """UPDATE control_requests SET consumed_at = ?, result = ?
+               WHERE id = ? AND consumed_at IS NULL""",
+            (at_ms, _dumps(result), request_id),
+        )
+
     def control_result(self, request_id: int) -> JSONObject | None:
         """Return a control request's result, or None while it has none."""
         row = self._row("SELECT result FROM control_requests WHERE id = ?", (request_id,))
@@ -576,8 +639,8 @@ class Repository:
         `flt.text` matches the run error or any log line of the run, ignoring the case of
         ASCII letters, as SQL `LIKE` does.
         """
-        # Design note: SQLite's lower() folds ASCII letters only, the same rule as LIKE,
-        # which section 1 names for `--grep`; instr() then needs no wildcard escaping.
+        # SQLite's lower() folds ASCII letters only, the same rule as LIKE, which `--grep`
+        # promises; instr() then needs no wildcard escaping.
         limit = min(max(flt.limit, 1), _MAX_PAGE)
         rows = self._rows(
             """SELECT * FROM runs r
@@ -809,10 +872,10 @@ class Repository:
 
     def _insert_run(self, new: NewRun) -> int:
         """Insert the run row and return its ID. A skipped run is finished on arrival."""
-        # Design note: the unique (trigger_key, scheduled_for) index backs up the slot's
+        # The unique (trigger_key, scheduled_for) index backs up the slot's
         # compare-and-set. If it refuses a row (possible only after last_slot moved back),
         # the sqlite3.IntegrityError propagates and rolls back the whole `create_run`, and
-        # the scheduler sees an ordinary submit error, which section 6 logs and moves past.
+        # the scheduler sees an ordinary submit error, which it logs and moves past.
         cursor = self._conn.execute(
             """INSERT INTO runs (workflow_id, workflow_name, digest, status, reason,
                    trigger_kind, trigger_key, trigger_json, inputs_json, scheduled_for, attempt,
@@ -841,7 +904,7 @@ class Repository:
 
     def _relative(self, path: Path) -> str:
         """Return `path` relative to the project directory, for `workflow_versions.path`."""
-        # Design note: a workflow outside the project directory (a `workflows_dir` set
+        # A workflow outside the project directory (a `workflows_dir` set
         # elsewhere) keeps its absolute path, which `project_dir / path` still resolves.
         if path.is_relative_to(self._project_dir):
             return str(path.relative_to(self._project_dir))
@@ -937,8 +1000,22 @@ def _time(ms: int | None) -> datetime | None:
     return None if ms is None else from_ms(ms)
 
 
+def storable_text(text: str) -> str:
+    """Return `text` with each lone surrogate replaced by U+FFFD, so SQLite can store it.
+
+    A Python string can hold surrogates that no UTF-8 text can, for example from the JSON
+    escape `\\ud800` in an untrusted document. Valid text comes back unchanged.
+    """
+    return _SURROGATE.sub("\ufffd", text)
+
+
+def _storable(text: str | None) -> str | None:
+    return None if text is None else storable_text(text)
+
+
 def _dumps(value: JSONValue) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    """Return compact JSON for a JSON column, with `storable_text` applied to it."""
+    return storable_text(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
 
 
 def _status_set(statuses: Collection[str]) -> str:

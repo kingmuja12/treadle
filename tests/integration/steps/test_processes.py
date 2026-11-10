@@ -19,7 +19,13 @@ from treadle.config import Limits
 from treadle.errors import StepError
 from treadle.models import LogStream
 from treadle.steps.base import StepRuntime
-from treadle.steps.procs import ProcessRegistry, ProcessResult, run_process, terminate_group
+from treadle.steps.procs import (
+    LeftoverGroups,
+    ProcessRegistry,
+    ProcessResult,
+    run_process,
+    terminate_group,
+)
 
 PYTHON = sys.executable
 
@@ -124,13 +130,20 @@ async def test_add_mask_lines_register_a_mask_and_are_hidden(tmp_path: Path) -> 
     assert log.texts(LogStream.STDERR) == ["::add-mask::not-on-stderr"]
 
 
-async def test_capture_keeps_the_last_characters_of_stdout(tmp_path: Path) -> None:
+async def test_capture_keeps_the_complete_lines_among_the_last_characters_of_stdout(
+    tmp_path: Path,
+) -> None:
     rt = runtime(tmp_path)
-    code = r"import sys; sys.stdout.buffer.write('h\u00e9llo w\u00f6rld\n'.encode('utf-8'))"
+    text = "h\u00e9llo\nw\u00f6rld\nand m\u00f6re\n"
+    code = f"import sys; sys.stdout.buffer.write({text!r}.encode('utf-8'))"
 
-    result = await run_process([PYTHON, "-c", code], cwd=tmp_path, rt=rt, capture=5)
+    whole_lines = await run_process([PYTHON, "-c", code], cwd=tmp_path, rt=rt, capture=15)
+    split_line = await run_process([PYTHON, "-c", code], cwd=tmp_path, rt=rt, capture=12)
+    all_text = await run_process([PYTHON, "-c", code], cwd=tmp_path, rt=rt, capture=100)
 
-    assert result.stdout_tail == "\u00f6rld\n"
+    assert whole_lines.stdout_tail == "w\u00f6rld\nand m\u00f6re\n"
+    assert split_line.stdout_tail == "and m\u00f6re\n"
+    assert all_text.stdout_tail == text
 
 
 async def test_a_long_line_is_cut_after_the_slack(tmp_path: Path) -> None:
@@ -299,3 +312,71 @@ async def test_kill_all_signals_live_groups() -> None:
     assert registry.kill_all() == 1
     assert await proc.wait() == -signal.SIGKILL
     assert registry.kill_all() == 0
+
+
+async def test_a_background_child_keeps_its_group_tracked_after_the_call(tmp_path: Path) -> None:
+    log, processes = RecordingLog(), RecordingProcesses()
+    rt = runtime(tmp_path, log=log, processes=processes)
+
+    result = await run_process(["sh", "-c", "sleep 30 >/dev/null 2>&1 &"], cwd=tmp_path, rt=rt)
+
+    pgid = processes.history[0][1]
+    try:
+        assert result.exit_code == 0
+        assert processes.history == [("add", pgid)]
+        assert log.texts(LogStream.SYSTEM) == [
+            "processes that this step started in the background are still running; "
+            "Treadle stops them when the run ends"
+        ]
+    finally:
+        os.killpg(pgid, signal.SIGKILL)
+    assert await group_gone(pgid)
+
+
+async def test_leftover_groups_forget_an_empty_group_and_stop_the_rest() -> None:
+    registry = ProcessRegistry()
+    leftovers = LeftoverGroups(registry)
+    brief = await asyncio.create_subprocess_exec("sleep", "0.2", start_new_session=True)
+    lasting = await asyncio.create_subprocess_exec("sleep", "30", start_new_session=True)
+    for proc in (brief, lasting):
+        registry.add(proc.pid)
+        leftovers.adopt(proc.pid)
+
+    await asyncio.sleep(1.5)
+    assert len(registry) == 1  # the brief group is gone and forgotten
+
+    assert await leftovers.stop(grace=1) == 1
+    assert len(registry) == 0
+    assert await lasting.wait() == -signal.SIGTERM
+    assert await brief.wait() == 0
+    assert await leftovers.stop(grace=1) == 0
+
+
+async def test_leftover_groups_watch_only_while_they_hold_a_group() -> None:
+    registry = ProcessRegistry()
+    leftovers = LeftoverGroups(registry)
+    brief = await asyncio.create_subprocess_exec("true", start_new_session=True)
+    registry.add(brief.pid)
+    leftovers.adopt(brief.pid)
+    await brief.wait()
+
+    await asyncio.sleep(1.2)  # the watch forgets the group, and ends with nothing to watch
+    assert len(registry) == 0
+    lasting = await asyncio.create_subprocess_exec("sleep", "30", start_new_session=True)
+    registry.add(lasting.pid)
+    leftovers.adopt(lasting.pid)
+
+    assert await leftovers.stop(grace=1) == 1
+    assert await lasting.wait() == -signal.SIGTERM
+
+
+async def test_leftover_groups_count_only_the_groups_that_they_stop() -> None:
+    registry = ProcessRegistry()
+    leftovers = LeftoverGroups(registry)
+    finished = await asyncio.create_subprocess_exec("true", start_new_session=True)
+    registry.add(finished.pid)
+    leftovers.adopt(finished.pid)
+    await finished.wait()  # gone before the watch notices
+
+    assert await leftovers.stop(grace=1) == 0
+    assert len(registry) == 0

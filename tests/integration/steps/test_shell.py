@@ -339,9 +339,20 @@ async def test_capture_stdout_keeps_the_tail_without_one_trailing_newline(tmp_pa
 
     result = await run_shell(rt, {"run": script, "shell": "python", "capture_stdout": True})
 
-    printed = "".join(f"line {n:04}\n" for n in range(1000)) + "end\n\n"
-    assert result.outputs["stdout"] == printed[-1024:].removesuffix("\n")
-    assert str(result.outputs["stdout"]).endswith("line 0999\nend\n")
+    # The last 1,024 characters start inside line 898, which the tail leaves out.
+    expected = "".join(f"line {n:04}\n" for n in range(899, 1000)) + "end\n"
+    assert result.outputs["stdout"] == expected
+
+
+async def test_capture_stdout_keeps_the_first_line_when_the_cut_falls_at_its_start(
+    tmp_path: Path,
+) -> None:
+    rt = runtime(tmp_path, limits=Limits(stdout_capture_bytes=14))
+    script = "print('first'); print('line 0001'); print('end')"
+
+    result = await run_shell(rt, {"run": script, "shell": "python", "capture_stdout": True})
+
+    assert result.outputs["stdout"] == "line 0001\nend"
 
 
 async def test_add_mask_registers_the_value_and_hides_the_line(tmp_path: Path) -> None:

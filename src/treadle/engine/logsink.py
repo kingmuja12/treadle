@@ -1,4 +1,4 @@
-"""Batched, masked, capped log writing for one run (section 5, "Log caps")."""
+"""Batched, masked, capped log writing for one run."""
 
 from __future__ import annotations
 
@@ -11,12 +11,14 @@ from treadle.clock import Clock, to_ms
 from treadle.config import Limits
 from treadle.engine.masking import Masker
 from treadle.models import LogStream
+from treadle.steps.procs import TRUNCATION_MARKER
 from treadle.store.async_store import AsyncStore
-from treadle.store.repo import NewLogLine
+from treadle.store.repo import NewLogLine, storable_text
 from treadle.units import format_size
 
-# The marker that both the step's line buffer and the sink append to a cut line.
-_TRUNCATED: Final = " [line truncated]"
+# The most values that `::add-mask::` lines may add to one run's masker. Each new value
+# makes the next mask compile the whole pattern again, so this bounds the cost.
+MAX_RUNTIME_MASKS: Final = 1000
 _log = logging.getLogger("treadle.engine")
 
 
@@ -24,7 +26,8 @@ class AttemptLog:
     """The log of one step attempt; implements StepLog.
 
     Lines are masked and cut at `limits.line_bytes`. After the attempt or run cap, one notice
-    is written and further output is dropped and counted.
+    is written and further output is dropped and counted. So is the output after a value
+    that the run can no longer mask, which `refused_mask` reports.
     """
 
     def __init__(self, sink: LogSink, step_id: str, attempt: int) -> None:
@@ -35,6 +38,7 @@ class AttemptLog:
         self._bytes = 0
         self._dropped = 0
         self._truncated = False
+        self._refused_mask = False
 
     @property
     def bytes_written(self) -> int:
@@ -45,6 +49,11 @@ class AttemptLog:
     def truncated(self) -> bool:
         """True once a cap dropped output."""
         return self._truncated
+
+    @property
+    def refused_mask(self) -> bool:
+        """True once `add_mask` refused a value, because the run already masks the most."""
+        return self._refused_mask
 
     def write(self, stream: LogStream, text: str) -> None:
         """Queue one line of process output."""
@@ -69,8 +78,29 @@ class AttemptLog:
         self._sink.system(text, step_id=self._step_id, attempt=self._attempt)
 
     def add_mask(self, value: str) -> None:
-        """Mask `value` for the rest of the run."""
-        self._sink._masker.add(value)
+        """Mask `value` for the rest of the run.
+
+        A run masks at most `MAX_RUNTIME_MASKS` added values. A new value past that can't be
+        masked, so the attempt's further output is dropped with one notice, and the executor
+        fails the attempt; an unmasked value never reaches storage.
+        """
+        sink = self._sink
+        if self._refused_mask:
+            return
+        if sink._runtime_masks < MAX_RUNTIME_MASKS:
+            if sink._masker.add(value):
+                sink._runtime_masks += 1
+            return
+        if sink._masker.knows(value):
+            return
+        self._refused_mask = True
+        if not self._truncated:
+            self._truncated = True
+            notice = (
+                f"output truncated: the run masks at most {MAX_RUNTIME_MASKS} values from "
+                "::add-mask::, so further output from this step is dropped"
+            )
+            sink._queue(self._step_id, self._attempt, LogStream.SYSTEM, notice)
 
 
 class LogSink:
@@ -101,6 +131,7 @@ class LogSink:
         self._flush_interval = flush_interval
         self._max_batch = max_batch
         self._run_bytes = 0
+        self._runtime_masks = 0  # values that `add_mask` added to the masker
         self._pending: list[NewLogLine] = []
         self._attempts: list[AttemptLog] = []
         self._has_lines = asyncio.Event()
@@ -177,22 +208,24 @@ class LogSink:
     def _clean(self, text: str) -> str:
         """Mask a line, then cut it after `limits.line_bytes` bytes and mark the cut.
 
-        A line that the step's line buffer already cut keeps one marker. The buffer can cut
-        through a secret longer than its slack, and the masker can't recognize the kept
-        prefix, so such a line also loses its last `longest - 1` characters before the cut.
+        A line that the step's line buffer already cut keeps one marker. Only a cut line ends
+        with the marker after more than `limits.line_bytes` bytes. The buffer can cut through
+        a secret longer than its slack, and the masker can't recognize the kept prefix, so
+        such a line also loses its last `longest - 1` characters before the cut.
         """
         limit = self._limits.line_bytes
-        cut_before = text.endswith(_TRUNCATED) and _size(text) > limit
+        kept = text.removesuffix(TRUNCATION_MARKER)
+        cut_before = kept != text and _stored_length(kept) > limit
         if cut_before:
-            text = text.removesuffix(_TRUNCATED)
+            text = kept
         masked = self._masker.mask(text)
         if cut_before:
             masked = masked[: len(masked) - max(self._masker.longest - 1, 0)]
-        # Encoding with "replace" also turns lone surrogates, which SQLite can't store, into "?".
-        data = masked.encode("utf-8", "replace")
+        line = storable_text(masked)
+        data = line.encode("utf-8")
         if not cut_before and len(data) <= limit:
-            return data.decode("utf-8")
-        return data[:limit].decode("utf-8", "ignore") + _TRUNCATED
+            return line
+        return data[:limit].decode("utf-8", "ignore") + TRUNCATION_MARKER
 
     def _cap_notice(self, attempt_bytes: int, size: int) -> str | None:
         """Return the notice for the cap that a line of `size` bytes would pass, or None."""
@@ -201,8 +234,8 @@ class LogSink:
             limit = format_size(limits.step_log_bytes)
             return f"output truncated: further output from this step is dropped (limit {limit})"
         if self._run_bytes + size > limits.run_log_bytes:
-            # Design note: section 5 words the notice for the step cap. The run cap's notice
-            # names the run and its own limit, so it's clear which setting to raise.
+            # Unlike the step cap's notice, the run cap's notice names the run and its own
+            # limit, so it's clear which setting to raise.
             limit = format_size(limits.run_log_bytes)
             return (
                 f"output truncated: further output from this run is dropped (limit {limit} per run)"
@@ -211,5 +244,13 @@ class LogSink:
 
 
 def _size(text: str) -> int:
-    """Return the bytes a line counts against the caps: its UTF-8 length plus a newline."""
-    return len(text.encode("utf-8", "replace")) + 1
+    """Return the bytes a line counts against the caps: its stored length plus a newline."""
+    return _stored_length(text) + 1
+
+
+def _stored_length(text: str) -> int:
+    """Return the UTF-8 length of `text` in storage.
+
+    A lone surrogate counts 3 bytes, as the U+FFFD that replaces it in storage does.
+    """
+    return len(text.encode("utf-8", "surrogatepass"))

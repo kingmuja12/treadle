@@ -65,17 +65,25 @@ async def test_wait_changed_returns_at_the_next_change_only() -> None:
     assert waiter.done()
 
     later = asyncio.create_task(handle.wait_changed())
-    await asyncio.sleep(0)
     handle.request_cancel(CancelReason.USER, force=True)
     await asyncio.sleep(0)
     assert later.done()
 
     unchanged = asyncio.create_task(handle.wait_changed())
-    await asyncio.sleep(0)
     handle.force()
     await asyncio.sleep(1)
     assert not unchanged.done()
     unchanged.cancel()
+
+
+async def test_a_wait_changed_task_sees_a_change_before_its_first_step() -> None:
+    handle = RunHandle(1)
+
+    waiter = asyncio.create_task(handle.wait_changed())
+    handle.request_cancel(CancelReason.USER)
+    await asyncio.sleep(0)
+
+    assert waiter.done()
 
 
 def call_soon_nested(depth: int, callback: Callable[[], object]) -> None:

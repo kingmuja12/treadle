@@ -15,9 +15,11 @@ from tests.unit.engine.helpers import ENVIRON, MANUAL, Engine, step_of
 from treadle.clock import to_ms
 from treadle.config import Limits
 from treadle.engine.executor import RunHandle
+from treadle.engine.logsink import MAX_RUNTIME_MASKS
 from treadle.models import CancelReason, LogStream, RetryPolicy, StepStatus, Workflow
 from treadle.schema import Obj
 from treadle.steps.base import StepResult, StepRuntime
+from treadle.steps.procs import TRUNCATION_MARKER
 from treadle.store.repo import NewLogLine, Repository, StepUpdate
 from treadle.types import Issue, JSONValue, YamlPath
 
@@ -78,6 +80,45 @@ async def test_add_mask_covers_later_lines_and_stored_outputs_only(
     assert step_of(detail, "mint").outputs == {"value": "***"}
 
 
+class FloodStep(MaskingStep):
+    """A step type that masks and prints as many values as a run may, and then one more."""
+
+    name = "flood"
+
+    async def run(self, params: Mapping[str, JSONValue], rt: StepRuntime) -> StepResult:
+        values = [f"minted-{index:04d}" for index in range(MAX_RUNTIME_MASKS + 1)]
+        *allowed, extra = values
+        for value in allowed:
+            rt.log.add_mask(value)
+        for value in allowed:
+            rt.log.write(LogStream.STDOUT, f"made {value}")
+        rt.log.add_mask(extra)
+        rt.log.write(LogStream.STDOUT, f"made {extra}")
+        return StepResult({"last": extra})
+
+
+async def test_a_step_that_passes_the_mask_limit_fails_without_storing_the_value(
+    make_engine: Callable[..., Engine],
+) -> None:
+    engine = make_engine(FloodStep())
+    policy = RetryPolicy(attempts=3, delay=0)
+
+    detail = await engine.execute(make_workflow(make_step("flood", uses="flood", retry=policy)))
+
+    flood = step_of(detail, "flood")
+    error = "too many ::add-mask:: values: a run masks at most 1000"
+    assert (flood.status, flood.error, flood.outputs, len(flood.attempts)) == (
+        StepStatus.FAILED,
+        error,
+        {},
+        1,
+    )
+    assert flood.attempts[0].log_truncated
+    texts = await engine.texts(detail.run.id, stream=LogStream.STDOUT)
+    assert texts == ["made ***"] * MAX_RUNTIME_MASKS
+    assert "minted-1000" not in " ".join(await engine.texts(detail.run.id))
+
+
 async def test_built_in_steps_write_masked_system_lines(
     engine: Engine, load_workflow: Callable[..., Workflow]
 ) -> None:
@@ -113,7 +154,7 @@ async def test_log_caps_cut_lines_and_drop_output_past_the_attempt_cap(
     attempt = step_of(detail, "chatty").attempts[0]
     assert (attempt.log_bytes, attempt.log_truncated) == (38 + 10, True)
     assert await engine.texts(detail.run.id) == [
-        "y" * 20 + " [line truncated]",
+        "y" * 20 + TRUNCATION_MARKER,
         "x" * 9,
         "output truncated: further output from this step is dropped (limit 48 B)",
         "dropped 90 bytes of output",

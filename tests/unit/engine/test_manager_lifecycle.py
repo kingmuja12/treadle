@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 from collections.abc import Callable
 
 import pytest
 from tests.support.builders import make_step, make_workflow
 from tests.support.clock import FakeClock
-from tests.support.fakes import FakeStep, Hang, Sleep
+from tests.support.fakes import FakeStep, FakeWorkflowSource, Hang, Sleep
 from tests.support.vtime import current_loop
 from tests.unit.engine.helpers import (
     MANUAL,
@@ -129,6 +130,47 @@ async def test_readmit_fails_a_run_whose_version_no_longer_loads(engine: Engine)
     )
 
 
+async def test_readmit_cancels_the_queued_runs_of_a_workflow_deleted_while_stopped(
+    engine: Engine, fake: FakeStep
+) -> None:
+    deleted = policy_workflow(QUEUE)
+    kept = make_workflow(make_step("other"), workflow_id="kept")
+    queued = await engine.create(deleted)
+    source = FakeWorkflowSource(deleted, kept)
+    source.remove("wf")  # its stored version still loads, as the registry's does
+
+    async with Manager(engine, source=source) as harness:
+        waiter = asyncio.create_task(harness.manager.wait(queued.id))
+        admitted = await harness.manager.readmit()
+        status = await waiter
+
+    assert (admitted, status) == (0, RunStatus.CANCELLED)
+    assert await stored_status(engine, queued.id) == (
+        RunStatus.CANCELLED,
+        RunReason.WORKFLOW_REMOVED,
+    )
+    assert fake.calls == []
+
+
+async def test_readmit_leaves_queued_runs_alone_when_no_workflow_loaded(
+    engine: Engine, fake: FakeStep, caplog: pytest.LogCaptureFixture
+) -> None:
+    workflow = policy_workflow(QUEUE)
+    queued = await engine.create(workflow)
+    source = FakeWorkflowSource(workflow)
+    source.remove("wf")  # as when the workflows directory couldn't be read
+
+    with caplog.at_level(logging.WARNING, logger="treadle.engine"):
+        async with Manager(engine, source=source) as harness:
+            admitted = await harness.manager.readmit()
+            stats = harness.manager.stats()
+
+    assert (admitted, stats.queued) == (0, 0)
+    assert await stored_status(engine, queued.id) == (RunStatus.QUEUED, None)
+    assert fake.calls == []
+    assert f"run={queued.id} stays queued: workflow 'wf' isn't loaded" in caplog.text
+
+
 async def test_a_readmitted_run_executes_its_stored_version_and_inputs(
     engine: Engine, fake: FakeStep, load_workflow: Callable[..., Workflow]
 ) -> None:
@@ -202,6 +244,28 @@ async def test_shutdown_lets_cleanup_finish_within_the_grace_and_leaves_queued_r
         await waiter
 
 
+async def test_shutdown_lets_a_cancelled_runs_cleanup_finish_within_the_grace(
+    engine: Engine, fake: FakeStep
+) -> None:
+    fake.script("work", Hang()).script("cleanup", Sleep(5))
+    workflow = make_workflow(make_step("work"), make_step("cleanup", condition="always()"))
+    loop = current_loop()
+
+    async with Manager(engine, workflow) as harness:
+        run = await harness.submit()
+        await asyncio.sleep(1)
+        await harness.manager.cancel(run.id)
+        await asyncio.sleep(1)
+        start = loop.time()
+        await harness.manager.shutdown(grace=15)
+        took = loop.time() - start
+
+    assert took == 4
+    detail = await engine.detail(run.id)
+    assert (detail.run.status, detail.run.reason) == (RunStatus.CANCELLED, RunReason.USER)
+    assert statuses(detail) == {"work": "cancelled", "cleanup": "succeeded"}
+
+
 async def test_shutdown_forces_runs_that_outlast_the_grace(
     engine: Engine, fake: FakeStep, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -260,12 +324,13 @@ async def test_shutdown_records_a_run_whose_executor_never_stops(
 
     assert (took, deaf.kills) == (3 + 2, 1)
     assert deaf.handles[run.id].forced
-    stored = (await engine.detail(run.id)).run
-    assert (stored.status, stored.reason, stored.error) == (
+    detail = await engine.detail(run.id)
+    assert (detail.run.status, detail.run.reason, detail.run.error) == (
         RunStatus.CANCELLED,
         RunReason.SHUTDOWN,
         "run cancelled (shutdown)",
     )
+    assert statuses(detail) == {"work": "skipped:run_interrupted"}
 
 
 async def test_an_executor_error_fails_the_run_and_the_queue_moves_on(

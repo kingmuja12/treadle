@@ -1,4 +1,4 @@
-"""Run state, expression contexts, and step environments (section 5, "Environment")."""
+"""Run state, expression contexts, and step environments."""
 
 from __future__ import annotations
 
@@ -56,8 +56,8 @@ class RunState:
     tolerated: set[str] = field(default_factory=set)
     outputs: dict[str, JSONObject] = field(default_factory=dict)
     cancelling: bool = False
-    # Design note: section 4 gives these functions only the RunState, which has no project
-    # directory and no step errors or attempt counts, so the state carries them.
+    # `base_values` and `conclude` receive only the RunState, so it also carries the project
+    # directory, the step errors, and the attempt counts that they need.
     project_dir: Path | None = field(default=None, kw_only=True)
     errors: dict[str, str] = field(default_factory=dict, kw_only=True)
     attempts: dict[str, int] = field(default_factory=dict, kw_only=True)
@@ -164,7 +164,7 @@ def treadle_env(
     """Return Treadle's own variables for one attempt, such as `TREADLE_RUN_ID`.
 
     `TREADLE_RUN_TMP` is `run_dir/shared`. The attempt directory holds `output_path` and the
-    script file, and section 5's table gives it no variable, so `attempt_dir` isn't exported.
+    script file, and steps have no variable for it, so `attempt_dir` isn't exported.
     """
     run = state.run
     return {

@@ -1,4 +1,4 @@
-"""The single-instance lock on the state directory (section 8, "Single-instance lock")."""
+"""The single-instance lock on the state directory."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import fcntl
 import json
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Final
 
@@ -15,6 +16,9 @@ from treadle.types import LockHolder
 
 _LOCK_FILE: Final = "treadle.lock"
 _HOLDER_FILE: Final = "holder.json"
+# A busy lock is tried again this many times, this many seconds apart (100 ms in all).
+_BUSY_RETRIES: Final = 10
+_BUSY_PAUSE: Final = 0.01
 # Reported while a holder has the lock but hasn't written holder.json yet.
 _UNKNOWN_HOLDER: Final = LockHolder(pid=0, kind="maintenance", started_at="", version="")
 
@@ -35,13 +39,15 @@ class InstanceLock:
         """Take the lock and write `holder.json`. Raises LockHeldError with the current holder.
 
         Creates the state directory (mode 0700) and the lock file (mode 0600) when missing.
+        A busy lock is tried again for up to 100 ms before it counts as held, because `probe`
+        holds a shared lock for a moment.
         """
-        # Design note: the daemon creates the state directory before it locks (section 8),
-        # but `treadle run` and `treadle cancel` lock first, so acquire creates it as well.
+        # The daemon creates the state directory before it locks, but `treadle run` and
+        # `treadle cancel` lock first, so acquire creates it as well.
         self._state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(self._state_dir / _LOCK_FILE, os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_exclusive(fd)
         except OSError as error:
             os.close(fd)
             if isinstance(error, BlockingIOError):
@@ -110,6 +116,21 @@ class InstanceLock:
 
     def __exit__(self, *exc: object) -> None:
         self.release()
+
+
+def _lock_exclusive(fd: int) -> None:
+    """Take the exclusive lock without waiting for a holder. Raises BlockingIOError if busy.
+
+    A probe's shared lock lasts only a moment, so a busy lock is tried again a few times.
+    """
+    for _ in range(_BUSY_RETRIES):
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            time.sleep(_BUSY_PAUSE)
+        else:
+            return
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def _read_holder(state_dir: Path) -> LockHolder | None:

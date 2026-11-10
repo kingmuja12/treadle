@@ -19,6 +19,7 @@ from treadle.clock import to_ms
 from treadle.engine.logsink import LogSink
 from treadle.errors import ShuttingDownError
 from treadle.models import (
+    AttemptStatus,
     CancelOutcome,
     RunReason,
     RunRequest,
@@ -343,7 +344,9 @@ async def test_readmit_leaves_a_run_that_changed_while_its_version_loaded(
             )
             return None
 
-    async with Manager(engine, source=CancellingSource()) as harness:
+    source = CancellingSource(make_workflow(make_step("work")))  # the current version differs
+
+    async with Manager(engine, source=source) as harness:
         assert await harness.manager.readmit() == 0
 
     stored = (await engine.detail(queued.id)).run
@@ -360,6 +363,43 @@ async def test_an_executor_error_after_the_run_finished_keeps_the_stored_status(
         detail = await harness.run_to_end()
 
     assert detail.run.status is RunStatus.SUCCEEDED
+
+
+async def test_an_executor_crash_leaves_no_step_or_attempt_unfinished(
+    engine: Engine, fake: FakeStep, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake.script("slow", Sleep(5))
+    workflow = make_workflow(
+        make_step("first", needs=[]), make_step("slow", needs=[]), make_step("after")
+    )
+    update_step = Repository.update_step
+
+    def full_disk_once(self: Repository, run_id: int, step_id: str, update: StepUpdate) -> bool:
+        if step_id == "first" and update.status is StepStatus.SUCCEEDED:
+            raise sqlite3.OperationalError("database or disk is full")
+        return update_step(self, run_id, step_id, update)
+
+    monkeypatch.setattr(Repository, "update_step", full_disk_once)
+
+    async with Manager(engine, workflow) as harness:
+        detail = await harness.run_to_end()
+
+    assert (detail.run.status, detail.run.error) == (
+        RunStatus.FAILED,
+        "internal error: OperationalError",
+    )
+    assert statuses(detail) == {
+        "first": "interrupted",
+        "slow": "cancelled",
+        "after": "skipped:run_interrupted",
+    }
+    attempts = {step.step_id: [a.status for a in step.attempts] for step in detail.steps}
+    assert attempts == {
+        "first": [AttemptStatus.SUCCEEDED],
+        "slow": [AttemptStatus.CANCELLED],
+        "after": [],
+    }
+    assert all(step.finished_at is not None for step in detail.steps)
 
 
 async def test_an_internal_error_that_cant_be_recorded_is_logged(

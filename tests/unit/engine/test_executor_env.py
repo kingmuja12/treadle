@@ -17,6 +17,7 @@ from tests.unit.engine.helpers import Engine, step_of
 from treadle.config import RunSettings
 from treadle.models import Defaults, RetryPolicy, ShellSpec, StepStatus, Workflow
 from treadle.schema import Obj
+from treadle.secrets import SecretSnapshot
 from treadle.steps.base import StepResult, StepRuntime
 from treadle.types import Issue, JSONValue, YamlPath
 
@@ -279,6 +280,19 @@ async def test_each_attempt_gets_fresh_private_files(
         "event": {"kind": "webhook", "body": {"token": "***", "n": 1}},
     }
     assert not (engine.settings.tmp_dir / f"run-{detail.run.id}").exists()
+
+
+async def test_the_event_file_masks_a_number_that_holds_a_secret(
+    make_engine: Callable[..., Engine], secret_snapshot: Callable[..., SecretSnapshot]
+) -> None:
+    probe = ProbeStep()
+    engine = make_engine(probe)
+    engine.secrets.snapshot = secret_snapshot(CHAT_ID="834512907")
+    trigger: dict[str, JSONValue] = {"kind": "webhook", "body": {"chat": 834512907, "n": 1}}
+
+    await engine.execute(make_workflow(make_step("look", uses="probe")), trigger=trigger)
+
+    assert probe.seen["event"] == {"kind": "webhook", "body": {"chat": "***", "n": 1}}
 
 
 async def test_the_runtime_carries_the_settings_and_workflow_defaults(

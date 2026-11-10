@@ -15,6 +15,7 @@ from typing import cast
 
 import pytest
 from tests.support.builders import make_runtime
+from tests.support.fakes import RecordingLog
 
 from treadle.schema import validate
 from treadle.steps.base import StepResult
@@ -52,7 +53,8 @@ def append_params(path: str, content: str) -> dict[str, JSONValue]:
 
 
 async def test_a_cancelled_step_waits_for_its_file_operation(tmp_path: Path) -> None:
-    rt = make_runtime(tmp_path)
+    log = RecordingLog()
+    rt = make_runtime(tmp_path, log=log)
 
     with blocking_fifo(rt.project_dir / "pipe") as release:
         task = asyncio.create_task(FileStep().run(append_params("pipe", "data"), rt))
@@ -65,6 +67,7 @@ async def test_a_cancelled_step_waits_for_its_file_operation(tmp_path: Path) -> 
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 5)
         assert os.read(reader, 100) == b"data"
+    assert log.texts() == ["the file operation finished after the step was cancelled"]
 
 
 async def test_a_second_cancellation_stops_waiting(tmp_path: Path) -> None:
