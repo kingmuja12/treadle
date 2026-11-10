@@ -601,6 +601,9 @@ class _Execution:
             self._system(
                 f"retrying in {format_duration(delay)} ({following})", step.id, track.attempts
             )
+            # Store the line before the next attempt can exist: a follower reads a retried
+            # attempt's delay and attempt count from it.
+            await self._sink.flush()
             await asyncio.sleep(delay)
             if self._state.cancelling:
                 break

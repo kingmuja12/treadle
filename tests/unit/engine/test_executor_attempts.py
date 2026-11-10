@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import random
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import ClassVar
 
 import pytest
@@ -18,6 +18,8 @@ from tests.unit.engine.helpers import Engine, call_times, step_of
 from treadle.engine.executor import backoff_delay
 from treadle.errors import StepConfigError
 from treadle.models import AttemptStatus, LogStream, RetryPolicy, RunStatus, StepStatus
+from treadle.steps.base import StepResult, StepRuntime
+from treadle.types import JSONValue
 
 A = AttemptStatus
 
@@ -103,6 +105,30 @@ async def test_retry_lines_and_attempt_lines_are_logged(engine: Engine, fake: Fa
     assert [attempt.status for attempt in archive.attempts] == [A.FAILED, A.FAILED, A.SUCCEEDED]
     assert (archive.status, archive.error) == (StepStatus.SUCCEEDED, None)
     assert detail.run.status is RunStatus.SUCCEEDED
+
+
+async def test_the_retry_line_is_stored_before_the_next_attempt_starts(
+    engine: Engine, fake: FakeStep, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fake.script("ping", Fail("exit code 1"), SUCCEED)
+    stored: list[list[str]] = []
+    perform = fake.run
+
+    async def run(params: Mapping[str, JSONValue], rt: StepRuntime) -> StepResult:
+        if rt.attempt == 2:
+            stored.append(await engine.texts(rt.run_id, step_id="ping", attempt=1))
+        return await perform(params, rt)
+
+    monkeypatch.setattr(fake, "run", run)
+
+    policy = RetryPolicy(attempts=2, delay=0.0)
+
+    await engine.execute(make_workflow(make_step("ping", retry=policy)))
+
+    # treadle run reads the delay and the attempt count of a retried attempt from this line,
+    # so the line must be stored by the time a later attempt can appear. A zero delay leaves
+    # the log no time to flush on its own schedule.
+    assert stored == [["attempt 1 failed: exit code 1", "retrying in 0ms (attempt 2 of 2)"]]
 
 
 async def test_a_step_is_retrying_during_the_backoff(engine: Engine, fake: FakeStep) -> None:
