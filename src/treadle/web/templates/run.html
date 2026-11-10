@@ -1,0 +1,111 @@
+{% extends "base.html" %}
+{% block content %}
+<article class="run" data-run-id="{{ run.id }}" data-run-active="{{ 'true' if active else 'false' }}" data-after="{{ last_seq }}">
+  <h1>Run #{{ run.id }} <span class="muted">of</span> <a href="/workflows/{{ run.workflow_id | urlencode }}">{{ run.workflow_name }}</a></h1>
+  <p class="run-status" id="run-status" aria-live="polite">{{ status(run.status) }}{% if run.reason %} <span class="muted">({{ run.reason }})</span>{% endif %}</p>
+  {% if run.error %}
+  <p class="run-error"><span aria-hidden="true">✗</span> {{ run.error }}</p>
+  {% endif %}
+
+  <div class="actions">
+    {% if active %}
+    <form method="post" action="/runs/{{ run.id }}/cancel" data-confirm="Cancel run #{{ run.id }}?">
+      {{ csrf() }}
+      <button type="submit">Cancel run</button>
+      <button type="submit" name="force" value="true" class="secondary">Force cancel</button>
+    </form>
+    <button type="button" id="pause-updates" class="secondary" aria-pressed="false" hidden>Pause updates</button>
+    {% else %}
+    <form method="post" action="/runs/{{ run.id }}/rerun">
+      {{ csrf() }}
+      <button type="submit">Re-run</button>
+    </form>
+    {% endif %}
+    <a href="/runs/{{ run.id }}">Refresh</a>
+  </div>
+
+  <dl class="facts">
+    <dt>Trigger</dt><dd>{{ run.trigger_kind }}{% if run.scheduled_for %}, scheduled for {{ when(run.scheduled_for) }}{% endif %}</dd>
+    <dt>Created</dt><dd>{{ when(run.created_at) }}</dd>
+    <dt>Started</dt><dd>{{ when(run.started_at) }}</dd>
+    <dt>Finished</dt><dd>{{ when(run.finished_at) }}</dd>
+    <dt>Duration</dt><dd>{{ run.duration_ms | duration }}</dd>
+    <dt>Attempt</dt><dd>{{ run.attempt }}{% if run.rerun_of %}, re-run of <a href="/runs/{{ run.rerun_of }}">#{{ run.rerun_of }}</a>{% endif %}</dd>
+    {% if run.replaced_by %}
+    <dt>Replaced by</dt><dd><a href="/runs/{{ run.replaced_by }}">#{{ run.replaced_by }}</a></dd>
+    {% endif %}
+    <dt>Version</dt><dd><code>{{ run.digest[:12] }}</code></dd>
+  </dl>
+
+  <details class="payload">
+    <summary>Trigger payload</summary>
+    <pre>{{ trigger_text }}</pre>
+  </details>
+
+  <section aria-labelledby="inputs-heading">
+    <h2 id="inputs-heading">Inputs</h2>
+    {% if inputs %}
+    <table class="data">
+      <thead>
+        <tr><th scope="col">Input</th><th scope="col">Value</th></tr>
+      </thead>
+      <tbody>
+        {% for input_name, input_value in inputs %}
+        <tr><th scope="row">{{ input_name }}</th><td><code>{{ input_value }}</code></td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <p class="muted">This run has no inputs.</p>
+    {% endif %}
+  </section>
+
+  <section aria-labelledby="steps-heading">
+    <h2 id="steps-heading">Steps</h2>
+    {% if steps %}
+    <table class="data">
+      <thead>
+        <tr>
+          <th scope="col">Step</th>
+          <th scope="col">Status</th>
+          <th scope="col">Attempts</th>
+          <th scope="col">Duration</th>
+          <th scope="col">Note</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for item in steps %}
+        {% set step = item.record %}
+        <tr>
+          <th scope="row"><a href="#log-{{ step.step_id }}">{{ step.name }}</a> <span class="muted">{{ step.uses }}</span></th>
+          <td>{{ status(step.status) }}{% if step.tolerated %} <span class="muted">(tolerated)</span>{% endif %}</td>
+          <td>{{ step.attempts | length }}</td>
+          <td>{{ step.duration_ms | duration }}</td>
+          <td>{% if step.skip_reason %}skipped: {{ step.skip_reason | replace("_", " ") }}{% elif step.error %}{{ step.error }}{% endif %}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% for item in steps %}
+    {% set step = item.record %}
+    <details class="step-log" id="log-{{ step.step_id }}">
+      <summary>Log of {{ step.name }} (last 500 lines)</summary>
+      {% if item.log %}<pre class="log">{{ item.log }}</pre>{% else %}<p class="muted">No output.</p>{% endif %}
+      <p><a href="/runs/{{ run.id }}/log.txt?step={{ step.step_id | urlencode }}">Full log of {{ step.name }} as text</a></p>
+    </details>
+    {% endfor %}
+    {% else %}
+    <p class="muted">No steps have started yet.</p>
+    {% endif %}
+    <p><a href="/runs/{{ run.id }}/log.txt">Whole run log as text</a></p>
+  </section>
+
+  {% if active %}
+  <section aria-labelledby="live-heading">
+    <h2 id="live-heading">Live log</h2>
+    <p class="muted">New lines appear here while the run is active, when JavaScript is on.</p>
+    <pre class="log" id="live-log"></pre>
+  </section>
+  {% endif %}
+</article>
+{% endblock %}

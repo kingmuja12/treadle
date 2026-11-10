@@ -1,0 +1,16 @@
+steps:
+  - id: both
+    uses: shell
+    with:
+      run: echo hi
+      argv: [echo, hi]
+  - id: shorthand
+    run: echo hi
+    with:
+      argv: [echo, hi]
+  - id: post
+    uses: http
+    with:
+      url: https://example.net/hook
+      json: {ok: true}
+      body: "ok"

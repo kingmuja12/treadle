@@ -1,0 +1,65 @@
+# Mirrors ~/Documents to a backup drive every night at 02:30, and sends a push
+# notification through ntfy when the backup fails.
+#
+# Setup:
+#   1. Set DEST to a folder on your backup drive. On Linux, use a mount point
+#      such as /mnt/backup/documents.
+#   2. Add NTFY_URL to .env, for example NTFY_URL=https://ntfy.sh/<your-topic>.
+#      Pick a topic name that is hard to guess, because anyone who knows it can
+#      read your notifications.
+#   3. Try a run that copies nothing: treadle run nightly-backup -i dry_run=true
+name: Nightly backup
+description: Mirror ~/Documents to the backup drive every night and alert on failure.
+inputs:
+  dry_run:
+    type: boolean
+    default: false
+env:
+  DEST: /Volumes/Backup/documents
+triggers:
+  schedule:
+    cron: "30 2 * * *"
+    # Remove this line to use the time zone in treadle.toml.
+    timezone: Europe/London
+    # After the machine was asleep or off at 02:30, run once when it's back.
+    catch_up: latest
+# If last night's backup is still running, skip tonight's.
+concurrency: skip
+timeout: 3h
+defaults:
+  timeout: 2h
+  retry: {attempts: 3, delay: 30s, max_delay: 10m}
+steps:
+  # Stop at once, without retries, when the drive isn't mounted.
+  - id: check-drive
+    run: test -d "$DEST"
+    retry: 1
+  - id: archive
+    env:
+      DRY_RUN: ${{ inputs.dry_run }}
+    run: |
+      flag=""
+      if [ "$DRY_RUN" = "true" ]; then flag="--dry-run"; fi
+      rsync -a --delete $flag "$HOME/Documents/" "$DEST/current/"
+      echo "stamp=$(date +%Y-%m-%d)" >> "$TREADLE_OUTPUT"
+  - id: record
+    if: inputs.dry_run == false
+    uses: file
+    with:
+      action: append
+      path: ~/Library/Logs/treadle-backups.log
+      content: "${{ steps.archive.outputs.stamp }} ok run=${{ run.id }}\n"
+  # check-drive is an ancestor of alert through archive, so alert also runs
+  # when the drive is missing.
+  - id: alert
+    needs: [archive]
+    if: failure()
+    uses: http
+    with:
+      method: POST
+      url: ${{ secrets.NTFY_URL }}
+      headers:
+        Title: Nightly backup failed
+        Priority: high
+        Tags: warning
+      body: "Backup failed in run ${{ run.id }} (attempt ${{ run.attempt }}). Details: treadle show ${{ run.id }}"

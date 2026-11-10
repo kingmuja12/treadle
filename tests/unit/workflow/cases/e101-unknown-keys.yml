@@ -1,0 +1,12 @@
+on: push
+jobs: {}
+runs-on: ubuntu-latest
+descripton: Typo in a key.
+triggers:
+  manual: {}
+  workflow_dispatch: {}
+steps:
+  - id: greet
+    run: echo hi
+    continue-on-error: true
+    working-directory: ~/src

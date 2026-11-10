@@ -1,0 +1,11 @@
+steps:
+  - id: build
+    run: make
+    outputs:
+      exit_code: ${{ result.exit_code }}
+  - id: probe
+    uses: http
+    with:
+      url: https://example.net/
+    outputs:
+      status: ${{ result.status }}

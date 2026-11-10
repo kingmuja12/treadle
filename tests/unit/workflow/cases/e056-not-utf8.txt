@@ -1,0 +1,2 @@
+workflows/e056-not-utf8.yml:1:10: error[E056]: the file isn't valid UTF-8
+   = help: save the file as UTF-8

@@ -1,0 +1,17 @@
+name: Hello
+description: A first workflow. Run it with `treadle run hello -i name=Ada`.
+inputs:
+  name:
+    type: string
+    default: world
+steps:
+  - id: greet
+    env:
+      NAME: ${{ inputs.name }}
+    run: |
+      echo "Hello, $NAME!"
+      echo "greeting=Hello, $NAME!" >> "$TREADLE_OUTPUT"
+  - id: report
+    uses: log
+    with:
+      message: "${{ steps.greet.outputs.greeting }} (run ${{ run.id }})"

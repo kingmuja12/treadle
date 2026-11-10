@@ -1,0 +1,5 @@
+workflows/e404-run-with-other-type.yml:4:5: error[E404]: 'run' needs a shell step, but this step uses 'http'
+   |
+ 4 |     run: curl https://example.net/
+   |     ^
+   = help: remove `uses`, or move the script into its own shell step

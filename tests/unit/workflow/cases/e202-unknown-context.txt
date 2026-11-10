@@ -1,0 +1,10 @@
+workflows/e202-unknown-context.yml:4:16: error[E202]: unknown context 'github'
+   |
+ 4 |       REF: ${{ github.ref }}
+   |                ^
+   = help: Treadle has no `github` context; use `trigger` for the event and `run` for the run
+workflows/e202-unknown-context.yml:5:17: error[E202]: unknown context 'inptus'
+   |
+ 5 |       TYPO: ${{ inptus.name }}
+   |                 ^
+   = help: did you mean 'inputs'?

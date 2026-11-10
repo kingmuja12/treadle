@@ -1,0 +1,9 @@
+workflows/e102-missing-keys.yml:1:1: error[E102]: missing required key 'steps'
+   |
+ 1 | name: No steps
+   | ^
+   = help: add a `steps` list with at least one step
+workflows/e102-missing-keys.yml:4:5: error[E102]: missing required key 'secret_env'
+   |
+ 4 |     name: deploy
+   |     ^

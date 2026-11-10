@@ -1,0 +1,10 @@
+workflows/e401-unknown-step-type.yml:3:11: error[E401]: unknown step type 'actions/checkout@v4'
+   |
+ 3 |     uses: actions/checkout@v4
+   |           ^
+   = help: use one of: file, http, log, shell, sleep
+workflows/e401-unknown-step-type.yml:5:11: error[E401]: unknown step type 'htpp'
+   |
+ 5 |     uses: htpp
+   |           ^
+   = help: did you mean 'http'?

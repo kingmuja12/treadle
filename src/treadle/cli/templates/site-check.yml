@@ -1,0 +1,23 @@
+name: Site check
+description: Check that a site answers with 200, and log a warning when it doesn't.
+inputs:
+  url:
+    type: string
+    default: https://example.com
+# Uncomment to check every 15 minutes:
+# triggers:
+#   schedule: "*/15 * * * *"
+steps:
+  - id: probe
+    uses: http
+    retry: {attempts: 3, delay: 5s}
+    with:
+      url: ${{ inputs.url }}
+      expect: [200]
+      timeout: 10s
+  - id: alert
+    if: failure()
+    uses: log
+    with:
+      level: warning
+      message: "Site check failed for ${{ inputs.url }} in run ${{ run.id }}"

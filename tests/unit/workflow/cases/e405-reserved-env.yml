@@ -1,0 +1,7 @@
+env:
+  TREADLE_TOKEN: oops
+steps:
+  - id: greet
+    env:
+      TREADLE_OUTPUT: /tmp/out
+    run: echo hi

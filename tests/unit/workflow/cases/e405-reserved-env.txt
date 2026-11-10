@@ -1,0 +1,10 @@
+workflows/e405-reserved-env.yml:2:3: error[E405]: 'TREADLE_TOKEN' is reserved: names that start with TREADLE_ are Treadle's
+   |
+ 2 |   TREADLE_TOKEN: oops
+   |   ^
+   = help: rename the variable
+workflows/e405-reserved-env.yml:6:7: error[E405]: 'TREADLE_OUTPUT' is reserved: names that start with TREADLE_ are Treadle's
+   |
+ 6 |       TREADLE_OUTPUT: /tmp/out
+   |       ^
+   = help: rename the variable

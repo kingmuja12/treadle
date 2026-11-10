@@ -1,0 +1,12 @@
+workflows/e306-invalid-glob.yml:4:15: error[E306]: invalid glob pattern '*.[ch': the '[' at position 3 has no closing ']'
+   |
+ 4 |     include: ["*.[ch", "reports/"]
+   |               ^
+workflows/e306-invalid-glob.yml:4:24: error[E306]: invalid glob pattern 'reports/': a pattern matches paths relative to the watched directory, so it can't start or end with '/' or contain '//'
+   |
+ 4 |     include: ["*.[ch", "reports/"]
+   |                        ^
+workflows/e306-invalid-glob.yml:5:15: error[E306]: invalid glob pattern '[z-a]*': invalid character class: bad character range z-a
+   |
+ 5 |     exclude: ["[z-a]*"]
+   |               ^

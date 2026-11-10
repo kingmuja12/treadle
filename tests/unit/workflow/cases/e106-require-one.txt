@@ -1,0 +1,8 @@
+workflows/e106-require-one.yml:2:5: error[E106]: one of 'uses' or 'run' is required
+   |
+ 2 |   - id: nothing
+   |     ^
+workflows/e106-require-one.yml:7:7: error[E106]: one of 'run' or 'argv' is required
+   |
+ 7 |       cwd: /tmp
+   |       ^

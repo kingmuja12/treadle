@@ -1,0 +1,7 @@
+steps:
+  - id: build
+    run: echo "tag=v1" >> "$TREADLE_OUTPUT"
+  - id: publish
+    env:
+      TAG: ${{ steps.biuld.outputs.tag }}
+    run: echo "$TAG"

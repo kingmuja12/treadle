@@ -1,0 +1,329 @@
+"""The `Daemon` class on the test's own event loop: serving, draining, forcing, and refusals."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import socket
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from contextlib import asynccontextmanager
+
+import httpx
+import pytest
+from tests.integration.daemon.conftest import HOOK_SECRET, STUBBORN
+from tests.integration.daemon.helpers import kill_group, recorded_process_groups, sign
+from tests.support.project import ProjectFactory
+from tests.unit.store.helpers import Runs
+
+from treadle import __version__
+from treadle.clock import SystemClock, iso_utc
+from treadle.config import Settings
+from treadle.daemon import Daemon
+from treadle.errors import BusyError, ConfigError, LockHeldError
+from treadle.lock import InstanceLock
+from treadle.models import RunReason, RunStatus, Workflow
+from treadle.steps.builtin import builtin_registry
+from treadle.store.async_store import AsyncStore
+from treadle.triggers.scheduler import Scheduler
+from treadle.types import ExitCode, LockHolder
+from treadle.workflow.loader import WorkflowLoader
+
+TOKEN = "t" * 32
+UNREACHABLE = "192.0.2.10"  # TEST-NET-1: never an address of this machine
+
+
+@pytest.fixture(autouse=True)
+def _kill_leftover_steps(daemon_project: ProjectFactory) -> Iterator[None]:
+    """Kill every step process group that the test's daemon recorded, even after a failure."""
+    yield
+    for pgid in recorded_process_groups(daemon_project.settings().db_path):
+        kill_group(pgid)
+
+
+async def _eventually(check: Callable[[], Awaitable[bool]], *, within: float = 20.0) -> None:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + within
+    while not await check():
+        if loop.time() > deadline:
+            raise AssertionError(f"the condition didn't hold within {within}s")
+        await asyncio.sleep(0.02)
+
+
+def _listening_port(settings: Settings) -> int | None:
+    """The port in `holder.json`, which the daemon records once it serves."""
+    try:
+        holder = json.loads(settings.holder_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    port = holder.get("port")
+    return port if isinstance(port, int) and port > 0 else None
+
+
+def _configure(project: ProjectFactory, *, extra: str = "", host: str | None = None) -> Settings:
+    server = f'host = "{host}"\n' if host else ""
+    project.write_config(f'timezone = "UTC"\n{extra}\n[server]\nport = 0\n{server}')
+    return project.settings()
+
+
+@asynccontextmanager
+async def serving(
+    daemon: Daemon, settings: Settings, *, stop: bool = True
+) -> AsyncIterator[httpx.AsyncClient]:
+    """Run the daemon until the block ends, then shut it down; it must exit with 0.
+
+    With `stop=False`, the block requests the shutdown itself. A third request would call
+    `os._exit`, so the helper never adds one.
+    """
+    task = asyncio.create_task(daemon.run())
+
+    async def ready() -> bool:
+        if task.done():
+            task.result()  # a startup failure fails the test here
+        return _listening_port(settings) is not None
+
+    try:
+        await _eventually(ready)
+        url = f"http://127.0.0.1:{_listening_port(settings)}"
+        async with httpx.AsyncClient(base_url=url, timeout=10) as client:
+            yield client
+    finally:
+        if stop and not task.done():
+            daemon.request_shutdown()
+        code = await asyncio.wait_for(task, 30)
+    assert code == ExitCode.OK
+
+
+async def _status(client: httpx.AsyncClient, run_id: int) -> str:
+    return str((await client.get(f"/api/v1/runs/{run_id}")).json()["status"])
+
+
+async def test_the_daemon_serves_runs_and_hooks_then_drains(daemon_project: ProjectFactory) -> None:
+    settings = _configure(daemon_project)
+    body = json.dumps({"ref": "refs/tags/v1"}).encode()
+    signed = {"Content-Type": "application/json", "X-Hub-Signature-256": sign(HOOK_SECRET, body)}
+    daemon = Daemon(settings, environ={})
+
+    async with serving(daemon, settings) as client:
+        health = await client.get("/api/v1/health")
+        created = await client.post("/api/v1/workflows/hello/runs", json={"inputs": {}})
+        hooked = await client.post("/hooks/deploy", content=body, headers=signed)
+        run_ids = [created.json()["run"]["id"], hooked.json()["run_id"]]
+
+        async def finished() -> bool:
+            return [await _status(client, run_id) for run_id in run_ids] == ["succeeded"] * 2
+
+        await _eventually(finished)
+        assert daemon.bound_port == _listening_port(settings)
+
+    assert health.json() == {"status": "ok", "version": __version__}
+    assert InstanceLock.probe(settings.state_dir) is None
+
+
+async def test_request_reload_applies_an_edit_at_once(daemon_project: ProjectFactory) -> None:
+    settings = _configure(daemon_project)
+    daemon = Daemon(settings, environ={})
+
+    async with serving(daemon, settings) as client:
+        daemon_project.write_workflow(
+            "hello", "name: Renamed\nsteps:\n  - id: a\n    run: 'true'\n"
+        )
+        daemon.request_reload()
+
+        async def renamed() -> bool:
+            return (await client.get("/api/v1/workflows/hello")).json()["name"] == "Renamed"
+
+        await _eventually(renamed, within=5)
+
+
+async def test_a_second_shutdown_request_forces_the_runs(daemon_project: ProjectFactory) -> None:
+    daemon_project.write_workflow("stubborn", STUBBORN)
+    settings = _configure(daemon_project, extra='[runs]\nkill_grace = "30s"')
+    daemon = Daemon(settings, environ={})
+    loop = asyncio.get_running_loop()
+    pid_file = daemon_project.root / "stubborn.pid"
+
+    async with serving(daemon, settings, stop=False) as client:
+        run_id = (await client.post("/api/v1/workflows/stubborn/runs", json={})).json()["run"]["id"]
+
+        async def holding() -> bool:
+            return pid_file.exists()
+
+        await _eventually(holding)
+        started = loop.time()
+        daemon.request_shutdown()
+        await asyncio.sleep(0.3)
+        daemon.request_shutdown()
+
+    assert loop.time() - started < 10  # well under the 30-second kill grace
+    store = await AsyncStore.open(settings, mode="client")
+    try:
+        detail = await store.get_run(run_id)
+    finally:
+        await store.close()
+    assert detail is not None
+    assert (detail.run.status, detail.run.reason) == (RunStatus.CANCELLED, RunReason.SHUTDOWN)
+
+
+async def test_a_token_protects_the_api(daemon_project: ProjectFactory) -> None:
+    settings = _configure(daemon_project)
+    daemon = Daemon(settings, environ={"TREADLE_TOKEN": TOKEN})
+
+    async with serving(daemon, settings) as client:
+        anonymous = await client.get("/api/v1/status")
+        bearer = await client.get("/api/v1/status", headers={"Authorization": f"Bearer {TOKEN}"})
+
+    assert anonymous.status_code == 401
+    assert bearer.status_code == 200
+    assert bearer.json()["workflows"] == {"valid": 3, "invalid": 0}
+
+
+@pytest.mark.parametrize(
+    ("host", "environ", "message"),
+    [
+        (UNREACHABLE, {}, r"set TREADLE_TOKEN \(at least 32 characters\) or bind 127\.0\.0\.1"),
+        (None, {"TREADLE_TOKEN": "short"}, "TREADLE_TOKEN must be at least 32 characters long"),
+    ],
+)
+async def test_token_rules_refuse_to_start(
+    daemon_project: ProjectFactory, host: str | None, environ: dict[str, str], message: str
+) -> None:
+    settings = _configure(daemon_project, host=host)
+
+    with pytest.raises(ConfigError, match=message):
+        await Daemon(settings, environ=environ).run()
+
+    assert not settings.state_dir.exists()
+
+
+async def test_a_held_lock_refuses_to_start(daemon_project: ProjectFactory) -> None:
+    settings = _configure(daemon_project)
+    holder = LockHolder(4242, "run", iso_utc(SystemClock().now()), __version__)
+
+    with InstanceLock(settings.state_dir, holder), pytest.raises(LockHeldError) as caught:
+        await Daemon(settings, environ={}).run()
+
+    assert str(caught.value) == (
+        "another Treadle process holds the state directory lock (run, pid 4242)"
+    )
+
+
+async def test_bind_failures_are_busy_errors(daemon_project: ProjectFactory) -> None:
+    with socket.create_server(("127.0.0.1", 0)) as busy:
+        port = busy.getsockname()[1]
+        daemon_project.write_config(f'timezone = "UTC"\n[server]\nport = {port}\n')
+        with pytest.raises(BusyError, match=f"port {port} on 127.0.0.1 is in use"):
+            await Daemon(daemon_project.settings(), environ={}).run()
+
+    remote = _configure(daemon_project, host=UNREACHABLE)
+    with pytest.raises(BusyError, match=f"can't listen on {UNREACHABLE} port 0: "):
+        await Daemon(remote, environ={"TREADLE_TOKEN": TOKEN}).run()
+    assert InstanceLock.probe(remote.state_dir) is None
+
+
+async def test_a_deleted_workflow_goes_away_and_its_queued_runs_are_cancelled(
+    daemon_project: ProjectFactory,
+) -> None:
+    settings = _configure(daemon_project)
+    daemon = Daemon(settings, environ={})
+
+    async with serving(daemon, settings) as client:
+        (daemon_project.workflows_dir / "deploy.yml").unlink()
+        daemon.request_reload()
+
+        async def gone() -> bool:
+            return (await client.get("/api/v1/workflows/deploy")).status_code == 404
+
+        await _eventually(gone, within=5)
+
+
+@pytest.mark.parametrize("fails", [True, False])
+async def test_a_background_service_that_stops_drains_the_daemon(
+    daemon_project: ProjectFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    fails: bool,
+) -> None:
+    async def stops(self: Scheduler) -> None:
+        if fails:
+            raise RuntimeError("the scheduler broke")
+
+    monkeypatch.setattr(Scheduler, "run", stops)
+    settings = _configure(daemon_project)
+    caplog.set_level(logging.INFO, logger="treadle.daemon")
+
+    code = await asyncio.wait_for(Daemon(settings, environ={}).run(), 30)
+
+    assert code == ExitCode.FAILURE
+    message = "treadle-scheduler failed" if fails else "treadle-scheduler stopped unexpectedly"
+    assert message in caplog.text
+    assert "shutting down, because treadle-scheduler stopped" in caplog.text
+    assert InstanceLock.probe(settings.state_dir) is None
+
+
+async def test_startup_warns_about_loose_permissions_and_readmits_queued_runs(
+    daemon_project: ProjectFactory, caplog: pytest.LogCaptureFixture
+) -> None:
+    settings = _configure(daemon_project)
+    hello = _loaded(settings, "hello")
+    store = await AsyncStore.open(settings)
+    try:
+        await store.write(lambda repo: Runs(repo, hello).queued())
+    finally:
+        await store.close()
+    settings.state_dir.chmod(0o755)
+    daemon_project.env_path.chmod(0o644)
+    caplog.set_level(logging.INFO)
+    daemon = Daemon(settings, environ={})
+
+    async with serving(daemon, settings) as client:
+
+        async def readmitted() -> bool:
+            return await _status(client, 1) == "succeeded"
+
+        await _eventually(readmitted)
+
+    assert f"{settings.state_dir} is accessible by other users" in caplog.text
+    assert f"{daemon_project.env_path} is readable by other users" in caplog.text
+    assert "re-admitted 1 queued runs" in caplog.text
+
+
+async def test_an_embedded_daemon_runs_without_signal_handlers(
+    daemon_project: ProjectFactory,
+) -> None:
+    settings = _configure(daemon_project)
+    daemon = Daemon(settings, environ={})
+    started: asyncio.Queue[asyncio.AbstractEventLoop] = asyncio.Queue()
+    loop = asyncio.get_running_loop()
+
+    async def main() -> ExitCode:
+        loop.call_soon_threadsafe(started.put_nowait, asyncio.get_running_loop())
+        return await daemon.run()
+
+    worker = asyncio.create_task(asyncio.to_thread(asyncio.run, main()))
+    daemon_loop = await started.get()
+
+    async def listening() -> bool:
+        return _listening_port(settings) is not None
+
+    await _eventually(listening)
+    url = f"http://127.0.0.1:{_listening_port(settings)}"
+    async with httpx.AsyncClient(base_url=url, timeout=10) as client:
+        health = await client.get("/api/v1/health")
+    daemon_loop.call_soon_threadsafe(daemon.request_shutdown)
+
+    assert await asyncio.wait_for(worker, 30) == ExitCode.OK
+    assert health.status_code == 200
+
+
+def _loaded(settings: Settings, workflow_id: str) -> Workflow:
+    loader = WorkflowLoader(
+        builtin_registry(),
+        project_dir=settings.project_dir,
+        default_timezone=settings.timezone,
+        limits=settings.limits,
+        environment_checks=False,
+    )
+    result = loader.load_file(settings.workflows_dir / f"{workflow_id}.yml")
+    assert result.workflow is not None
+    return result.workflow

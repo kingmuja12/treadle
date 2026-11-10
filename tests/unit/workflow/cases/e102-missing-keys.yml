@@ -1,0 +1,4 @@
+name: No steps
+triggers:
+  webhook:
+    name: deploy

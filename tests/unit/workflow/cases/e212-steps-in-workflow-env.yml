@@ -1,0 +1,5 @@
+env:
+  TAG: ${{ steps.build.outputs.tag }}
+steps:
+  - id: build
+    run: echo "tag=v1" >> "$TREADLE_OUTPUT"

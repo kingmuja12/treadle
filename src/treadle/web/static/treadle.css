@@ -1,0 +1,373 @@
+/* Treadle dashboard styles. Status always pairs color with an icon and text. */
+
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --surface: #f5f6f8;
+  --text: #1b1f24;
+  --muted: #59636e;
+  --border: #d0d7de;
+  --link: #0a5bc4;
+  --focus: #0a5bc4;
+  --ok: #1a7f37;
+  --bad: #c11b2e;
+  --warn: #8a5a00;
+  --info: #4c4fd0;
+  --banner-bg: #fff4d6;
+  --banner-text: #4d3800;
+  --radius: 6px;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0f1216;
+    --surface: #1a1f26;
+    --text: #e6e9ed;
+    --muted: #9aa5b1;
+    --border: #353d47;
+    --link: #78b4ff;
+    --focus: #78b4ff;
+    --ok: #4ac26b;
+    --bad: #ff7b86;
+    --warn: #e3b341;
+    --info: #a5a8ff;
+    --banner-bg: #3d2e00;
+    --banner-text: #ffe8a3;
+  }
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+
+a {
+  color: var(--link);
+}
+
+:focus-visible {
+  outline: 3px solid var(--focus);
+  outline-offset: 2px;
+}
+
+code,
+pre {
+  font-family: var(--mono);
+  font-size: 0.9em;
+}
+
+.skip-link {
+  position: absolute;
+  left: 1rem;
+  top: -3rem;
+  padding: 0.5rem 1rem;
+  background: var(--bg);
+  border: 2px solid var(--focus);
+  border-radius: var(--radius);
+  z-index: 10;
+}
+
+.skip-link:focus {
+  top: 1rem;
+}
+
+.site-header {
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+
+.site-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1.5rem;
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 0.75rem 1rem;
+}
+
+.site-nav ul {
+  display: flex;
+  gap: 1rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.site-nav a[aria-current="page"] {
+  font-weight: 600;
+  text-decoration-thickness: 3px;
+}
+
+.brand {
+  font-weight: 700;
+  color: var(--text);
+  text-decoration: none;
+}
+
+.sign-out {
+  margin-left: auto;
+}
+
+main {
+  max-width: 72rem;
+  margin: 0 auto;
+  padding: 1rem;
+}
+
+main:focus {
+  outline: none;
+}
+
+.site-footer {
+  max-width: 72rem;
+  margin: 2rem auto 0;
+  padding: 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.875rem;
+}
+
+.banner {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  background: var(--banner-bg);
+  color: var(--banner-text);
+  text-align: center;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+}
+
+table.data caption {
+  text-align: left;
+  color: var(--muted);
+  padding-bottom: 0.5rem;
+}
+
+table.data th,
+table.data td {
+  padding: 0.5rem;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+
+table.data thead th {
+  font-size: 0.875rem;
+  color: var(--muted);
+}
+
+table.data tbody th {
+  font-weight: 600;
+}
+
+.issues-row td {
+  padding-top: 0;
+}
+
+pre.issues,
+pre.log,
+.payload pre {
+  margin: 0.5rem 0;
+  padding: 0.75rem;
+  overflow-x: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  white-space: pre;
+}
+
+pre.log {
+  max-height: 32rem;
+  overflow-y: auto;
+}
+
+.status {
+  display: inline-flex;
+  gap: 0.25rem;
+  align-items: baseline;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.status-succeeded,
+.status-ok {
+  color: var(--ok);
+}
+
+.status-failed,
+.status-timed_out,
+.status-invalid {
+  color: var(--bad);
+}
+
+.status-cancelled,
+.status-interrupted,
+.status-stale {
+  color: var(--warn);
+}
+
+.status-running,
+.status-retrying,
+.status-queued {
+  color: var(--info);
+}
+
+.status-skipped,
+.status-pending {
+  color: var(--muted);
+}
+
+.trigger {
+  margin: 0 0 0.25rem;
+}
+
+.trigger-error,
+.run-error,
+.field-error {
+  color: var(--bad);
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 0.25rem 1rem;
+}
+
+.facts dt {
+  color: var(--muted);
+}
+
+.facts dd {
+  margin: 0;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+  align-items: center;
+  margin: 1rem 0;
+}
+
+.actions form {
+  display: flex;
+  gap: 0.5rem;
+}
+
+button {
+  font: inherit;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid var(--link);
+  border-radius: var(--radius);
+  background: var(--link);
+  color: var(--bg);
+  cursor: pointer;
+}
+
+button.secondary {
+  background: transparent;
+  color: var(--link);
+}
+
+input,
+select {
+  font: inherit;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.field {
+  margin: 0 0 1rem;
+}
+
+.field label {
+  display: block;
+  font-weight: 600;
+}
+
+.field .hint {
+  margin: 0.125rem 0;
+  color: var(--muted);
+}
+
+.field-invalid input,
+.field-invalid select {
+  border: 2px solid var(--bad);
+}
+
+.field-error {
+  margin: 0.125rem 0;
+  font-weight: 600;
+}
+
+.error-summary {
+  margin: 1rem 0;
+  padding: 0.75rem 1rem;
+  border: 2px solid var(--bad);
+  border-radius: var(--radius);
+}
+
+.error-summary h3 {
+  margin-top: 0;
+}
+
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem;
+  align-items: flex-end;
+  padding: 1rem;
+  background: var(--surface);
+  border-radius: var(--radius);
+}
+
+.filters .field {
+  margin: 0;
+}
+
+.statuses {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.statuses .choice {
+  display: inline-flex;
+  gap: 0.25rem;
+  margin-right: 0.75rem;
+}
+
+.step-log summary {
+  cursor: pointer;
+  margin: 0.5rem 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

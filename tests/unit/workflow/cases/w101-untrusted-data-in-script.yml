@@ -1,0 +1,13 @@
+triggers:
+  webhook:
+    name: deploy
+    secret_env: HOOK_SECRET
+steps:
+  - id: fetch
+    uses: http
+    with:
+      url: https://example.net/version
+  - id: deploy
+    run: |
+      echo "Deploying ${{ trigger.body.ref }}"
+      echo "Remote says ${{ steps.fetch.outputs.body }}"

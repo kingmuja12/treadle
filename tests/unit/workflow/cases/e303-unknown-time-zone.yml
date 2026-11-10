@@ -1,0 +1,7 @@
+triggers:
+  schedule:
+    cron: "0 2 * * *"
+    timezone: Europe/Londn
+steps:
+  - id: greet
+    run: echo hi

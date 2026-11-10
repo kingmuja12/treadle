@@ -1,0 +1,10 @@
+workflows/e406-reserved-output.yml:5:7: error[E406]: output 'exit_code' reuses an output name of the shell step type
+   |
+ 5 |       exit_code: ${{ result.exit_code }}
+   |       ^
+   = help: rename the output
+workflows/e406-reserved-output.yml:11:7: error[E406]: output 'status' reuses an output name of the http step type
+   |
+11 |       status: ${{ result.status }}
+   |       ^
+   = help: rename the output

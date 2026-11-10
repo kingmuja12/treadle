@@ -1,0 +1,5 @@
+workflows/e052-merge-key.yml:3:5: error[E052]: merge keys (`<<`) aren't supported
+   |
+ 3 |     <<: {run: echo hi}
+   |     ^
+   = help: repeat the keys you need instead of merging them

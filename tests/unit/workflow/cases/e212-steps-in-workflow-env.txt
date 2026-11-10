@@ -1,0 +1,5 @@
+workflows/e212-steps-in-workflow-env.yml:2:12: error[E212]: `steps` isn't available in workflow env
+   |
+ 2 |   TAG: ${{ steps.build.outputs.tag }}
+   |            ^
+   = help: workflow env is rendered before any step runs; use the step's env instead

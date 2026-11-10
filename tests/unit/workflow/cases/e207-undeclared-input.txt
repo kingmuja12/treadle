@@ -1,0 +1,10 @@
+workflows/e207-undeclared-input.yml:7:17: error[E207]: undeclared input 'nmae'
+   |
+ 7 |       NAME: ${{ inputs.nmae }}
+   |                 ^
+   = help: did you mean 'name'?
+workflows/e207-undeclared-input.yml:8:18: error[E207]: undeclared input 'missing'
+   |
+ 8 |       OTHER: ${{ inputs.missing }}
+   |                  ^
+   = help: declare it under `inputs`

@@ -1,0 +1,15 @@
+workflows/w301-w302-watch-paths.yml:3:13: warning[W301]: the watch path /golden/missing doesn't exist
+   |
+ 3 |     paths: [/golden/missing, .]
+   |             ^
+   = help: the trigger stays degraded until the path exists
+workflows/w301-w302-watch-paths.yml:3:30: warning[W301]: the watch path /golden/project doesn't exist
+   |
+ 3 |     paths: [/golden/missing, .]
+   |                              ^
+   = help: the trigger stays degraded until the path exists
+workflows/w301-w302-watch-paths.yml:3:30: warning[W302]: the watch path /golden/project contains the state and workflows directories
+   |
+ 3 |     paths: [/golden/missing, .]
+   |                              ^
+   = help: Treadle writes there, so the workflow could trigger itself

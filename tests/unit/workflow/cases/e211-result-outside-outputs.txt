@@ -1,0 +1,4 @@
+workflows/e211-result-outside-outputs.yml:4:9: error[E211]: `result` is only available in step outputs
+   |
+ 4 |     if: result.status == 200
+   |         ^

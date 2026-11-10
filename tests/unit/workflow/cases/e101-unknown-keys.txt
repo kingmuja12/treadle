@@ -1,0 +1,40 @@
+workflows/e101-unknown-keys.yml:1:1: error[E101]: unknown key 'on' in workflow
+   |
+ 1 | on: push
+   | ^
+   = help: Treadle uses `triggers`. `on` is a YAML 1.1 boolean trap.
+workflows/e101-unknown-keys.yml:2:1: error[E101]: unknown key 'jobs' in workflow
+   |
+ 2 | jobs: {}
+   | ^
+   = help: Treadle has one step graph per file. Move the steps under `steps`.
+workflows/e101-unknown-keys.yml:3:1: error[E101]: unknown key 'runs-on' in workflow
+   |
+ 3 | runs-on: ubuntu-latest
+   | ^
+   = help: Treadle runs on this machine. Remove the key.
+workflows/e101-unknown-keys.yml:4:1: error[E101]: unknown key 'descripton' in workflow
+   |
+ 4 | descripton: Typo in a key.
+   | ^
+   = help: did you mean 'description'?
+workflows/e101-unknown-keys.yml:6:3: error[E101]: unknown key 'manual' in triggers
+   |
+ 6 |   manual: {}
+   |   ^
+   = help: every workflow accepts manual runs, so there is no `manual` trigger
+workflows/e101-unknown-keys.yml:7:3: error[E101]: unknown key 'workflow_dispatch' in triggers
+   |
+ 7 |   workflow_dispatch: {}
+   |   ^
+   = help: every workflow accepts manual runs; remove the key
+workflows/e101-unknown-keys.yml:11:5: error[E101]: unknown key 'continue-on-error' in step
+   |
+11 |     continue-on-error: true
+   |     ^
+   = help: use `continue_on_error`
+workflows/e101-unknown-keys.yml:12:5: error[E101]: unknown key 'working-directory' in step
+   |
+12 |     working-directory: ~/src
+   |     ^
+   = help: set the working directory under `with`, such as with: {cwd: ~/src}

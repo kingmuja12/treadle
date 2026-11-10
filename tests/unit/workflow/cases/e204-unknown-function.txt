@@ -1,0 +1,10 @@
+workflows/e204-unknown-function.yml:3:9: error[E204]: unknown function 'startswith'
+   |
+ 3 |     if: startswith(trigger.body.ref, 'refs/tags/')
+   |         ^
+   = help: did you mean 'startsWith'? Function names are case-sensitive.
+workflows/e204-unknown-function.yml:7:17: error[E204]: unknown function 'uppercase'
+   |
+ 7 |       TEXT: ${{ uppercase('x') }}
+   |                 ^
+   = help: did you mean 'upper'?

@@ -1,0 +1,48 @@
+{#- Shared macros. Child templates call them inside their blocks. -#}
+{% macro status(value) -%}
+<span class="status status-{{ value }}"><span class="status-icon" aria-hidden="true">{{ status_icon(value) }}</span> {{ value | replace("_", " ") }}</span>
+{%- endmacro %}
+{% macro when(value) -%}
+{% if value %}<time datetime="{{ value | iso }}">{{ value | localtime(timezone) }}</time>{% else %}-{% endif %}
+{%- endmacro %}
+{% macro csrf() -%}
+<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+{%- endmacro %}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>{{ title }} · Treadle</title>
+<link rel="stylesheet" href="/static/treadle.css">
+<script src="/static/treadle.js" defer></script>
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+<header class="site-header">
+  <nav class="site-nav" aria-label="Main">
+    <a class="brand" href="/">Treadle</a>
+    <ul>
+      <li><a href="/"{% if section == "workflows" %} aria-current="page"{% endif %}>Workflows</a></li>
+      <li><a href="/runs"{% if section == "runs" %} aria-current="page"{% endif %}>Runs</a></li>
+    </ul>
+    {% if signed_in %}
+    <form class="sign-out" method="post" action="/logout">
+      {{ csrf() }}
+      <button type="submit">Sign out</button>
+    </form>
+    {% endif %}
+  </nav>
+</header>
+{% if draining %}
+<p class="banner" role="status">Treadle is shutting down. It refuses new runs, and these pages still work.</p>
+{% endif %}
+<main id="main" tabindex="-1">
+{% block content %}{% endblock %}
+</main>
+<footer class="site-footer">
+  <p>Treadle {{ version }}</p>
+</footer>
+</body>
+</html>

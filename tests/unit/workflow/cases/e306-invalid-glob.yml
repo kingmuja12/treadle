@@ -1,0 +1,8 @@
+triggers:
+  watch:
+    paths: /srv/inbox
+    include: ["*.[ch", "reports/"]
+    exclude: ["[z-a]*"]
+steps:
+  - id: greet
+    run: echo hi

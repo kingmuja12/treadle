@@ -1,0 +1,5 @@
+workflows/e059-top-level-list.yml:1:1: error[E059]: the top level must be a mapping of workflow keys, got a list
+   |
+ 1 | - id: greet
+   | ^
+   = help: start the file with keys such as name: and steps:

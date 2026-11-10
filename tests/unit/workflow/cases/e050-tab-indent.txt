@@ -1,0 +1,5 @@
+workflows/e050-tab-indent.yml:2:1: error[E050]: found character '\t' that cannot start any token
+   |
+ 2 | 	- id: greet
+   | ^
+   = help: indent with spaces; YAML doesn't allow tabs here

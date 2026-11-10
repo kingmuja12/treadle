@@ -1,0 +1,6 @@
+steps:
+  - id: fetch
+    uses: http
+    run: curl https://example.net/
+    with:
+      url: https://example.net/

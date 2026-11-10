@@ -1,0 +1,8 @@
+name: Deploy ${{ inputs.target }}
+timeout: ${{ inputs.timeout }}
+steps:
+  - id: greet
+    name: Greet ${{ inputs.name }}
+    run: echo hi
+    with:
+      ${{ inputs.key }}: value

@@ -1,0 +1,7 @@
+timeout: 10m
+steps:
+  - id: quick
+    run: echo hi
+  - id: slow
+    run: sleep 30
+    timeout: 1h

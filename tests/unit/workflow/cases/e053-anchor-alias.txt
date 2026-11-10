@@ -1,0 +1,10 @@
+workflows/e053-anchor-alias.yml:2:13: error[E053]: anchors (`&name`) aren't supported
+   |
+ 2 |   GREETING: &greeting hello
+   |             ^
+   = help: repeat the value where you need it
+workflows/e053-anchor-alias.yml:6:13: error[E053]: aliases (`*name`) aren't supported
+   |
+ 6 |       TEXT: *greeting
+   |             ^
+   = help: repeat the value where you need it

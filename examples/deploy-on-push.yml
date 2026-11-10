@@ -1,0 +1,57 @@
+# Rebuilds a Hugo site and publishes it when main changes on a Forgejo server.
+#
+# Setup:
+#   1. Add BLOG_HOOK_SECRET to .env, with at least 16 random characters.
+#   2. In the repository's webhook settings on Forgejo, set the target URL to
+#      https://<your Treadle host>/hooks/blog-push, the content type to
+#      application/json, and the secret to the value of BLOG_HOOK_SECRET.
+#   3. Change the site directory (~/sites/blog) and the web root
+#      (/var/www/blog/) to yours.
+#
+# Data from the request reaches the build script only through env, where the
+# shell treats it as a value, never as code.
+name: Deploy blog on push
+description: Rebuild and publish the blog when main changes on the Forgejo server.
+triggers:
+  webhook:
+    name: blog-push
+    secret_env: BLOG_HOOK_SECRET
+    signature_header: X-Forgejo-Signature
+# A newer push cancels a deploy that is still running.
+concurrency: replace
+timeout: 45m
+steps:
+  - id: note
+    uses: log
+    with:
+      message: "Push to ${{ trigger.body.ref }} (${{ trigger.body.after }})"
+  - id: build
+    if: trigger.body.ref == 'refs/heads/main'
+    env:
+      COMMIT: ${{ trigger.body.after }}
+    with:
+      cwd: ~/sites/blog
+    run: |
+      case "$COMMIT" in (*[!0-9a-f]*|'') echo "unexpected commit id" >&2; exit 2;; esac
+      git fetch --quiet origin
+      git checkout --quiet --detach "$COMMIT"
+      hugo --minify
+    timeout: 10m
+  # A skipped step doesn't stop the steps after it, so each step checks how the
+  # one before it ended.
+  - id: publish
+    if: steps.build.status == 'succeeded'
+    uses: shell
+    with:
+      cwd: ~/sites/blog
+      argv: [rsync, -a, --delete, public/, /var/www/blog/]
+  - id: ping
+    if: steps.publish.status == 'succeeded'
+    uses: http
+    continue_on_error: true
+    retry: {attempts: 5, delay: 2s, backoff: 2, jitter: 0.2}
+    with:
+      url: https://blog.example.net/healthz
+      expect: [200]
+    outputs:
+      healthy: ${{ result.status == 200 }}

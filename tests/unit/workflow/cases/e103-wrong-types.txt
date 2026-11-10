@@ -1,0 +1,20 @@
+workflows/e103-wrong-types.yml:1:7: error[E103]: expected a string, got a list
+   |
+ 1 | name: [not, a, string]
+   |       ^
+workflows/e103-wrong-types.yml:3:10: error[E103]: expected a string, number, or boolean, got null
+   |
+ 3 |   EMPTY: null
+   |          ^
+workflows/e103-wrong-types.yml:7:14: error[E103]: expected a duration such as 30s, got a list
+   |
+ 7 |     timeout: [1, 2]
+   |              ^
+workflows/e103-wrong-types.yml:8:11: error[E103]: expected a mapping, got a string
+   |
+ 8 |     with: echo
+   |           ^
+workflows/e103-wrong-types.yml:9:5: error[E103]: expected a step mapping, got a string
+   |
+ 9 |   - "just a string"
+   |     ^

@@ -1,0 +1,8 @@
+steps:
+  - id: probe
+    uses: http
+    if: result.status == 200
+    with:
+      url: https://example.net/healthz
+    outputs:
+      healthy: ${{ result.status == 200 }}

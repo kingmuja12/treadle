@@ -1,0 +1,10 @@
+workflows/e209-unknown-step-field.yml:5:9: error[E209]: unknown step field 'conclusion'
+   |
+ 5 |     if: steps.build.conclusion == 'success'
+   |         ^
+   = help: use `outputs` or `status`
+workflows/e209-unknown-step-field.yml:7:16: error[E209]: unknown step field 'output'
+   |
+ 7 |       TAG: ${{ steps.build.output.tag }}
+   |                ^
+   = help: did you mean 'outputs'?

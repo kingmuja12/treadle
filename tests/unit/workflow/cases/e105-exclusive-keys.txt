@@ -1,0 +1,13 @@
+workflows/e105-exclusive-keys.yml:6:7: error[E105]: 'run' and 'argv' can't be used together
+   |
+ 6 |       argv: [echo, hi]
+   |       ^
+workflows/e105-exclusive-keys.yml:10:7: error[E105]: 'run' and 'with.argv' can't be used together
+   |
+10 |       argv: [echo, hi]
+   |       ^
+   = help: keep one of them
+workflows/e105-exclusive-keys.yml:16:7: error[E105]: 'json' and 'body' can't be used together
+   |
+16 |       body: "ok"
+   |       ^

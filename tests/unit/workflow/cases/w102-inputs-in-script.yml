@@ -1,0 +1,8 @@
+inputs:
+  name:
+    default: world
+steps:
+  - id: build
+    run: echo "tag=v1" >> "$TREADLE_OUTPUT"
+  - id: greet
+    run: echo "Hello, ${{ inputs.name }} at ${{ steps.build.outputs.tag }}"

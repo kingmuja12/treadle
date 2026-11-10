@@ -1,0 +1,10 @@
+workflows/e203-not-an-ancestor.yml:7:18: error[E203]: step 'first' isn't an ancestor of step 'second'
+   |
+ 7 |       VALUE: ${{ steps.first.outputs.value }}
+   |                  ^
+   = help: add 'first' to the needs of step 'second'
+workflows/e203-not-an-ancestor.yml:10:9: error[E203]: step 'fourth' isn't an ancestor of step 'third'
+   |
+10 |     if: steps.fourth.status == 'succeeded'
+   |         ^
+   = help: move step 'fourth' above step 'third' and add it to needs

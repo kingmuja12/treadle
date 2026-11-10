@@ -1,0 +1,5 @@
+name: Broken
+steps:
+  - id: greet
+    run: echo hi
+   uses: shell

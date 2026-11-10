@@ -1,0 +1,7 @@
+steps:
+  - id: nothing
+    name: Neither uses nor run
+  - id: empty-shell
+    uses: shell
+    with:
+      cwd: /tmp

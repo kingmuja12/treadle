@@ -1,0 +1,179 @@
+"""`LocalRunner`: a foreground run with real processes, threads, and a second process."""
+
+from __future__ import annotations
+
+import asyncio
+import sqlite3
+import subprocess
+import sys
+from collections.abc import Callable, Iterator
+
+import pytest
+from tests.integration.daemon.helpers import child_environ, kill_group, recorded_process_groups
+from tests.integration.triggers.helpers import eventually
+from tests.support.project import ProjectFactory
+from tests.unit.store.helpers import DAY, Runs, project_workflow
+
+from treadle.clock import SystemClock, to_ms
+from treadle.config import Settings
+from treadle.errors import LockHeldError, NotFoundError
+from treadle.lock import InstanceLock
+from treadle.models import RunReason, RunStatus
+from treadle.runner import LocalRunner
+from treadle.store.async_store import AsyncStore
+
+
+@pytest.fixture(autouse=True)
+def _kill_leftover_steps(daemon_project: ProjectFactory) -> Iterator[None]:
+    """Kill every step process group that the runner recorded, even after a failure."""
+    yield
+    for pgid in recorded_process_groups(daemon_project.settings().db_path):
+        kill_group(pgid)
+
+
+async def _seed(settings: Settings, workflow_id: str, make: Callable[[Runs], object]) -> None:
+    """Create runs in the project's database before any lock holder opens it."""
+    store = await AsyncStore.open(settings)
+    try:
+        workflow = project_workflow(settings.project_dir, workflow_id)
+        await store.write(lambda repo: make(Runs(repo, workflow)))
+    finally:
+        await store.close()
+
+
+async def test_a_run_executes_in_this_process_and_frees_the_lock(
+    daemon_project: ProjectFactory,
+) -> None:
+    settings = daemon_project.settings()
+
+    async with LocalRunner(settings) as runner:
+        holder = InstanceLock.probe(settings.state_dir)
+        submission = await runner.start("hello", {"name": "Ada"})
+        assert submission.run is not None
+        status = await runner.wait(submission.run.id)
+        lines = await runner.store.logs(submission.run.id)
+
+    assert holder is not None
+    assert holder.kind == "run"
+    assert status is RunStatus.SUCCEEDED
+    assert [line.text for line in lines] == ["Hello, Ada!"]
+    assert InstanceLock.probe(settings.state_dir) is None
+    assert list(settings.tmp_dir.iterdir()) == []
+    with pytest.raises(RuntimeError, match="isn't open"):
+        _ = runner.store
+
+
+async def test_a_cancel_from_another_process_reaches_the_run(
+    daemon_project: ProjectFactory,
+) -> None:
+    settings = daemon_project.settings()
+
+    async with LocalRunner(settings) as runner:
+        submission = await runner.start("nap", {})
+        assert submission.run is not None
+        run_id = submission.run.id
+        await eventually((daemon_project.root / f"nap-{run_id}.pid").exists, within=20)
+        cancel = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-m",
+            "treadle",
+            "-C",
+            str(daemon_project.root),
+            "cancel",
+            str(run_id),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_environ(),
+        )
+        out, err = await asyncio.wait_for(cancel.communicate(), 30)
+        status = await asyncio.wait_for(runner.wait(run_id), 30)
+        detail = await runner.store.get_run(run_id)
+
+    assert (cancel.returncode, out.decode(), err.decode()) == (
+        0,
+        f"Cancel requested for run #{run_id}.\n",
+        "",
+    )
+    assert status is RunStatus.CANCELLED
+    assert detail is not None
+    assert detail.run.reason is RunReason.USER
+
+
+async def test_opening_recovers_crashed_runs_and_leaves_queued_ones(
+    daemon_project: ProjectFactory,
+) -> None:
+    settings = daemon_project.settings()
+    await _seed(settings, "hello", lambda runs: (runs.running(), runs.queued()))
+    leftover = settings.tmp_dir / "run-1"
+    leftover.mkdir(parents=True)
+    stray = settings.tmp_dir / "run-2"
+    stray.write_text("not a directory")
+
+    async with LocalRunner(settings) as runner:
+        crashed = await runner.store.get_run(1)
+        queued = await runner.store.get_run(2)
+        busy = LocalRunner(settings)
+        with pytest.raises(LockHeldError):
+            await busy.__aenter__()
+
+    assert crashed is not None
+    assert queued is not None
+    assert (crashed.run.status, crashed.run.reason) == (
+        RunStatus.INTERRUPTED,
+        RunReason.EXECUTOR_STOPPED,
+    )
+    assert queued.run.status is RunStatus.QUEUED
+    assert not leftover.exists()
+    assert not stray.exists()
+
+
+async def test_closing_runs_a_bounded_retention_pass(daemon_project: ProjectFactory) -> None:
+    settings = daemon_project.settings()
+    old = to_ms(SystemClock().now()) - 40 * DAY
+
+    def seed(runs: Runs) -> None:
+        for _ in range(620):
+            runs.finished(RunStatus.SUCCEEDED, at_ms=old)
+
+    await _seed(settings, "hello", seed)
+
+    async with LocalRunner(settings):
+        pass
+
+    conn = sqlite3.connect(settings.db_path)
+    try:
+        (remaining,) = conn.execute("SELECT COUNT(*) FROM runs").fetchone()
+    finally:
+        conn.close()
+    assert remaining == 620 - 5 * 100  # five batches of 100, then the next run's turn
+
+
+async def test_the_runner_must_be_open_to_run_and_opens_only_once(
+    daemon_project: ProjectFactory,
+) -> None:
+    runner = LocalRunner(daemon_project.settings())
+
+    with pytest.raises(RuntimeError, match="isn't open"):
+        await runner.start("hello", {})
+    await runner.__aexit__(None, None, None)  # closing a runner that isn't open does nothing
+    async with runner:
+        with pytest.raises(RuntimeError, match="already open"):
+            await runner.__aenter__()
+        with pytest.raises(NotFoundError, match="run 99 doesn't exist"):
+            await runner.cancel(99)
+
+
+async def test_a_failed_retention_pass_only_warns(
+    daemon_project: ProjectFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def broken(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("the disk is full")
+
+    monkeypatch.setattr("treadle.runner.run_retention", broken)
+
+    async with LocalRunner(daemon_project.settings()):
+        pass
+
+    assert "retention failed; the next run or the daemon tries again" in caplog.text

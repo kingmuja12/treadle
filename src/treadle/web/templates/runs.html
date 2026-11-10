@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Runs</h1>
+<form class="filters" method="get" action="/runs" role="search" aria-label="Filter runs">
+  <div class="field">
+    <label for="filter-workflow">Workflow</label>
+    <select id="filter-workflow" name="workflow">
+      <option value="">All workflows</option>
+      {% for workflow_id in workflow_ids %}
+      <option value="{{ workflow_id }}"{% if workflow_id == filters.workflow_id %} selected{% endif %}>{{ workflow_id }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="filter-trigger">Trigger</label>
+    <select id="filter-trigger" name="trigger">
+      <option value="">Any trigger</option>
+      {% for kind in kinds %}
+      <option value="{{ kind }}"{% if kind == filters.trigger_kind %} selected{% endif %}>{{ kind }}</option>
+      {% endfor %}
+    </select>
+  </div>
+  <div class="field">
+    <label for="filter-q">Error or log text</label>
+    <input type="search" id="filter-q" name="q" value="{{ filters.text or '' }}">
+  </div>
+  <fieldset class="statuses">
+    <legend>Status</legend>
+    {% for value in statuses %}
+    <span class="choice">
+      <input type="checkbox" id="filter-status-{{ value }}" name="status" value="{{ value }}"{% if value in filters.statuses %} checked{% endif %}>
+      <label for="filter-status-{{ value }}">{{ value | replace("_", " ") }}</label>
+    </span>
+    {% endfor %}
+  </fieldset>
+  <button type="submit">Filter</button>
+  <a href="/runs">Clear filters</a>
+</form>
+
+{% if runs %}
+<table class="data">
+  <caption>Newest runs first.</caption>
+  <thead>
+    <tr>
+      <th scope="col">Run</th>
+      <th scope="col">Workflow</th>
+      <th scope="col">Status</th>
+      <th scope="col">Trigger</th>
+      <th scope="col">Started</th>
+      <th scope="col">Duration</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for run in runs %}
+    <tr>
+      <th scope="row"><a href="/runs/{{ run.id }}">#{{ run.id }}</a></th>
+      <td><a href="/workflows/{{ run.workflow_id | urlencode }}">{{ run.workflow_name }}</a></td>
+      <td>{{ status(run.status) }}{% if run.reason %} <span class="muted">({{ run.reason }})</span>{% endif %}</td>
+      <td>{{ run.trigger_kind }}</td>
+      <td>{{ when(run.started_at or run.created_at) }}</td>
+      <td>{{ run.duration_ms | duration }}</td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% if older_url %}
+<p class="pager"><a href="{{ older_url }}">Older runs</a></p>
+{% endif %}
+{% else %}
+<p class="muted">No runs match these filters.</p>
+{% endif %}
+{% endblock %}

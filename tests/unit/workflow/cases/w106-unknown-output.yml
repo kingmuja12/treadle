@@ -1,0 +1,9 @@
+steps:
+  - id: probe
+    uses: http
+    with:
+      url: https://example.net/healthz
+  - id: report
+    uses: log
+    with:
+      message: "status ${{ steps.probe.outputs.status_code }}"

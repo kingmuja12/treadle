@@ -1,0 +1,6 @@
+steps:
+  - id: greet
+    if: inputs.a == "b"
+    env:
+      CHAINED: ${{ 1 < 2 < 3 }}
+    run: echo ${{ inputs.name

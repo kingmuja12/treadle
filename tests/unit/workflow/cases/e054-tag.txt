@@ -1,0 +1,5 @@
+workflows/e054-tag.yml:1:15: error[E054]: tags aren't supported
+   |
+ 1 | max_parallel: !!int "4"
+   |               ^
+   = help: remove the tag; quote a value to make it a string

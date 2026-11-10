@@ -1,0 +1,18 @@
+steps:
+  - id: list
+    uses: shell
+    with:
+      argv: [ls, -l]
+      shell: bash
+  - id: probe
+    uses: http
+    timeout: 10s
+    with:
+      url: https://example.net/
+      timeout: 1m
+  - id: copy
+    uses: file
+    with:
+      action: copy
+      path: ~/backup.txt
+      content: unused

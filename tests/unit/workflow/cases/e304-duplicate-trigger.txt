@@ -1,0 +1,10 @@
+workflows/e304-duplicate-trigger.yml:4:7: error[E304]: duplicate schedule trigger
+   |
+ 4 |     - cron: "0 2 * * *"
+   |       ^
+   = help: it repeats triggers.schedule[0]
+workflows/e304-duplicate-trigger.yml:8:7: error[E304]: webhook 'deploy' is declared twice
+   |
+ 8 |     - {name: deploy, secret_env: HOOK_SECRET, rate_limit: 10}
+   |       ^
+   = help: it repeats triggers.webhook[0]

@@ -1,0 +1,57 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Workflows</h1>
+{% if rows %}
+<table class="data">
+  <caption>Every workflow in <code>{{ workflows_dir }}</code>, with its triggers and last run.</caption>
+  <thead>
+    <tr>
+      <th scope="col">Workflow</th>
+      <th scope="col">Triggers</th>
+      <th scope="col">Last run</th>
+      <th scope="col">State</th>
+    </tr>
+  </thead>
+  <tbody>
+  {% for row in rows %}
+    <tr>
+      <th scope="row">
+        <a href="/workflows/{{ row.entry.workflow_id | urlencode }}">{{ row.name }}</a>
+        <span class="muted">{{ row.entry.workflow_id }}</span>
+      </th>
+      <td>
+        {% for trigger in row.triggers %}
+        <p class="trigger">
+          {{ trigger.summary }}
+          {% if trigger.next_fire %}<span class="muted">next {{ when(trigger.next_fire) }}</span>{% endif %}
+          {% if trigger.error %}<span class="trigger-error"><span aria-hidden="true">⚠</span> {{ trigger.error }}</span>{% endif %}
+        </p>
+        {% else %}
+        <span class="muted">manual only</span>
+        {% endfor %}
+      </td>
+      <td>
+        {% if row.last_run %}
+        <a href="/runs/{{ row.last_run.id }}">#{{ row.last_run.id }}</a>
+        {{ status(row.last_run.status) }}
+        <span class="muted">{{ when(row.last_run.created_at) }}</span>
+        {% else %}
+        <span class="muted">never</span>
+        {% endif %}
+      </td>
+      <td>{{ status(row.state) }}</td>
+    </tr>
+    {% if row.issues %}
+    <tr class="issues-row">
+      <td colspan="4">
+        <pre class="issues">{{ row.issues }}</pre>
+      </td>
+    </tr>
+    {% endif %}
+  {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>No workflows yet. Add a YAML file to <code>{{ workflows_dir }}</code> to create one.</p>
+{% endif %}
+{% endblock %}

@@ -1,0 +1,6 @@
+triggers:
+  watch:
+    paths: [/golden/missing, .]
+steps:
+  - id: greet
+    run: echo hi

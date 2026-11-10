@@ -1,0 +1,12 @@
+workflows/e302-invalid-cron.yml:3:15: error[E302]: hour 25 isn't between 0 and 23
+   |
+ 3 |     - cron: 0 25 * * *
+   |               ^
+workflows/e302-invalid-cron.yml:4:18: error[E302]: the expression never fires: no date matches its day-of-month and month fields
+   |
+ 4 |     - cron: '0 0 30 2 *'
+   |                  ^
+workflows/e302-invalid-cron.yml:5:7: error[E302]: seconds fields aren't supported; use 5 fields: minute hour day-of-month month day-of-week
+   |
+ 5 |     - "*/5 * * * * *"
+   |       ^

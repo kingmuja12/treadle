@@ -1,0 +1,33 @@
+# Secrets: never commit real values.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Virtual environments
+.venv/
+venv/
+
+# Python caches and build output
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
+
+# Coverage reports
+.coverage
+.coverage.*
+coverage.json
+coverage.xml
+htmlcov/
+
+# Treadle state directories
+.treadle/
+
+# Operating system files
+.DS_Store

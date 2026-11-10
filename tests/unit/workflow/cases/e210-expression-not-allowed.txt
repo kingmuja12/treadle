@@ -1,0 +1,19 @@
+workflows/e210-expression-not-allowed.yml:1:14: error[E210]: expressions aren't allowed here
+   |
+ 1 | name: Deploy ${{ inputs.target }}
+   |              ^
+   = help: Treadle needs this value before a run starts; expressions work only in env, with, outputs, run, and if
+workflows/e210-expression-not-allowed.yml:2:10: error[E210]: expressions aren't allowed here
+   |
+ 2 | timeout: ${{ inputs.timeout }}
+   |          ^
+   = help: Treadle needs this value before a run starts; expressions work only in env, with, outputs, run, and if
+workflows/e210-expression-not-allowed.yml:5:17: error[E210]: expressions aren't allowed here
+   |
+ 5 |     name: Greet ${{ inputs.name }}
+   |                 ^
+   = help: Treadle needs this value before a run starts; expressions work only in env, with, outputs, run, and if
+workflows/e210-expression-not-allowed.yml:8:7: error[E210]: expressions aren't allowed in keys
+   |
+ 8 |       ${{ inputs.key }}: value
+   |       ^

@@ -1,0 +1,9 @@
+inputs:
+  name:
+    default: world
+steps:
+  - id: greet
+    env:
+      NAME: ${{ inputs.nmae }}
+      OTHER: ${{ inputs.missing }}
+    run: echo "$NAME"

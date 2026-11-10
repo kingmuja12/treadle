@@ -1,0 +1,8 @@
+steps:
+  - id: tag
+    if: startswith(trigger.body.ref, 'refs/tags/')
+    run: echo tagged
+  - id: other
+    env:
+      TEXT: ${{ uppercase('x') }}
+    run: echo "$TEXT"

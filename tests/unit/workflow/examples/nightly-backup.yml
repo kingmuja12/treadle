@@ -1,0 +1,44 @@
+name: Nightly backup
+description: Mirror ~/Documents to the backup drive every night and alert on failure.
+inputs:
+  dry_run:
+    type: boolean
+    default: false
+env:
+  DEST: /Volumes/Backup/documents
+triggers:
+  schedule:
+    cron: "30 2 * * *"
+    timezone: Europe/London
+    catch_up: latest
+concurrency: skip
+timeout: 3h
+defaults:
+  timeout: 2h
+  retry: {attempts: 3, delay: 30s, max_delay: 10m}
+steps:
+  - id: check-drive
+    run: test -d "$DEST"
+    retry: 1
+  - id: archive
+    env:
+      DRY_RUN: ${{ inputs.dry_run }}
+    run: |
+      flag=""
+      if [ "$DRY_RUN" = "true" ]; then flag="--dry-run"; fi
+      rsync -a --delete $flag "$HOME/Documents/" "$DEST/current/"
+      echo "stamp=$(date +%Y-%m-%d)" >> "$TREADLE_OUTPUT"
+  - id: record
+    uses: file
+    with:
+      action: append
+      path: ~/Library/Logs/treadle-backups.log
+      content: "${{ steps.archive.outputs.stamp }} ok run=${{ run.id }}\n"
+  - id: alert
+    needs: [archive]
+    if: failure()
+    uses: http
+    with:
+      method: POST
+      url: ${{ secrets.NTFY_URL }}
+      body: "Backup failed in run ${{ run.id }} (attempt ${{ run.attempt }})"

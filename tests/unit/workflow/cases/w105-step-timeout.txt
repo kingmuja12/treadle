@@ -1,0 +1,10 @@
+workflows/w105-step-timeout.yml:1:10: warning[W105]: the default step timeout (30m) is longer than the workflow timeout (10m)
+   |
+ 1 | timeout: 10m
+   |          ^
+   = help: the run times out first; lower the step timeout or raise `timeout`
+workflows/w105-step-timeout.yml:7:14: warning[W105]: the step timeout (1h) is longer than the workflow timeout (10m)
+   |
+ 7 |     timeout: 1h
+   |              ^
+   = help: the run times out first; lower the step timeout or raise `timeout`

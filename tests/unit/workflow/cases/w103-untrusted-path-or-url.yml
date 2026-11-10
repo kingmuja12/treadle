@@ -1,0 +1,15 @@
+triggers:
+  webhook:
+    name: fetch
+    secret_env: HOOK_SECRET
+steps:
+  - id: fetch
+    uses: http
+    with:
+      url: "https://example.net/${{ trigger.query.page }}"
+  - id: save
+    uses: file
+    with:
+      action: write
+      path: ~/inbox/${{ trigger.body.name }}
+      content: saved

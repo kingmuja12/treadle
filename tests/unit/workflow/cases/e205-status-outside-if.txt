@@ -1,0 +1,5 @@
+workflows/e205-status-outside-if.yml:7:16: error[E205]: status function 'failure()' is only allowed in `if`
+   |
+ 7 |       message: "previous step failed: ${{ failure() }}"
+   |                ^
+   = help: use steps.<id>.status to read a step's status outside `if`

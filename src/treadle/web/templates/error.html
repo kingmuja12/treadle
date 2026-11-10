@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ heading }}</h1>
+<p>{{ message }}</p>
+{% if issues %}
+<pre class="issues">{{ issues }}</pre>
+{% endif %}
+<p><a href="/">Back to the workflows</a></p>
+{% endblock %}

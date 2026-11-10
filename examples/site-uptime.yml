@@ -1,0 +1,44 @@
+# Checks a site every 5 minutes and sends a push notification through ntfy
+# when the check fails.
+#
+# Setup:
+#   1. Add NTFY_URL to .env, for example NTFY_URL=https://ntfy.sh/<your-topic>.
+#   2. Set the default of the url input to your site. To check another URL
+#      once, run: treadle run site-uptime -i url=https://example.org/
+name: Site uptime
+description: Check a site every 5 minutes and send an ntfy alert when it's down.
+inputs:
+  url:
+    type: string
+    default: https://example.com/
+triggers:
+  schedule:
+    cron: "*/5 * * * *"
+    # A check that was due while the machine slept is stale; skip it.
+    catch_up: none
+# If a check is still running when the next one is due, skip the next one.
+concurrency: skip
+timeout: 4m
+defaults:
+  timeout: 1m
+steps:
+  - id: probe
+    uses: http
+    retry: {attempts: 3, delay: 10s}
+    with:
+      url: ${{ inputs.url }}
+      expect: [200]
+      timeout: 10s
+      # The probe sends no credentials, so following redirects is safe.
+      follow_redirects: true
+  - id: alert
+    if: failure()
+    uses: http
+    with:
+      method: POST
+      url: ${{ secrets.NTFY_URL }}
+      headers:
+        Title: Site down
+        Priority: high
+        Tags: warning
+      body: "${{ inputs.url }} failed its check (status: ${{ steps.probe.outputs.status || 'no response' }}). Details: treadle show ${{ run.id }}"

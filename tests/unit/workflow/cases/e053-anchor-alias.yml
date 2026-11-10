@@ -1,0 +1,7 @@
+env:
+  GREETING: &greeting hello
+steps:
+  - id: greet
+    env:
+      TEXT: *greeting
+    run: echo "$TEXT"

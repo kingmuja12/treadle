@@ -1,0 +1,35 @@
+# Moves each new PDF in ~/Downloads into ~/Documents/PDFs.
+#
+# The step reads the changed paths from the event file at $TREADLE_EVENT_PATH,
+# so a file name never becomes part of a script. When a name is already taken
+# in the target folder, the file gets a numbered name, such as "report (1).pdf".
+name: Sort downloads
+description: Move new PDFs from Downloads into Documents/PDFs.
+triggers:
+  watch:
+    paths: ~/Downloads
+    # Patterns are case-sensitive, so list both spellings.
+    include: ["*.pdf", "*.PDF"]
+    events: [created]
+    # Wait until a download has been quiet for 5 seconds.
+    debounce: 5s
+steps:
+  - id: move
+    with:
+      shell: python
+    run: |
+      import json, os, pathlib, shutil
+      event = json.loads(pathlib.Path(os.environ["TREADLE_EVENT_PATH"]).read_text())
+      target = pathlib.Path.home() / "Documents" / "PDFs"
+      target.mkdir(parents=True, exist_ok=True)
+      for change in event["changes"]:
+          source = pathlib.Path(change["path"])
+          if not source.is_file():
+              continue
+          destination = target / source.name
+          number = 1
+          while destination.exists():
+              destination = target / f"{source.stem} ({number}){source.suffix}"
+              number += 1
+          shutil.move(source, destination)
+          print(f"moved {source.name} to {destination}")

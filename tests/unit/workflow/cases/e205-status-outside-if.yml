@@ -1,0 +1,7 @@
+steps:
+  - id: greet
+    run: echo hi
+  - id: report
+    uses: log
+    with:
+      message: "previous step failed: ${{ failure() }}"

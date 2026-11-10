@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>{{ name }}</h1>
+<dl class="facts">
+  <dt>ID</dt><dd><code>{{ entry.workflow_id }}</code></dd>
+  <dt>File</dt><dd><code>{{ path }}</code></dd>
+  <dt>State</dt><dd>{{ status(state) }}</dd>
+  {% if workflow %}
+  <dt>Concurrency</dt><dd>{{ workflow.concurrency.policy }}{% if workflow.concurrency.policy == "queue" %} (up to {{ workflow.concurrency.max_queued }} queued){% endif %}</dd>
+  <dt>Version</dt><dd><code>{{ workflow.short_digest }}</code></dd>
+  {% endif %}
+</dl>
+{% if workflow and workflow.description %}
+<p class="description">{{ workflow.description }}</p>
+{% endif %}
+
+{% if issues %}
+<section aria-labelledby="issues-heading">
+  <h2 id="issues-heading">Issues</h2>
+  {% if state == "stale" %}
+  <p>The newest version of this file is invalid, so runs use the last good version.</p>
+  {% endif %}
+  <pre class="issues">{{ issues }}</pre>
+</section>
+{% endif %}
+
+<section aria-labelledby="triggers-heading">
+  <h2 id="triggers-heading">Triggers</h2>
+  {% if triggers %}
+  <ul class="triggers">
+    {% for trigger in triggers %}
+    <li>
+      {{ trigger.summary }}
+      {% if trigger.next_fire %}<span class="muted">next {{ when(trigger.next_fire) }}</span>{% endif %}
+      {% if trigger.error %}<span class="trigger-error"><span aria-hidden="true">⚠</span> {{ trigger.error }}</span>{% endif %}
+    </li>
+    {% endfor %}
+  </ul>
+  {% else %}
+  <p class="muted">No triggers. Start runs from this page, the API, or <code>treadle run</code>.</p>
+  {% endif %}
+</section>
+
+{% if workflow %}
+<section aria-labelledby="steps-heading">
+  <h2 id="steps-heading">Steps</h2>
+  <table class="data">
+    <thead>
+      <tr>
+        <th scope="col">Step</th>
+        <th scope="col">Uses</th>
+        <th scope="col">Needs</th>
+        <th scope="col">If</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for step in workflow.steps %}
+      <tr>
+        <th scope="row">{{ step.name }}{% if step.name != step.id %} <span class="muted">{{ step.id }}</span>{% endif %}</th>
+        <td><code>{{ step.uses }}</code></td>
+        <td>{% if step.needs %}{{ step.needs | join(", ") }}{% if step.implicit_needs %} <span class="muted">(implicit)</span>{% endif %}{% else %}<span class="muted">none</span>{% endif %}</td>
+        <td><code>{{ step.condition.source }}</code></td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section aria-labelledby="run-now-heading">
+  <h2 id="run-now-heading">Run now</h2>
+  {% if problems %}
+  <div class="error-summary" role="alert" aria-labelledby="error-summary-heading">
+    <h3 id="error-summary-heading">The run didn't start</h3>
+    <ul>
+      {% for problem in problems %}
+      <li>{% if problem.field %}<a href="#input-{{ problem.field }}">{{ problem.text }}</a>{% else %}{{ problem.text }}{% endif %}</li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+  <form class="run-form" method="post" action="/workflows/{{ entry.workflow_id | urlencode }}/run">
+    {{ csrf() }}
+    {% for field in fields %}
+    <div class="field{% if field.error %} field-invalid{% endif %}">
+      <label for="input-{{ field.name }}">{{ field.name }}{% if field.required %} <span class="muted">(required)</span>{% endif %}</label>
+      {% if field.description %}<p class="hint" id="input-{{ field.name }}-hint">{{ field.description }}</p>{% endif %}
+      {% if field.error %}<p class="field-error" id="input-{{ field.name }}-error"><span aria-hidden="true">✗</span> {{ field.error }}</p>{% endif %}
+      {% if field.type == "boolean" %}
+      <input type="hidden" name="input.{{ field.name }}" value="false">
+      <input type="checkbox" id="input-{{ field.name }}" name="input.{{ field.name }}" value="true"{% if field.value == "true" %} checked{% endif %}{% if field.error %} aria-invalid="true"{% endif %}{% if field.described_by %} aria-describedby="{{ field.described_by }}"{% endif %}>
+      {% elif field.type == "choice" %}
+      <select id="input-{{ field.name }}" name="input.{{ field.name }}"{% if field.required %} required{% endif %}{% if field.error %} aria-invalid="true"{% endif %}{% if field.described_by %} aria-describedby="{{ field.described_by }}"{% endif %}>
+        {% if not field.required %}<option value=""{% if not field.value %} selected{% endif %}>(not set)</option>{% endif %}
+        {% for option in field.options %}
+        <option value="{{ option }}"{% if option == field.value %} selected{% endif %}>{{ option }}</option>
+        {% endfor %}
+      </select>
+      {% else %}
+      <input type="{{ 'text' if field.type == 'string' else 'number' }}"{% if field.type == "number" %} step="any"{% elif field.type == "integer" %} step="1"{% endif %} id="input-{{ field.name }}" name="input.{{ field.name }}" value="{{ field.value }}"{% if field.required %} required{% endif %}{% if field.error %} aria-invalid="true"{% endif %}{% if field.described_by %} aria-describedby="{{ field.described_by }}"{% endif %}>
+      {% endif %}
+    </div>
+    {% endfor %}
+    <button type="submit">Run {{ name }}</button>
+  </form>
+</section>
+{% endif %}
+
+<section aria-labelledby="recent-heading">
+  <h2 id="recent-heading">Recent runs</h2>
+  {% if runs %}
+  <table class="data">
+    <thead>
+      <tr>
+        <th scope="col">Run</th>
+        <th scope="col">Status</th>
+        <th scope="col">Trigger</th>
+        <th scope="col">Created</th>
+        <th scope="col">Duration</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for run in runs %}
+      <tr>
+        <th scope="row"><a href="/runs/{{ run.id }}">#{{ run.id }}</a></th>
+        <td>{{ status(run.status) }}</td>
+        <td>{{ run.trigger_kind }}</td>
+        <td>{{ when(run.created_at) }}</td>
+        <td>{{ run.duration_ms | duration }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p><a href="/runs?workflow={{ entry.workflow_id | urlencode }}">All runs of this workflow</a></p>
+  {% else %}
+  <p class="muted">This workflow hasn't run yet.</p>
+  {% endif %}
+</section>
+{% endblock %}

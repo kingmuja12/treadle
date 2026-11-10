@@ -1,0 +1,6 @@
+steps:
+  - id: greet
+    if: contains('abc') && success(true)
+    env:
+      JOINED: ${{ join() }}
+    run: echo "$JOINED"

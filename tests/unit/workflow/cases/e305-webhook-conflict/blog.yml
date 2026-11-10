@@ -1,0 +1,7 @@
+triggers:
+  webhook:
+    name: push
+    secret_env: HOOK_SECRET
+steps:
+  - id: build
+    run: echo build

@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "treadle"
+dynamic = ["version"]
+description = "A local, code-first workflow automation engine for schedules, file changes, webhooks, and manual runs."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Abdulmujeeb Abdulwaheed" }]
+requires-python = ">=3.11"
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Typing :: Typed",
+]
+dependencies = [
+  "PyYAML>=6.0.2,<7",
+  "starlette>=1.10,<2",
+  "uvicorn>=0.54,<0.60",
+  "jinja2>=3.1.6,<4",
+  "httpx>=0.28,<1",
+]
+
+[project.scripts]
+treadle = "treadle.cli.main:main"
+
+[project.urls]
+Homepage = "https://github.com/kingmuja12/treadle"
+Issues = "https://github.com/kingmuja12/treadle/issues"
+
+[dependency-groups]
+dev = ["pytest>=8.4", "pytest-cov>=6.2", "anyio>=4.16", "mypy>=1.18", "ruff>=0.13", "types-PyYAML>=6.0.12"]
+
+[tool.hatch.version]
+path = "src/treadle/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/treadle"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "SIM", "RUF", "S", "ASYNC", "C4", "PIE", "PT", "RET", "TID"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S108", "S311", "S603", "S607"]
+"scripts/**" = ["S603", "S607"]
+"src/treadle/steps/procs.py" = ["S603"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unreachable = true
+files = ["src/treadle"]
+
+[tool.pytest.ini_options]
+minversion = "8.4"
+testpaths = ["tests"]
+pythonpath = ["."]
+anyio_mode = "auto"
+addopts = ["-ra", "--strict-markers", "--strict-config", "--import-mode=importlib"]
+xfail_strict = true
+filterwarnings = ["error::DeprecationWarning:treadle"]
+
+[tool.coverage.run]
+branch = true
+source = ["treadle"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "@overload", "class .*\\bProtocol\\b.*:"]

@@ -1,0 +1,18 @@
+workflows/e407-invalid-parameters.yml:6:14: error[E407]: 'shell' applies only to 'run' scripts, not to 'argv'
+   |
+ 6 |       shell: bash
+   |              ^
+   = help: remove 'shell', or move the command into 'run'
+workflows/e407-invalid-parameters.yml:12:16: error[E407]: the request timeout (1m) is longer than the step timeout (10s)
+   |
+12 |       timeout: 1m
+   |                ^
+   = help: lower with.timeout, or raise the step's timeout
+workflows/e407-invalid-parameters.yml:16:7: error[E407]: action 'copy' needs 'source'
+   |
+16 |       action: copy
+   |       ^
+workflows/e407-invalid-parameters.yml:18:16: error[E407]: 'content' doesn't apply to action 'copy'
+   |
+18 |       content: unused
+   |                ^

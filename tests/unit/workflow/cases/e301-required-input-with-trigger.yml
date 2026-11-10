@@ -1,0 +1,10 @@
+inputs:
+  target:
+    required: true
+triggers:
+  schedule: "0 3 * * *"
+steps:
+  - id: deploy
+    env:
+      TARGET: ${{ inputs.target }}
+    run: echo "$TARGET"

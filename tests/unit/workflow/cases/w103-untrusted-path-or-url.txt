@@ -1,0 +1,10 @@
+workflows/w103-untrusted-path-or-url.yml:9:12: warning[W103]: `trigger.query.page` puts untrusted data into `url`
+   |
+ 9 |       url: "https://example.net/${{ trigger.query.page }}"
+   |            ^
+   = help: check the value first, or build the url from trusted parts
+workflows/w103-untrusted-path-or-url.yml:14:25: warning[W103]: `trigger.body.name` puts untrusted data into `path`
+   |
+14 |       path: ~/inbox/${{ trigger.body.name }}
+   |                         ^
+   = help: check the value first, or build the path from trusted parts

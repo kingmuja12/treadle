@@ -1,0 +1,5 @@
+workflows/e050-yaml-syntax.yml:5:4: error[E050]: expected <block end>, but found '<block mapping start>'
+   |
+ 5 |    uses: shell
+   |    ^
+   = help: while parsing a block collection, which starts at line 3, column 3

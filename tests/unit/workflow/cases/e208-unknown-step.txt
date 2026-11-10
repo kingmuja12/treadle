@@ -1,0 +1,5 @@
+workflows/e208-unknown-step.yml:6:16: error[E208]: unknown step 'biuld'
+   |
+ 6 |       TAG: ${{ steps.biuld.outputs.tag }}
+   |                ^
+   = help: did you mean 'build'?

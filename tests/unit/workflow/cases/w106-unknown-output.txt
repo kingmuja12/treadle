@@ -1,0 +1,5 @@
+workflows/w106-unknown-output.yml:9:16: warning[W106]: step 'probe' has no output 'status_code'
+   |
+ 9 |       message: "status ${{ steps.probe.outputs.status_code }}"
+   |                ^
+   = help: did you mean 'status'?

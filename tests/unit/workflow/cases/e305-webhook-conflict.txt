@@ -1,0 +1,5 @@
+workflows/docs.yml:5:13: error[E305]: webhook name 'push' is already used by workflow 'blog'
+   |
+ 5 |     - name: push
+   |             ^
+   = help: webhook names are unique across workflows; rename one of them

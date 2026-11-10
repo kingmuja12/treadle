@@ -1,0 +1,7 @@
+steps:
+  - id: deploy
+    needs: [build]
+    run: echo deploy
+  - id: build
+    needs: [buidl, build]
+    run: echo build

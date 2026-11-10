@@ -1,0 +1,9 @@
+name: [not, a, string]
+env:
+  EMPTY: null
+steps:
+  - id: greet
+    run: echo hi
+    timeout: [1, 2]
+    with: echo
+  - "just a string"

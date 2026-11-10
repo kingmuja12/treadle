@@ -1,0 +1,13 @@
+steps:
+  - id: first
+    run: echo "value=1" >> "$TREADLE_OUTPUT"
+  - id: second
+    needs: []
+    env:
+      VALUE: ${{ steps.first.outputs.value }}
+    run: echo "$VALUE"
+  - id: third
+    if: steps.fourth.status == 'succeeded'
+    run: echo hi
+  - id: fourth
+    run: echo hi

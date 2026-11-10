@@ -1,0 +1,5 @@
+workflows/e403-duplicate-step-id.yml:4:9: error[E403]: duplicate step ID 'greet'
+   |
+ 4 |   - id: greet
+   |         ^
+   = help: steps[0] already uses this ID

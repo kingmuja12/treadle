@@ -1,0 +1,10 @@
+workflows/e051-duplicate-key.yml:5:5: error[E051]: duplicate key 'run': first defined at line 4, column 5
+   |
+ 5 |     run: echo again
+   |     ^
+   = help: remove one of the two entries
+workflows/e051-duplicate-key.yml:6:1: error[E051]: duplicate key 'name': first defined at line 1, column 1
+   |
+ 6 | name: Second
+   | ^
+   = help: remove one of the two entries

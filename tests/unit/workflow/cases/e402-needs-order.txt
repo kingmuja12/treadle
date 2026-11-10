@@ -1,0 +1,15 @@
+workflows/e402-needs-order.yml:3:13: error[E402]: step 'build' comes after step 'deploy'
+   |
+ 3 |     needs: [build]
+   |             ^
+   = help: move step 'build' above step 'deploy'
+workflows/e402-needs-order.yml:6:13: error[E402]: unknown step 'buidl'
+   |
+ 6 |     needs: [buidl, build]
+   |             ^
+   = help: did you mean 'build'?
+workflows/e402-needs-order.yml:6:20: error[E402]: step 'build' can't need itself
+   |
+ 6 |     needs: [buidl, build]
+   |                    ^
+   = help: remove it from needs

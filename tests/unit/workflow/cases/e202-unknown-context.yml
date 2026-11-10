@@ -1,0 +1,6 @@
+steps:
+  - id: greet
+    env:
+      REF: ${{ github.ref }}
+      TYPO: ${{ inptus.name }}
+    run: echo hi

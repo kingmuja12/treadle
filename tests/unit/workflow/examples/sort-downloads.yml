@@ -1,0 +1,22 @@
+name: Sort downloads
+description: Move new PDFs from Downloads into Documents/PDFs.
+triggers:
+  watch:
+    paths: ~/Downloads
+    include: ["*.pdf"]
+    events: [created]
+    debounce: 5s
+steps:
+  - id: move
+    with:
+      shell: python
+    run: |
+      import json, os, pathlib, shutil
+      event = json.loads(pathlib.Path(os.environ["TREADLE_EVENT_PATH"]).read_text())
+      target = pathlib.Path.home() / "Documents" / "PDFs"
+      target.mkdir(parents=True, exist_ok=True)
+      for change in event["changes"]:
+          source = pathlib.Path(change["path"])
+          if source.exists():
+              shutil.move(source, target / source.name)
+              print(f"moved {source.name}")

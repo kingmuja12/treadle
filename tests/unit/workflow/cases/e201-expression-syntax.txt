@@ -1,0 +1,15 @@
+workflows/e201-expression-syntax.yml:3:21: error[E201]: unexpected character '"'
+   |
+ 3 |     if: inputs.a == "b"
+   |                     ^
+   = help: use single quotes
+workflows/e201-expression-syntax.yml:5:26: error[E201]: comparisons can't be chained
+   |
+ 5 |       CHAINED: ${{ 1 < 2 < 3 }}
+   |                          ^
+   = help: combine comparisons with &&
+workflows/e201-expression-syntax.yml:6:15: error[E201]: unterminated ${{
+   |
+ 6 |     run: echo ${{ inputs.name
+   |               ^
+   = help: close it with }}, or write a literal ${{ as ${{ '${{' }}

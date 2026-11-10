@@ -1,0 +1,6 @@
+name: First
+steps:
+  - id: greet
+    run: echo hi
+    run: echo again
+name: Second

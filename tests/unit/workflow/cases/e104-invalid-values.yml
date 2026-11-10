@@ -1,0 +1,12 @@
+concurrency: skp
+max_parallel: 64
+timeout: 30d
+defaults:
+  retry: {attempts: 3, delay: 10m}
+steps:
+  - id: Bad Id
+    run: echo hi
+  - id: wait
+    uses: sleep
+    with:
+      duration: 48h

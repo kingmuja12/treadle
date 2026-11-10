@@ -1,0 +1,7 @@
+steps:
+  - id: checkout
+    uses: actions/checkout@v4
+  - id: fetch
+    uses: htpp
+    with:
+      url: https://example.net/

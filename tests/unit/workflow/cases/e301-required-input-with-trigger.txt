@@ -1,0 +1,5 @@
+workflows/e301-required-input-with-trigger.yml:3:5: error[E301]: input 'target' is required, but schedule, watch, and webhook triggers can't supply inputs
+   |
+ 3 |     required: true
+   |     ^
+   = help: give the input a default instead

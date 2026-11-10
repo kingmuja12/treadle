@@ -1,0 +1,11 @@
+triggers:
+  schedule:
+    - "0 2 * * *"
+    - cron: "0 2 * * *"
+      catch_up: latest
+  webhook:
+    - {name: deploy, secret_env: HOOK_SECRET}
+    - {name: deploy, secret_env: HOOK_SECRET, rate_limit: 10}
+steps:
+  - id: greet
+    run: echo hi

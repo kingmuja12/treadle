@@ -1,0 +1,4 @@
+max_parallel: !!int "4"
+steps:
+  - id: greet
+    run: echo hi

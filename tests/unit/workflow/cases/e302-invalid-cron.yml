@@ -1,0 +1,8 @@
+triggers:
+  schedule:
+    - cron: 0 25 * * *
+    - cron: '0 0 30 2 *'
+    - "*/5 * * * * *"
+steps:
+  - id: greet
+    run: echo hi

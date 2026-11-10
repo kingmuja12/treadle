@@ -1,0 +1,301 @@
+"""Real processes through `run_process`, `terminate_group`, and `ProcessRegistry`."""
+
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import errno
+import os
+import signal
+import sys
+from pathlib import Path
+from typing import Any
+
+import pytest
+from tests.support.builders import make_runtime
+from tests.support.fakes import RecordingLog, RecordingProcesses
+
+from treadle.config import Limits
+from treadle.errors import StepError
+from treadle.models import LogStream
+from treadle.steps.base import StepRuntime
+from treadle.steps.procs import ProcessRegistry, ProcessResult, run_process, terminate_group
+
+PYTHON = sys.executable
+
+
+class ReadyLog(RecordingLog):
+    """Records lines, and sets `ready` when a process prints the line "ready"."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.ready = asyncio.Event()
+
+    def write(self, stream: LogStream, text: str) -> None:
+        super().write(stream, text)
+        if text == "ready":
+            self.ready.set()
+
+
+CLEANUP_CHILD = """\
+import os, signal, sys, time
+
+def clean_up(signum, frame):
+    time.sleep(0.3)
+    open(os.environ["MARKER"], "w").close()
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, clean_up)
+print("ready", flush=True)
+while True:
+    time.sleep(0.05)
+"""
+
+
+def runtime(tmp_path: Path, *, env: dict[str, str] | None = None, **kwargs: Any) -> StepRuntime:
+    rt = make_runtime(tmp_path, **kwargs)
+    return dataclasses.replace(rt, env={"PATH": os.environ["PATH"], **(env or {})})
+
+
+def real(path: Path) -> str:
+    return os.path.realpath(path)
+
+
+def write_file(path: Path, text: str) -> Path:
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def exists(path: Path) -> bool:
+    return path.exists()
+
+
+def tracked_group(processes: RecordingProcesses) -> int:
+    """Return the one process group that was tracked and then released."""
+    pgid = processes.history[0][1]
+    assert processes.history == [("add", pgid), ("discard", pgid)]
+    return pgid
+
+
+async def group_gone(pgid: int) -> bool:
+    """Wait up to 2 seconds for every member of a process group to be gone and reaped."""
+    for _ in range(40):
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:  # macOS reports zombies that way until they are reaped
+            pass
+        await asyncio.sleep(0.05)
+    return False
+
+
+async def test_both_streams_are_logged_line_by_line(tmp_path: Path) -> None:
+    log = RecordingLog()
+    rt = runtime(tmp_path, log=log)
+
+    script = "echo out; echo err >&2; printf 'crlf\\r\\n'; printf 'no newline'"
+    result = await run_process(["sh", "-c", script], cwd=tmp_path, rt=rt)
+
+    assert result == ProcessResult(exit_code=0, stdout_tail="")
+    assert log.texts(LogStream.STDOUT) == ["out", "crlf", "no newline"]
+    assert log.texts(LogStream.STDERR) == ["err"]
+
+
+async def test_the_process_group_is_tracked_while_it_runs(tmp_path: Path) -> None:
+    processes = RecordingProcesses()
+    rt = runtime(tmp_path, processes=processes)
+
+    await run_process(["true"], cwd=tmp_path, rt=rt)
+
+    assert tracked_group(processes) > 0
+    assert processes.live == set()
+
+
+async def test_add_mask_lines_register_a_mask_and_are_hidden(tmp_path: Path) -> None:
+    log = RecordingLog()
+    rt = runtime(tmp_path, log=log)
+
+    script = "echo '::add-mask::s3cret-value'; echo after; echo '::add-mask::not-on-stderr' >&2"
+    await run_process(["sh", "-c", script], cwd=tmp_path, rt=rt)
+
+    assert log.masks == ["s3cret-value"]
+    assert log.texts(LogStream.STDOUT) == ["::add-mask::***", "after"]
+    assert log.texts(LogStream.STDERR) == ["::add-mask::not-on-stderr"]
+
+
+async def test_capture_keeps_the_last_characters_of_stdout(tmp_path: Path) -> None:
+    rt = runtime(tmp_path)
+    code = r"import sys; sys.stdout.buffer.write('h\u00e9llo w\u00f6rld\n'.encode('utf-8'))"
+
+    result = await run_process([PYTHON, "-c", code], cwd=tmp_path, rt=rt, capture=5)
+
+    assert result.stdout_tail == "\u00f6rld\n"
+
+
+async def test_a_long_line_is_cut_after_the_slack(tmp_path: Path) -> None:
+    log = RecordingLog()
+    rt = runtime(tmp_path, log=log, limits=Limits(line_bytes=1024))
+
+    await run_process([PYTHON, "-c", "print('x' * 5000); print('next')"], cwd=tmp_path, rt=rt)
+
+    assert log.texts(LogStream.STDOUT) == ["x" * 2048 + " [line truncated]", "next"]
+
+
+async def test_stdin_is_empty(tmp_path: Path) -> None:
+    rt = runtime(tmp_path)
+
+    async with asyncio.timeout(10):
+        result = await run_process(["cat"], cwd=tmp_path, rt=rt)
+
+    assert result.exit_code == 0
+
+
+async def test_the_process_gets_exactly_the_runtime_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("TREADLE_TEST_PARENT_ONLY", "leaked")
+    log = RecordingLog()
+    rt = runtime(tmp_path, log=log, env={"ONLY": "1"})
+
+    script = 'echo "$ONLY|${TREADLE_TEST_PARENT_ONLY-unset}"; pwd -P'
+    await run_process(["sh", "-c", script], cwd=tmp_path, rt=rt)
+
+    assert log.texts(LogStream.STDOUT) == ["1|unset", real(tmp_path)]
+
+
+@pytest.mark.parametrize(
+    ("script", "code"),
+    [("exit 7", 7), ("kill -TERM $$", 128 + signal.SIGTERM), ("kill -KILL $$", 137)],
+)
+async def test_exit_codes_report_signals_as_128_plus_the_signal(
+    tmp_path: Path, script: str, code: int
+) -> None:
+    result = await run_process(["sh", "-c", script], cwd=tmp_path, rt=runtime(tmp_path))
+
+    assert result.exit_code == code
+
+
+async def test_a_missing_program_or_directory_fails_to_start(tmp_path: Path) -> None:
+    processes = RecordingProcesses()
+    rt = runtime(tmp_path, processes=processes)
+    missing = os.strerror(errno.ENOENT)
+
+    with pytest.raises(StepError) as program:
+        await run_process(["treadle-no-such-program"], cwd=tmp_path, rt=rt)
+    with pytest.raises(StepError) as directory:
+        await run_process(["true"], cwd=tmp_path / "gone", rt=rt)
+
+    assert program.value.message == (
+        f"cannot start treadle-no-such-program: {missing} (treadle-no-such-program)"
+    )
+    assert directory.value.message == f"cannot start true: {missing} ({tmp_path / 'gone'})"
+    assert program.value.retryable is True
+    assert processes.history == []
+
+
+async def test_the_grace_period_lets_a_child_finish_after_its_shell_exits(
+    tmp_path: Path,
+) -> None:
+    child = write_file(tmp_path / "child.py", CLEANUP_CHILD)
+    marker = tmp_path / "cleaned-up"
+    log, processes = ReadyLog(), RecordingProcesses()
+    rt = runtime(tmp_path, log=log, processes=processes, kill_grace=5, env={"MARKER": str(marker)})
+    # The shell runs the child in the foreground and dies at once on SIGTERM; the child takes
+    # 0.3 seconds to clean up, which SIGKILL must not cut short.
+    script = f'"{PYTHON}" "{child}"; echo unreachable'
+    task = asyncio.create_task(run_process(["sh", "-c", script], cwd=tmp_path, rt=rt))
+    await asyncio.wait_for(log.ready.wait(), 10)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert exists(marker)
+    assert "unreachable" not in log.texts()
+    assert await group_gone(tracked_group(processes))
+
+
+async def test_sigkill_follows_the_grace_period_when_sigterm_is_ignored(tmp_path: Path) -> None:
+    log, processes = ReadyLog(), RecordingProcesses()
+    rt = runtime(tmp_path, log=log, processes=processes, kill_grace=0.3)
+    script = "trap '' TERM; sleep 100 & echo ready; sleep 100"
+    task = asyncio.create_task(run_process(["sh", "-c", script], cwd=tmp_path, rt=rt))
+    await asyncio.wait_for(log.ready.wait(), 10)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert loop.time() - started >= 0.25
+    pgid = tracked_group(processes)
+    assert await group_gone(pgid)
+
+
+async def test_a_member_that_ignores_sigterm_doesnt_outlive_its_leader(tmp_path: Path) -> None:
+    log, processes = ReadyLog(), RecordingProcesses()
+    rt = runtime(tmp_path, log=log, processes=processes, kill_grace=0.3)
+    script = "trap '' TERM; sleep 100 & trap - TERM; echo ready; sleep 100"
+    task = asyncio.create_task(run_process(["sh", "-c", script], cwd=tmp_path, rt=rt))
+    await asyncio.wait_for(log.ready.wait(), 10)
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    pgid = tracked_group(processes)
+    assert await group_gone(pgid)
+
+
+async def test_terminate_group_stops_a_process_that_exits_on_sigterm() -> None:
+    proc = await asyncio.create_subprocess_exec("sleep", "100", start_new_session=True)
+
+    async with asyncio.timeout(4):
+        await terminate_group(proc, grace=30)
+
+    assert proc.returncode == -signal.SIGTERM
+
+
+async def test_terminate_group_without_grace_kills_at_once() -> None:
+    proc = await asyncio.create_subprocess_exec(
+        "sh",
+        "-c",
+        "trap '' TERM; echo ready; sleep 100",
+        stdout=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert proc.stdout is not None
+    assert await proc.stdout.readline() == b"ready\n"
+
+    # The kill usually lands while the shell forks `sleep`, which macOS lets escape a single
+    # group signal; the pipe reaches its end only when no member of the group survived.
+    async with asyncio.timeout(4):
+        await terminate_group(proc, grace=0)
+        assert await proc.stdout.read() == b""
+
+    assert proc.returncode == -signal.SIGKILL
+    assert await group_gone(proc.pid)
+
+
+async def test_terminate_group_returns_at_once_when_the_group_is_gone() -> None:
+    proc = await asyncio.create_subprocess_exec("true", start_new_session=True)
+    await proc.wait()
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    await terminate_group(proc, grace=30)
+
+    assert loop.time() - started < 1
+    assert proc.returncode == 0
+
+
+async def test_kill_all_signals_live_groups() -> None:
+    proc = await asyncio.create_subprocess_exec("sleep", "100", start_new_session=True)
+    registry = ProcessRegistry()
+    registry.add(proc.pid)
+
+    assert registry.kill_all() == 1
+    assert await proc.wait() == -signal.SIGKILL
+    assert registry.kill_all() == 0
