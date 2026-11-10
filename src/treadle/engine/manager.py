@@ -346,7 +346,7 @@ class RunManager:
             if self._workflows.get(run.workflow_id) is None:
                 await self._readmit_unlisted(run, listed=listed)
                 continue
-            workflow = await self._workflows.version(run.digest)
+            workflow = await self._workflows.version(run.digest, workflow_id=run.workflow_id)
             if workflow is None:
                 await self._fail_unloadable(run.id)
             elif await self._replay(run, workflow):

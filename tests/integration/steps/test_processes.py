@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import errno
+import gc
 import os
 import signal
 import sys
@@ -18,6 +19,7 @@ from tests.support.fakes import RecordingLog, RecordingProcesses
 from treadle.config import Limits
 from treadle.errors import StepError
 from treadle.models import LogStream
+from treadle.steps import procs
 from treadle.steps.base import StepRuntime
 from treadle.steps.procs import (
     LeftoverGroups,
@@ -92,6 +94,24 @@ async def group_gone(pgid: int) -> bool:
             return True
         except PermissionError:  # macOS reports zombies that way until they are reaped
             pass
+        await asyncio.sleep(0.05)
+    return False
+
+
+def group_alive(pgid: int) -> bool:
+    """True while the process group exists. Zombies alone count as gone, as for Treadle."""
+    try:
+        os.killpg(pgid, 0)
+    except (ProcessLookupError, PermissionError):  # PermissionError: only zombies (macOS)
+        return False
+    return True
+
+
+async def released(processes: RecordingProcesses, pgid: int) -> bool:
+    """Wait up to 2 seconds for `processes` to stop tracking a process group."""
+    for _ in range(40):
+        if ("discard", pgid) in processes.history:
+            return True
         await asyncio.sleep(0.05)
     return False
 
@@ -260,6 +280,65 @@ async def test_a_member_that_ignores_sigterm_doesnt_outlive_its_leader(tmp_path:
 
     pgid = tracked_group(processes)
     assert await group_gone(pgid)
+
+
+async def test_a_second_cancellation_kills_the_group_without_waiting_out_the_grace(
+    tmp_path: Path,
+) -> None:
+    log, processes = ReadyLog(), RecordingProcesses()
+    rt = runtime(tmp_path, log=log, processes=processes, kill_grace=30)
+    script = "trap '' TERM; sleep 100 & echo ready; sleep 100"
+    task = asyncio.create_task(run_process(["sh", "-c", script], cwd=tmp_path, rt=rt))
+    await asyncio.wait_for(log.ready.wait(), 10)
+    pgid = processes.history[0][1]
+    task.cancel()
+    await asyncio.sleep(0.2)  # the group gets SIGTERM, which it ignores
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    task.cancel()  # as a forced cancel does
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert loop.time() - started < 2.5  # well before the 30-second grace ends
+    assert not group_alive(pgid)  # gone before the CancelledError arrived
+    assert await released(processes, pgid)
+
+
+async def test_pipes_that_outlive_the_group_leave_no_error_for_the_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(procs, "_KILL_WAIT", 0.3)  # also how long a stop waits for the pipes
+    reports: list[str] = []
+    loop = asyncio.get_running_loop()
+    handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _, context: reports.append(context["message"]))
+    log = ReadyLog()
+    rt = runtime(tmp_path, log=log, kill_grace=0.3)
+    # The child leaves the group, so stopping the group leaves both pipes open.
+    child = (
+        "import os, time; os.setsid(); print(os.getpid()); print('ready', flush=True); "
+        "time.sleep(5)"
+    )
+    script = f'"{PYTHON}" -c "{child}" & sleep 100'
+    try:
+        task = asyncio.create_task(run_process(["sh", "-c", script], cwd=tmp_path, rt=rt))
+        await asyncio.wait_for(log.ready.wait(), 10)
+        escaped = int(log.texts(LogStream.STDOUT)[0])
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        del task
+        await asyncio.sleep(0.1)  # the cancelled pumps finish
+        gc.collect()  # a future reports an exception that nothing retrieved when collected
+        # Ending the child closes the pipes, so the subprocess transport closes too.
+        os.kill(escaped, signal.SIGKILL)
+        assert await group_gone(escaped)
+        await asyncio.sleep(0.1)
+    finally:
+        loop.set_exception_handler(handler)
+
+    assert reports == []
 
 
 async def test_terminate_group_stops_a_process_that_exits_on_sigterm() -> None:

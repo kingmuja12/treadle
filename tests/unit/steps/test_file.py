@@ -698,6 +698,18 @@ async def test_a_directory_copy_never_merges_into_the_state_directory(
             "content holds text that isn't valid Unicode, which can't be written as UTF-8",
             id="content",
         ),
+        pytest.param(
+            {"action": "write", "path": "~treadle-no-such-user/notes.txt"},
+            "can't expand '~treadle-no-such-user' in path '~treadle-no-such-user/notes.txt' "
+            "to a home directory; check the user name after '~', or write the full path",
+            id="path-with-an-unknown-user",
+        ),
+        pytest.param(
+            {"action": "copy", "source": "~treadle-no-such-user/in.txt", "path": "out.txt"},
+            "can't expand '~treadle-no-such-user' in source '~treadle-no-such-user/in.txt' "
+            "to a home directory; check the user name after '~', or write the full path",
+            id="source-with-an-unknown-user",
+        ),
     ],
 )
 async def test_a_value_that_cant_reach_the_file_system_is_a_config_error(

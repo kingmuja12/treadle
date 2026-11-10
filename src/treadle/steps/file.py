@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import functools
 import os
 import shutil
 import stat
@@ -15,6 +16,7 @@ from typing import ClassVar, Final, Literal, TypeAlias, cast
 from treadle.errors import PathNotAllowedError, StepConfigError, StepError
 from treadle.schema import Bool, Field, Obj, Str
 from treadle.steps.base import StepResult, StepRuntime, check_os_text
+from treadle.steps.shell import expand_home
 from treadle.types import Issue, JSONValue, Severity, YamlPath
 
 _Params: TypeAlias = Mapping[str, JSONValue]
@@ -90,18 +92,37 @@ class FileStep:
         """Perform the action in a worker thread and return `path`, `bytes`, and `changed`.
 
         A thread can't be interrupted, so a cancelled step waits for the operation to end,
-        logs whether it finished, and re-raises; a retry never overlaps it, and a second
-        cancellation stops the wait. Path violations raise PathNotAllowedError. An existing
-        destination without `overwrite`, or a directory without `recursive`, raises
-        StepConfigError. Other OS errors raise a retryable StepError.
+        logs whether it finished, and re-raises; a retry never overlaps it. A second
+        cancellation stops the wait, and the operation's outcome is logged when it ends.
+        Path violations raise PathNotAllowedError. An existing destination without
+        `overwrite`, or a directory without `recursive`, raises StepConfigError. Other OS
+        errors raise a retryable StepError.
         """
         work = asyncio.create_task(asyncio.to_thread(_perform, params, rt))
+        # asyncio.wait never cancels `work`. From Python 3.14 on, asyncio.shield would also
+        # report an error that `work` raises after a cancellation, even one logged here.
         try:
-            return await asyncio.shield(work)
-        except asyncio.CancelledError:
             await asyncio.wait([work])
-            rt.log.system(_late_outcome(work))
+        except asyncio.CancelledError:
+            try:
+                await asyncio.wait([work])
+            except asyncio.CancelledError:
+                # Logging the outcome also retrieves the error, so the event loop never
+                # reports it as unretrieved.
+                work.add_done_callback(functools.partial(_log_late_outcome, rt))
+                raise
+            _log_late_outcome(rt, work)
             raise
+        return work.result()
+
+
+def _log_late_outcome(rt: StepRuntime, work: asyncio.Task[StepResult]) -> None:
+    """Log how a file operation that outlived its step's cancellation ended.
+
+    A task that a closing event loop cancelled has no outcome to log.
+    """
+    if not work.cancelled():
+        rt.log.system(_late_outcome(work))
 
 
 def _late_outcome(work: asyncio.Task[StepResult]) -> str:
@@ -121,10 +142,11 @@ def resolve_path(
     `~` expands, and a relative path resolves against the project directory. Symlinks
     resolve, except a final one when `follow_final` is False. The result must be inside a
     file root and, with `modify`, outside the state directory. Raises PathNotAllowedError,
-    or StepConfigError naming `key` for a path that the operating system can't take.
+    or StepConfigError naming `key` for a path that the operating system can't take or
+    whose "~user" has no known home directory.
     """
     check_os_text(raw, key)
-    path = rt.project_dir / Path(raw).expanduser()
+    path = rt.project_dir / expand_home(raw, key)
     if follow_final or path.name in ("", ".."):
         resolved = _real(path)
     else:

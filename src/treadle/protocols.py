@@ -43,8 +43,12 @@ class WorkflowSource(Protocol):
     def entries(self) -> list[WorkflowEntry]:
         """Return every entry, sorted by workflow ID."""
 
-    async def version(self, digest: str) -> Workflow | None:
-        """Return a stored workflow version, parsed again, or None when it no longer loads."""
+    async def version(self, digest: str, *, workflow_id: str | None = None) -> Workflow | None:
+        """Return a stored workflow version, parsed again, or None when it no longer loads.
+
+        Files with identical bytes share a digest, so `workflow_id`, when given, picks that
+        workflow's version.
+        """
 
 
 class RunSubmitter(Protocol):

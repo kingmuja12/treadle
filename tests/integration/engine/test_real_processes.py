@@ -228,7 +228,7 @@ async def test_a_forced_cancel_ends_the_run_without_waiting_out_the_kill_grace(
 
     assert status is RunStatus.CANCELLED
     assert took < 2  # well before the 3-second kill grace
-    assert await group_gone(pgid, within=5)
+    assert await group_gone(pgid, within=1)  # the force sent SIGKILL at once
 
 
 async def test_a_secret_printed_by_a_real_process_is_masked_in_storage(

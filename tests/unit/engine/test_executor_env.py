@@ -15,7 +15,7 @@ from tests.unit.engine.conftest import API_TOKEN
 from tests.unit.engine.helpers import Engine, step_of
 
 from treadle.config import RunSettings
-from treadle.models import Defaults, RetryPolicy, ShellSpec, StepStatus, Workflow
+from treadle.models import AttemptStatus, Defaults, RetryPolicy, ShellSpec, StepStatus, Workflow
 from treadle.schema import Obj
 from treadle.secrets import SecretSnapshot
 from treadle.steps.base import StepResult, StepRuntime
@@ -333,6 +333,31 @@ async def test_the_default_cwd_expands_home_and_keeps_absolute_paths(
     await engine.execute(make_workflow(make_step("look", uses="probe"), defaults=Defaults(cwd=cwd)))
 
     assert probe.runtimes[0].default_cwd == expected
+
+
+async def test_a_default_cwd_without_a_home_directory_fails_the_shell_steps_that_use_it(
+    make_engine: Callable[..., Engine],
+) -> None:
+    probe = ProbeStep()
+    engine = make_engine(probe)
+    workflow = make_workflow(
+        make_step("build", uses="shell", params={"run": "true"}),
+        make_step("look", uses="probe", needs=[]),
+        defaults=Defaults(cwd="~treadle-no-such-user/src"),
+    )
+
+    detail = await engine.execute(workflow)
+
+    error = (
+        "can't expand '~treadle-no-such-user' in defaults.cwd '~treadle-no-such-user/src' "
+        "to a home directory; check the user name after '~', or write the full path"
+    )
+    build = step_of(detail, "build")
+    assert (build.status, build.error) == (StepStatus.FAILED, error)
+    assert [attempt.status for attempt in build.attempts] == [AttemptStatus.FAILED]
+    assert step_of(detail, "look").status is StepStatus.SUCCEEDED
+    assert probe.runtimes[0].default_cwd == Path("~treadle-no-such-user/src")
+    assert detail.run.error == f"step 'build' failed: {error}"
 
 
 async def test_retries_get_their_own_attempt_directories(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import os
 from pathlib import Path
 from typing import cast
@@ -284,6 +285,40 @@ async def test_a_value_that_a_process_cant_receive_is_a_config_error(
 
     assert caught.value.message == message
     assert caught.value.retryable is False
+    assert processes.history == []
+
+
+NO_HOME = "~treadle-no-such-user"
+
+
+@pytest.mark.parametrize(
+    ("raw", "runtime", "key"),
+    [
+        pytest.param({"run": "true", "cwd": f"{NO_HOME}/src"}, {}, "cwd", id="cwd"),
+        # The executor leaves a `defaults.cwd` that it can't expand as written.
+        pytest.param(
+            {"run": "true"},
+            {"default_cwd": Path(f"{NO_HOME}/src")},
+            "defaults.cwd",
+            id="defaults-cwd",
+        ),
+    ],
+)
+async def test_a_cwd_whose_user_has_no_home_directory_is_a_config_error(
+    tmp_path: Path, raw: dict[str, object], runtime: dict[str, object], key: str
+) -> None:
+    processes = RecordingProcesses()
+    rt = dataclasses.replace(make_runtime(tmp_path, processes=processes), **runtime)
+    value, issues = validate(ShellStep().schema, raw)
+    assert issues == []
+
+    with pytest.raises(StepConfigError) as caught:
+        await ShellStep().run(cast(dict[str, JSONValue], value), rt)
+
+    assert caught.value.message == (
+        f"can't expand '{NO_HOME}' in {key} '{NO_HOME}/src' to a home directory; "
+        "check the user name after '~', or write the full path"
+    )
     assert processes.history == []
 
 

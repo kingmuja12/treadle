@@ -174,6 +174,24 @@ def parse_output_file(text: str) -> dict[str, str]:
     return outputs
 
 
+def expand_home(raw: str | Path, key: str) -> Path:
+    """Return `raw`, the value of the path parameter `key`, with a leading "~" expanded.
+
+    The `file` step expands its paths the same way. Raises StepConfigError, naming `key` and
+    the path, for a "~" or "~user" whose home directory isn't known, such as a user that
+    doesn't exist on this machine.
+    """
+    path = Path(raw)
+    try:
+        return path.expanduser()
+    except RuntimeError:
+        message = (
+            f"can't expand '{path.parts[0]}' in {key} '{raw}' to a home directory; "
+            "check the user name after '~', or write the full path"
+        )
+        raise StepConfigError(message) from None
+
+
 def _write_script(params: Mapping[str, JSONValue], rt: StepRuntime) -> Path | None:
     """Write a `run` script to a new 0600 file in the attempt directory and return its path.
 
@@ -195,13 +213,16 @@ def _write_script(params: Mapping[str, JSONValue], rt: StepRuntime) -> Path | No
 def _workdir(params: Mapping[str, JSONValue], rt: StepRuntime) -> Path:
     """Return `cwd` with `~` expanded, relative to the project directory, or `defaults.cwd`.
 
-    Raises StepConfigError for a `cwd` that the operating system can't take.
+    Raises StepConfigError for a `cwd` that the operating system can't take, and for a
+    "~user" in `cwd` or `defaults.cwd` without a known home directory.
     """
     cwd = params.get("cwd")
     if not isinstance(cwd, str):
-        return rt.default_cwd
+        # The executor leaves a `defaults.cwd` that it can't expand as written; any other
+        # default is absolute, so this returns it unchanged.
+        return rt.project_dir / expand_home(rt.default_cwd, "defaults.cwd")
     check_os_text(cwd, "cwd")
-    return rt.project_dir / Path(cwd).expanduser()
+    return rt.project_dir / expand_home(cwd, "cwd")
 
 
 def _read_output(rt: StepRuntime) -> str:

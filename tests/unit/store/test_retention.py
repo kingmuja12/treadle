@@ -10,6 +10,7 @@ from tests.unit.store.helpers import DAY, HOUR, T0, Runs, project_workflow
 
 from treadle.clock import to_ms
 from treadle.config import RetentionSettings, Settings
+from treadle.errors import StoreError
 from treadle.models import LogStream, RunFilter, RunRecord, RunStatus, Workflow
 from treadle.retention import retention_loop, run_retention
 from treadle.store.async_store import AsyncStore
@@ -154,6 +155,20 @@ def test_incremental_vacuum_stops_at_its_page_limit(
     repo.incremental_vacuum(pages=10)
 
     assert free_pages(conn) == before - 10
+
+
+def test_incremental_vacuum_refuses_to_run_inside_a_transaction(
+    repo: Repository, conn: sqlite3.Connection, runs: Runs
+) -> None:
+    fill_and_prune(repo, runs)
+    before = free_pages(conn)
+
+    with repo.transaction():
+        with pytest.raises(StoreError, match="inside a transaction"):
+            repo.incremental_vacuum()
+        assert conn.in_transaction  # the caller's transaction is still open
+
+    assert free_pages(conn) == before
 
 
 @pytest.fixture

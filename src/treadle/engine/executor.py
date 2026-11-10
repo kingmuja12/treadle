@@ -334,7 +334,7 @@ class _Execution:
         )
         self._run_dir = settings.tmp_dir / f"run-{run.id}"
         self._event_path = self._run_dir / "event.json"
-        self._default_cwd = settings.project_dir / Path(workflow.defaults.cwd).expanduser()
+        self._default_cwd = _default_cwd(settings.project_dir, workflow.defaults.cwd)
         self._file_roots = settings.file_roots()
         self._protected = settings.protected_paths()
         self._pending = list(workflow.steps)
@@ -965,6 +965,18 @@ def _close_attempt(
         log_bytes=log.bytes_written,
         log_truncated=log.truncated,
     )
+
+
+def _default_cwd(project_dir: Path, cwd: str) -> Path:
+    """Return `defaults.cwd` with "~" expanded, relative to the project directory.
+
+    A "~user" without a known home directory stays as written, so each step that uses the
+    default fails and says why, and the other steps still run.
+    """
+    try:
+        return project_dir / Path(cwd).expanduser()
+    except RuntimeError:
+        return Path(cwd)
 
 
 def _success_only(condition: Condition) -> bool:

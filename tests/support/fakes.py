@@ -286,9 +286,12 @@ class FakeWorkflowSource:
         """Return the entries sorted by workflow ID."""
         return [self._entries[key] for key in sorted(self._entries)]
 
-    async def version(self, digest: str) -> Workflow | None:
-        """Return a stored version, or None."""
-        return self.versions.get(digest)
+    async def version(self, digest: str, *, workflow_id: str | None = None) -> Workflow | None:
+        """Return a stored version, or None. With `workflow_id`, only that workflow's."""
+        version = self.versions.get(digest)
+        if version is None or workflow_id not in (None, version.id):
+            return None
+        return version
 
 
 class MemoryRunReader:

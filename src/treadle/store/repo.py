@@ -26,6 +26,7 @@ from typing import Any, Final, Literal, TypeAlias, TypeVar, cast
 
 from treadle.clock import from_ms
 from treadle.config import RetentionSettings
+from treadle.errors import StoreError
 from treadle.models import (
     AttemptRecord,
     AttemptStatus,
@@ -794,10 +795,17 @@ class Repository:
         return PruneStats(versions=len(unused), deliveries=deliveries, controls=controls)
 
     def incremental_vacuum(self, pages: int = 2000) -> None:
-        """Return up to `pages` free pages to the file system. Call it outside a transaction."""
-        # The pragma frees one page per result row, so it runs to the end only when every
-        # row is fetched.
-        self._conn.execute(f"PRAGMA incremental_vacuum({int(pages)})").fetchall()
+        """Return up to `pages` free pages to the file system.
+
+        Call it outside a transaction: inside one, it raises StoreError and changes nothing.
+        """
+        if self._conn.in_transaction:
+            raise StoreError("an incremental vacuum can't run inside a transaction")
+        # The pragma frees one page each time SQLite steps it. Python 3.11's sqlite3 steps it
+        # only once, even when every row is fetched, because its rows have no columns, while
+        # executescript() runs it to the end on every version. On 3.11, executescript() would
+        # also commit an open transaction first, which the check above rules out.
+        self._conn.executescript(f"PRAGMA incremental_vacuum({int(pages)});")
 
     # Helpers
 

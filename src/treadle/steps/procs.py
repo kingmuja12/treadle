@@ -11,7 +11,7 @@ import signal
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Final, cast
+from typing import Any, Final, cast
 
 from treadle.errors import StepError
 from treadle.models import LogStream
@@ -181,24 +181,35 @@ async def run_process(
     child that keeps a pipe open keeps the call waiting. A background child whose output goes
     elsewhere outlives the call instead: its group then stays tracked in `rt.processes`, with
     a system line, for the tracker's owner to stop. On cancellation, the group is terminated
-    under `asyncio.shield` and the CancelledError is re-raised. An argument,
-    environment value, or working directory that the operating system can't take raises
-    StepConfigError. A process that can't start, such as a missing program or working
-    directory, raises a retryable StepError.
+    under `asyncio.shield` and the CancelledError is re-raised. A cancellation that arrives
+    while the group is terminated, as a forced cancel sends, ends the grace period: the group
+    gets SIGKILL at once, and the call waits up to 2 seconds for it to be gone before
+    re-raising. An argument, environment value, or working directory that the operating
+    system can't take raises StepConfigError. A process that can't start, such as a missing
+    program or working directory, raises a retryable StepError.
     """
     proc = await _spawn(argv, cwd, rt.env)
     rt.processes.add(proc.pid)
-    # The pumps run under shield, so they keep draining while a cancelled process shuts down;
-    # a full pipe would otherwise hide its end-of-file and delay `wait()`.
+    # asyncio.wait never cancels the pumps, so they keep draining while a cancelled process
+    # shuts down; a full pipe would otherwise hide its end-of-file and delay `wait()`. From
+    # Python 3.14 on, asyncio.shield would also report their late cancellation to the loop.
     drained = asyncio.gather(
         _pump(cast(asyncio.StreamReader, proc.stdout), LogStream.STDOUT, rt, capture),
         _pump(cast(asyncio.StreamReader, proc.stderr), LogStream.STDERR, rt, 0),
     )
     try:
-        stdout_tail, _ = await asyncio.shield(drained)
+        await asyncio.wait([drained])
+        stdout_tail, _ = drained.result()
         code = await proc.wait()
     except BaseException:
-        await asyncio.shield(_stop(proc, drained, rt))
+        try:
+            await asyncio.shield(_stop(proc, drained, rt))
+        except asyncio.CancelledError:
+            # A second cancellation, as from a forced cancel, can't wait out the grace period.
+            await asyncio.shield(
+                _wait_for_group(proc.pid, _KILL_WAIT, signal_each_poll=signal.SIGKILL)
+            )
+            raise
         raise
     if _signal_group(proc.pid, 0):
         rt.log.system(_LEFT_RUNNING)
@@ -271,13 +282,26 @@ async def _spawn(
 async def _stop(
     proc: asyncio.subprocess.Process, drained: asyncio.Future[tuple[str, str]], rt: StepRuntime
 ) -> None:
-    """Terminate the group, let the pipes finish draining, and stop tracking the group."""
+    """Terminate the group, let the pipes finish draining, and stop tracking the group.
+
+    Pumps that still read after that, such as from a pipe that an escaped process holds
+    open, are cancelled.
+    """
     try:
         await terminate_group(proc, grace=rt.kill_grace)
         await asyncio.wait([drained], timeout=_KILL_WAIT)
     finally:
         drained.cancel()
+        # Nothing awaits the pumps any more, so a cancelled gather would be reported as an
+        # exception that was never retrieved.
+        drained.add_done_callback(_retrieve)
         rt.processes.discard(proc.pid)
+
+
+def _retrieve(future: asyncio.Future[Any]) -> None:
+    """Mark the outcome of a future that nothing awaits as retrieved."""
+    if not future.cancelled():
+        future.exception()
 
 
 async def _pump(

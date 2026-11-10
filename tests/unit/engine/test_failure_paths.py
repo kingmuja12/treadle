@@ -287,9 +287,9 @@ async def test_cancelling_the_actor_fails_its_queued_and_in_flight_requests(
     engine: Engine,
 ) -> None:
     class SlowSource(FakeWorkflowSource):
-        async def version(self, digest: str) -> Workflow | None:
+        async def version(self, digest: str, *, workflow_id: str | None = None) -> Workflow | None:
             await asyncio.sleep(60)
-            return await super().version(digest)
+            return await super().version(digest, workflow_id=workflow_id)
 
     workflow = make_workflow(make_step("work"))
     await engine.create(workflow)
@@ -337,7 +337,7 @@ async def test_readmit_leaves_a_run_that_changed_while_its_version_loaded(
     queued = await engine.create(make_workflow(make_step("work"), source="# gone\n"))
 
     class CancellingSource(FakeWorkflowSource):
-        async def version(self, digest: str) -> Workflow | None:
+        async def version(self, digest: str, *, workflow_id: str | None = None) -> Workflow | None:
             now = to_ms(clock.now())
             await engine.store.write(
                 lambda repo: repo.cancel_queued([queued.id], reason=RunReason.USER, at_ms=now)
