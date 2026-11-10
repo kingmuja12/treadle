@@ -241,8 +241,19 @@ class TestPayload:
             (b'"caf\xff"', "can't decode"),
             (b"[" * 65 + b"]" * 65, "deeper than 64 levels"),
             (b"[" * 100000 + b"]" * 100000, "deeper than 64 levels"),
+            (b"[" * 100000, "deeper than 64 levels"),
         ],
-        ids=["syntax", "empty", "nan", "infinity", "overflow", "utf8", "nesting", "recursion"],
+        ids=[
+            "syntax",
+            "empty",
+            "nan",
+            "infinity",
+            "overflow",
+            "utf8",
+            "nesting",
+            "deep",
+            "unclosed",
+        ],
     )
     def test_an_invalid_json_body_raises_value_error(self, body: bytes, message: str) -> None:
         request = hook_request(body)

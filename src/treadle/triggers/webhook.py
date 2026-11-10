@@ -21,6 +21,7 @@ from typing import Final, NoReturn
 
 from treadle.clock import Clock, iso_utc
 from treadle.errors import NotFoundError, ShuttingDownError, WorkflowInvalidError
+from treadle.expr.functions import nests_deeper_than
 from treadle.models import (
     Delivery,
     HookRequest,
@@ -334,14 +335,10 @@ def _body(request: HookRequest) -> JSONValue:
     media = request.content_type or ""
     if media != "application/json" and not (media.endswith("+json") and "/" in media):
         return request.body.decode("utf-8", "replace")
-    try:
-        value: JSONValue = json.loads(
-            request.body.decode("utf-8"), parse_constant=_reject_constant, parse_float=_finite
-        )
-    except RecursionError:
-        raise ValueError(f"nesting is deeper than {_MAX_NESTING} levels") from None
-    if _depth(value) > _MAX_NESTING:
+    text = request.body.decode("utf-8")
+    if nests_deeper_than(text, _MAX_NESTING):
         raise ValueError(f"nesting is deeper than {_MAX_NESTING} levels")
+    value: JSONValue = json.loads(text, parse_constant=_reject_constant, parse_float=_finite)
     return value
 
 
@@ -354,20 +351,6 @@ def _finite(text: str) -> float:
     if not math.isfinite(value):
         raise ValueError(f"the number {text} is out of range")
     return value
-
-
-def _depth(value: JSONValue) -> int:
-    """Return how deeply arrays and objects nest in `value`, without recursion."""
-    deepest = 0
-    pending: list[tuple[JSONValue, int]] = [(value, 0)]
-    while pending:
-        item, depth = pending.pop()
-        if isinstance(item, dict | list):
-            depth += 1
-            deepest = max(deepest, depth)
-            children = item.values() if isinstance(item, dict) else item
-            pending.extend((child, depth) for child in children)
-    return deepest
 
 
 def _accepted(name: str, submission: Submission) -> HookResponse:

@@ -148,7 +148,7 @@ def _from_json(text: JSONValue) -> JSONValue:
         raise _ArgumentError(f"input is longer than {_MAX_CHARS} characters")
     # The depth is checked before parsing, because how deep json.loads can recurse, and so
     # which error it raises for deep input, differs between Python versions.
-    if _nests_deeper_than(text, _MAX_JSON_DEPTH):
+    if nests_deeper_than(text, _MAX_JSON_DEPTH):
         raise _ArgumentError(f"input nests deeper than {_MAX_JSON_DEPTH} levels")
     try:
         value: JSONValue = json.loads(text, parse_constant=_no_constant, parse_float=_finite)
@@ -168,12 +168,13 @@ def _finite(text: str) -> float:
     return number
 
 
-def _nests_deeper_than(text: str, levels: int) -> bool:
+def nests_deeper_than(text: str, levels: int) -> bool:
     """True when the arrays and objects in JSON `text` nest more than `levels` deep.
 
     One pass counts the brackets and braces outside strings, and stops at the first one
     that is too deep. The count is exact for valid JSON. For other text, it only decides
-    whether this error or the parser's error comes first.
+    whether this error or the parser's error comes first. Check before `json.loads`:
+    how deep the parser gets before it fails depends on the Python version.
     """
     depth = 0
     in_string = escaped = False
