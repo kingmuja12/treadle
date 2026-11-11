@@ -86,7 +86,12 @@ class ExecutorDeps:
 
 
 class RunHandle:
-    """The cancel state of one active run, shared by the manager and the executor."""
+    """The cancel state of one active run, shared by the manager and the executor.
+
+    A user, an API client, or a stop signal asks for a cancel with `request_cancel`. Treadle
+    starts one itself with `cancel_for`: after the run's timeout, for a shutdown, or for a
+    replacement.
+    """
 
     finalizing: bool
 
@@ -94,6 +99,7 @@ class RunHandle:
         self.finalizing = False
         self._run_id = run_id
         self._reason: CancelReason | None = None
+        self._requested = False
         self._forced = False
         self._changed = asyncio.Event()
 
@@ -115,12 +121,30 @@ class RunHandle:
     def request_cancel(self, reason: CancelReason, *, force: bool = False) -> bool:
         """Request cancellation, and return True when the state changed.
 
-        The first reason wins. A second request, or `force=True`, sets `forced`.
+        The first reason wins, whoever gave it. A second request, or `force=True`, sets
+        `forced`. A cancel that `cancel_for` started isn't a request, so the first request
+        after it, such as a user's after the run timed out, leaves the cleanup steps running.
+        """
+        repeated, self._requested = self._requested, True
+        if self._reason is None:
+            self._reason = reason
+            self._forced = force
+            self._notify()
+            return True
+        if force or repeated:
+            return self.force()
+        return False
+
+    def cancel_for(self, reason: CancelReason) -> bool:
+        """Start cancelling for a reason of Treadle's own, and return True when it did.
+
+        A run that is cancelling already keeps its reason. This never forces the run, so its
+        cleanup steps still get `cleanup_timeout`: only a second request, the end of that
+        timeout, or the end of a shutdown's grace forces it.
         """
         if self._reason is not None:
-            return self.force()
+            return False
         self._reason = reason
-        self._forced = force
         self._notify()
         return True
 
@@ -353,8 +377,7 @@ class _Execution:
                 await self._loop()
         except asyncio.CancelledError:
             # The run task is cancelled only when a forced shutdown stops waiting for it.
-            if self._handle.reason is None:
-                self._handle.request_cancel(CancelReason.SHUTDOWN)
+            self._handle.cancel_for(CancelReason.SHUTDOWN)
             await asyncio.shield(self._stop_steps())
             await asyncio.shield(self._finalize(setup_error))
             raise
@@ -405,9 +428,7 @@ class _Execution:
     async def _loop(self) -> None:
         loop = asyncio.get_running_loop()
         self._timers.append(
-            loop.call_later(
-                self._workflow.timeout, self._handle.request_cancel, CancelReason.TIMEOUT
-            )
+            loop.call_later(self._workflow.timeout, self._handle.cancel_for, CancelReason.TIMEOUT)
         )
         # The waiter exists before each read of the handle, so no change goes unseen.
         changed = asyncio.create_task(self._handle.wait_changed())
@@ -758,6 +779,9 @@ class _Execution:
             log=log,
             processes=processes,
             http=deps.http,
+            # A force reaches a running step only as a cancellation of its task, as a cancel
+            # that isn't forced does, so the step reads the handle to tell the two apart.
+            forced=lambda: self._handle.forced,
         )
 
     def _declared_outputs(self, step: Step, outcome: _Outcome, env: dict[str, str]) -> _Outcome:
@@ -903,8 +927,15 @@ class _Execution:
         await self._remove_run_dir()
 
     async def _stop_leftovers(self) -> None:
-        """Stop the processes that steps left running in the background."""
-        stopped = await self._leftovers.stop(grace=self._deps.settings.runs.kill_grace)
+        """Stop the processes that steps left running in the background.
+
+        A forced cancellation kills them at once, as it kills the running steps; otherwise
+        they get `[runs] kill_grace` between SIGTERM and SIGKILL. A finalizing run takes no
+        more cancels, so nothing could cut that wait short later.
+        """
+        stopped = await self._leftovers.stop(
+            grace=self._deps.settings.runs.kill_grace, forced=self._handle.forced
+        )
         if stopped:
             attempts = "attempt" if stopped == 1 else "attempts"
             self._system(f"stopped the background processes of {stopped} step {attempts}")

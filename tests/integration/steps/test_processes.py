@@ -305,6 +305,27 @@ async def test_a_second_cancellation_kills_the_group_without_waiting_out_the_gra
     assert await released(processes, pgid)
 
 
+async def test_a_forced_cancellation_kills_the_group_without_a_grace_period(
+    tmp_path: Path,
+) -> None:
+    log, processes = ReadyLog(), RecordingProcesses()
+    rt = runtime(tmp_path, log=log, processes=processes, kill_grace=30)
+    rt = dataclasses.replace(rt, forced=lambda: True)
+    script = "trap '' TERM; sleep 100 & echo ready; sleep 100"
+    task = asyncio.create_task(run_process(["sh", "-c", script], cwd=tmp_path, rt=rt))
+    await asyncio.wait_for(log.ready.wait(), 10)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    task.cancel()  # once, as a forced cancel that reaches a running step does
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert loop.time() - started < 10  # a third of the 30-second grace
+    pgid = tracked_group(processes)  # released before the CancelledError arrived
+    assert not group_alive(pgid)
+
+
 async def test_pipes_that_outlive_the_group_leave_no_error_for_the_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -447,6 +468,30 @@ async def test_leftover_groups_watch_only_while_they_hold_a_group() -> None:
 
     assert await leftovers.stop(grace=1) == 1
     assert await lasting.wait() == -signal.SIGTERM
+
+
+async def test_a_forced_stop_kills_the_leftover_groups_without_a_grace_period() -> None:
+    registry = ProcessRegistry()
+    leftovers = LeftoverGroups(registry)
+    stubborn = await asyncio.create_subprocess_exec(
+        "sh",
+        "-c",
+        "trap '' TERM; echo ready; sleep 100",
+        stdout=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert stubborn.stdout is not None
+    assert await asyncio.wait_for(stubborn.stdout.readline(), 10) == b"ready\n"
+    registry.add(stubborn.pid)
+    leftovers.adopt(stubborn.pid)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+
+    assert await leftovers.stop(grace=30, forced=True) == 1
+
+    assert loop.time() - started < 10  # a third of the 30-second grace
+    assert await stubborn.wait() == -signal.SIGKILL
+    assert len(registry) == 0
 
 
 async def test_leftover_groups_count_only_the_groups_that_they_stop() -> None:

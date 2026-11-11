@@ -196,8 +196,9 @@ ends, for example because Treadle killed it, nothing reaps it, and it stays a zo
 still counts a zombie as a member of its process group, so the step's group never looks
 empty. Each time Treadle stops such a group, it waits out the whole `[runs] kill_grace`,
 sends `SIGKILL`, and waits 2 more seconds. With the default grace of 5 seconds, a step that
-times out after 1 second takes about 8 seconds to end. The zombies also keep their process
-IDs until Treadle exits.
+times out after 1 second takes about 8 seconds to end. A forced cancel sends `SIGKILL` at
+once, but still waits the 2 seconds. The zombies also keep their process IDs until Treadle
+exits.
 
 An init process such as tini, which `--init` runs, reaps those processes at once. It
 forwards signals to Treadle, so `docker stop` still shuts Treadle down gracefully, and

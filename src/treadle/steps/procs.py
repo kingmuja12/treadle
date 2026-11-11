@@ -74,17 +74,20 @@ class LeftoverGroups:
         if self._watch is None:
             self._watch = asyncio.get_running_loop().create_task(self._forget_empty())
 
-    async def stop(self, *, grace: float) -> int:
+    async def stop(self, *, grace: float, forced: bool = False) -> int:
         """Stop each group that is still alive, and return how many there were.
 
         The groups stop together: each gets SIGTERM, up to `grace` seconds to exit, and then
-        SIGKILL.
+        SIGKILL. A forced stop, as for a run whose cancellation was forced, sends SIGKILL at
+        once.
         """
         if self._watch is not None:
             self._watch.cancel()
             await asyncio.wait([self._watch])
         groups, self._groups = self._groups, set()
-        stopped = await asyncio.gather(*(_stop_group(pgid, grace) for pgid in groups))
+        stopped = await asyncio.gather(
+            *(_stop_group(pgid, grace, forced=forced) for pgid in groups)
+        )
         for pgid in groups:
             self._registry.discard(pgid)
         return sum(stopped)
@@ -155,18 +158,12 @@ async def terminate_group(proc: asyncio.subprocess.Process, *, grace: float) -> 
     """Stop a process group: SIGTERM, up to `grace` seconds, SIGKILL, then up to 2 seconds.
 
     The grace period lasts until every member of the group has exited, not only the leader,
-    so a child that is still cleaning up after its shell exits isn't killed early. SIGKILL
-    then goes to whatever is left of the group, including members that ignore SIGTERM, and
-    repeats while any member is left, because a child that is being forked when the group
-    is signalled can miss the signal (macOS lets it escape). The final 2 seconds also cover
-    collecting the leader's exit status.
+    so a child that is still cleaning up after its shell exits isn't killed early. Then
+    whatever is left of the group gets SIGKILL, as `_kill_group` sends it.
     """
     if _signal_group(proc.pid, signal.SIGTERM):
         await _wait_for_group(proc.pid, grace)
-    with contextlib.suppress(TimeoutError):
-        async with asyncio.timeout(_KILL_WAIT):
-            await _wait_for_group(proc.pid, _KILL_WAIT, signal_each_poll=signal.SIGKILL)
-            await proc.wait()
+    await _kill_group(proc)
 
 
 async def run_process(
@@ -180,13 +177,15 @@ async def run_process(
     The call returns once the process has exited and both pipes are closed, so a background
     child that keeps a pipe open keeps the call waiting. A background child whose output goes
     elsewhere outlives the call instead: its group then stays tracked in `rt.processes`, with
-    a system line, for the tracker's owner to stop. On cancellation, the group is terminated
-    under `asyncio.shield` and the CancelledError is re-raised. A cancellation that arrives
-    while the group is terminated, as a forced cancel sends, ends the grace period: the group
-    gets SIGKILL at once, and the call waits up to 2 seconds for it to be gone before
-    re-raising. An argument, environment value, or working directory that the operating
-    system can't take raises StepConfigError. A process that can't start, such as a missing
-    program or working directory, raises a retryable StepError.
+    a system line, for the tracker's owner to stop. On cancellation, the group is stopped
+    under `asyncio.shield` and the CancelledError is re-raised: the group gets SIGKILL at
+    once when `rt.forced()` is true, and otherwise SIGTERM, then SIGKILL after
+    `rt.kill_grace`. A cancellation that arrives while the group is stopping, as a forced
+    cancel sends, ends the grace period: the group gets SIGKILL at once, and the call waits
+    up to 2 seconds for it to be gone before re-raising. An argument, environment value, or
+    working directory that the operating system can't take raises StepConfigError. A
+    process that can't start, such as a missing program or working directory, raises a
+    retryable StepError.
     """
     proc = await _spawn(argv, cwd, rt.env)
     rt.processes.add(proc.pid)
@@ -206,9 +205,7 @@ async def run_process(
             await asyncio.shield(_stop(proc, drained, rt))
         except asyncio.CancelledError:
             # A second cancellation, as from a forced cancel, can't wait out the grace period.
-            await asyncio.shield(
-                _wait_for_group(proc.pid, _KILL_WAIT, signal_each_poll=signal.SIGKILL)
-            )
+            await asyncio.shield(_kill_group(proc))
             raise
         raise
     if _signal_group(proc.pid, 0):
@@ -242,14 +239,30 @@ async def _wait_for_group(pgid: int, grace: float, *, signal_each_poll: int = 0)
         await asyncio.sleep(_POLL_INTERVAL)
 
 
-async def _stop_group(pgid: int, grace: float) -> bool:
+async def _kill_group(proc: asyncio.subprocess.Process) -> None:
+    """Stop a process group at once: SIGKILL, then up to 2 seconds for it to be gone.
+
+    SIGKILL goes to every member that is left, including members that ignore SIGTERM, and
+    repeats while any member is left, because a child that is being forked when the group is
+    signalled can miss the signal (macOS lets it escape). The 2 seconds also cover collecting
+    the leader's exit status.
+    """
+    with contextlib.suppress(TimeoutError):
+        async with asyncio.timeout(_KILL_WAIT):
+            await _wait_for_group(proc.pid, _KILL_WAIT, signal_each_poll=signal.SIGKILL)
+            await proc.wait()
+
+
+async def _stop_group(pgid: int, grace: float, *, forced: bool) -> bool:
     """Stop a process group whose leader is gone, as `terminate_group` does.
 
-    Returns False when the group no longer existed.
+    A forced stop skips SIGTERM and the grace period, as `_kill_group` does. Returns False
+    when the group no longer existed.
     """
-    if not _signal_group(pgid, signal.SIGTERM):
+    if not _signal_group(pgid, signal.SIGKILL if forced else signal.SIGTERM):
         return False
-    await _wait_for_group(pgid, grace)
+    if not forced:
+        await _wait_for_group(pgid, grace)
     await _wait_for_group(pgid, _KILL_WAIT, signal_each_poll=signal.SIGKILL)
     return True
 
@@ -282,13 +295,17 @@ async def _spawn(
 async def _stop(
     proc: asyncio.subprocess.Process, drained: asyncio.Future[tuple[str, str]], rt: StepRuntime
 ) -> None:
-    """Terminate the group, let the pipes finish draining, and stop tracking the group.
+    """Stop the group, let the pipes finish draining, and stop tracking the group.
 
-    Pumps that still read after that, such as from a pipe that an escaped process holds
-    open, are cancelled.
+    A forced stop, once `rt.forced()` is true, kills the group at once; any other stop
+    terminates it with `rt.kill_grace` between SIGTERM and SIGKILL. Pumps that still read
+    after that, such as from a pipe that an escaped process holds open, are cancelled.
     """
     try:
-        await terminate_group(proc, grace=rt.kill_grace)
+        if rt.forced():
+            await _kill_group(proc)
+        else:
+            await terminate_group(proc, grace=rt.kill_grace)
         await asyncio.wait([drained], timeout=_KILL_WAIT)
     finally:
         drained.cancel()

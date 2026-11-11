@@ -47,6 +47,17 @@ def test_a_forced_first_request_sets_both() -> None:
     assert (handle.reason, handle.forced) == (CancelReason.SHUTDOWN, True)
 
 
+def test_a_cancel_that_treadle_starts_isnt_a_request() -> None:
+    handle = RunHandle(1)
+
+    assert handle.cancel_for(CancelReason.TIMEOUT)
+    assert not handle.cancel_for(CancelReason.SHUTDOWN)
+    assert not handle.request_cancel(CancelReason.USER)  # the first request forces nothing
+    assert (handle.reason, handle.forced) == (CancelReason.TIMEOUT, False)
+    assert handle.request_cancel(CancelReason.USER)
+    assert (handle.reason, handle.forced) == (CancelReason.TIMEOUT, True)
+
+
 def test_forcing_a_run_that_isnt_cancelling_gives_it_the_user_reason() -> None:
     handle = RunHandle(1)
 
@@ -167,6 +178,25 @@ async def test_the_run_timeout_cancels_with_reason_timeout(engine: Engine, fake:
     assert call_times(fake, "cleanup") == [start + 60]
     lines = await engine.texts(detail.run.id)
     assert "the run timed out after 1m; cancelling" in lines
+
+
+async def test_a_users_first_cancel_after_the_run_timeout_leaves_the_cleanup_running(
+    engine: Engine, fake: FakeStep
+) -> None:
+    fake.script("slow", Hang()).script("cleanup", Sleep(50))
+    workflow = make_workflow(
+        make_step("slow"), make_step("cleanup", condition="always()"), timeout=60
+    )
+    launched = await engine.launch(workflow)
+    start = current_loop().time()
+
+    await cancel_at(70, launched.handle, CancelReason.USER)  # 10 seconds into the cleanup
+    detail = await engine.finish(launched)
+
+    assert not launched.handle.forced
+    assert statuses(detail) == {"slow": "cancelled", "cleanup": "succeeded"}
+    assert current_loop().time() - start == 110
+    assert (detail.run.status, detail.run.reason) == (RunStatus.TIMED_OUT, RunReason.TIMEOUT)
 
 
 async def test_a_running_cleanup_step_keeps_running_while_others_stop(

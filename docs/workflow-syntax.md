@@ -375,8 +375,8 @@ Each skipped step records one reason:
   `cleanup_timeout` to finish, and then Treadle forces the cancellation.
 - Each step's process runs in its own process group. To stop a step, Treadle sends
   `SIGTERM` to the group, and then `SIGKILL` after `[runs] kill_grace` (default 5s). When
-  Treadle forces the cancellation of a step that is already stopping, it sends `SIGKILL` at
-  once.
+  Treadle forces the cancellation, it sends `SIGKILL` to the group at once, whether or not
+  the step is already stopping.
 - A `file` step runs in a thread, which a timeout or a cancel can't interrupt. Its attempt
   waits for the file operation to end, and logs whether it finished or failed. A timed-out
   `file` attempt ends `timed_out` without a retry. When Treadle forces the cancellation, the
@@ -387,7 +387,8 @@ Each skipped step records one reason:
 - A process that a step starts in the background, such as `server >/dev/null 2>&1 &`, keeps
   running for the later steps of the run, and the step's log says so. When the run ends,
   whether it succeeded, failed, or was cancelled, Treadle stops such processes: `SIGTERM`,
-  and then `SIGKILL` after `[runs] kill_grace`. A forced shutdown kills them at once.
+  and then `SIGKILL` after `[runs] kill_grace`. When Treadle forces the cancellation, for
+  example in a forced shutdown, it kills them at once.
 - Redirect the output of a background process, as that example does. A background process
   that keeps the step's output open keeps the step running.
 - A process that leaves its process group with `setsid` escapes Treadle. Under systemd,

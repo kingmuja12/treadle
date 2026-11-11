@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import itertools
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import Any
 
 import pytest
@@ -401,6 +402,70 @@ async def test_cancelling_an_active_run_records_the_request_and_a_second_cancel_
     assert status is RunStatus.CANCELLED
     detail = await engine.detail(run.id)
     assert (detail.run.reason, statuses(detail)) == (RunReason.USER, {"cleanup": "cancelled"})
+
+
+@contextlib.asynccontextmanager
+async def timed_out(harness: Manager) -> AsyncIterator[None]:
+    """Let the workflow's 60-second timeout start cancelling the active run."""
+    await asyncio.sleep(60)
+    yield
+
+
+@contextlib.asynccontextmanager
+async def replaced(harness: Manager) -> AsyncIterator[None]:
+    """Submit a run that replaces the active one."""
+    await harness.submit()
+    yield
+
+
+@contextlib.asynccontextmanager
+async def shutting_down(harness: Manager) -> AsyncIterator[None]:
+    """Shut down while the block runs, with a grace that outlasts it."""
+    shutdown = asyncio.create_task(harness.manager.shutdown(grace=3600))
+    yield
+    await shutdown
+
+
+@pytest.mark.parametrize(
+    ("cancelling", "reason"),
+    [
+        pytest.param(timed_out, RunReason.TIMEOUT, id="timeout"),
+        pytest.param(replaced, RunReason.REPLACED, id="replacement"),
+        pytest.param(shutting_down, RunReason.SHUTDOWN, id="shutdown"),
+    ],
+)
+async def test_a_cancel_that_treadle_started_doesnt_make_the_users_first_cancel_force(
+    engine: Engine,
+    fake: FakeStep,
+    cancelling: Callable[[Manager], contextlib.AbstractAsyncContextManager[None]],
+    reason: RunReason,
+) -> None:
+    fake.script("work", Hang()).script("cleanup", Hang())
+    workflow = make_workflow(
+        make_step("work"),
+        make_step("cleanup", condition="always()"),
+        concurrency=Concurrency(REPLACE),
+        timeout=60,
+    )
+
+    async with Manager(engine, workflow) as harness:
+        run = await harness.submit()
+        await asyncio.sleep(1)
+        async with cancelling(harness):
+            await asyncio.sleep(1)
+            first = await harness.manager.cancel(run.id)
+            await asyncio.sleep(1)
+            second = await harness.manager.cancel(run.id)
+            await harness.manager.wait(run.id)
+
+    # The first cancel leaves the cleanup step running, and only the second forces it.
+    assert first == CancelOutcome(run.id, RunStatus.RUNNING, accepted=True, forced=False)
+    assert second == CancelOutcome(run.id, RunStatus.RUNNING, accepted=True, forced=True)
+    detail = await engine.detail(run.id)
+    assert (detail.run.reason, statuses(detail)) == (
+        reason,
+        {"work": "cancelled", "cleanup": "cancelled"},
+    )
 
 
 async def test_cancelling_a_finished_or_missing_run(engine: Engine) -> None:

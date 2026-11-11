@@ -389,7 +389,7 @@ class RunManager:
                 )
         self._pending.clear()
         for active in self._active.values():
-            _begin_cancel(active.handle, CancelReason.SHUTDOWN)
+            active.handle.cancel_for(CancelReason.SHUTDOWN)
 
     async def _finished(self, workflow_id: str, run_id: int, status: RunStatus | None) -> None:
         del self._active[workflow_id]
@@ -458,7 +458,7 @@ class RunManager:
         for item in self._pending.pop(workflow_id, deque()):
             self._resolve(item.run.id, RunStatus.CANCELLED)
         if active is not None:
-            _begin_cancel(active.handle, CancelReason.REPLACED)
+            active.handle.cancel_for(CancelReason.REPLACED)
 
     async def _replay(self, run: RunRecord, workflow: Workflow) -> bool:
         """Apply the policy to a re-admitted run, and return True when it stays queued."""
@@ -641,16 +641,6 @@ def _create(repo: Repository, new: NewRun, now_ms: int) -> CreateResult:
     if result.outcome == "created" and new.replaced_active is not None:
         repo.mark_cancel_requested(new.replaced_active, at_ms=now_ms)
     return result
-
-
-def _begin_cancel(handle: RunHandle, reason: CancelReason) -> None:
-    """Start cancelling a run unless it already is.
-
-    A second request would force the run and cut its cleanup steps short; only a user's
-    second cancel, or the end of the shutdown grace, forces a run.
-    """
-    if handle.reason is None:
-        handle.request_cancel(reason)
 
 
 def _masked(masker: Masker, value: JSONObject) -> JSONObject:

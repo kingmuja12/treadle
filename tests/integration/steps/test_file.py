@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import errno
 import gc
 import os
@@ -57,9 +58,9 @@ def append_params(path: str, content: str) -> dict[str, JSONValue]:
     return cast(dict[str, JSONValue], value)
 
 
-async def eventually(condition: Callable[[], bool]) -> None:
-    """Wait up to 2 seconds for `condition` to hold, polling every 20 ms."""
-    for _ in range(100):
+async def eventually(condition: Callable[[], bool], *, within: float = 2.0) -> None:
+    """Wait up to `within` seconds for `condition` to hold, polling every 20 ms."""
+    for _ in range(round(within / 0.02)):
         if condition():
             return
         await asyncio.sleep(0.02)
@@ -96,6 +97,24 @@ async def test_a_second_cancellation_stops_waiting(tmp_path: Path) -> None:
 
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, 2)
+
+
+async def test_a_forced_cancellation_stops_waiting_at_once(tmp_path: Path) -> None:
+    log = RecordingLog()
+    rt = dataclasses.replace(make_runtime(tmp_path, log=log), forced=lambda: True)
+
+    with blocking_fifo(rt.project_dir / "pipe") as release:
+        task = asyncio.create_task(FileStep().run(append_params("pipe", "data"), rt))
+        await asyncio.sleep(0.2)
+        task.cancel()  # once, as a forced cancel that reaches a running step does
+
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 10)
+        assert log.texts() == []  # the operation is still blocked on the FIFO
+        reader = release()
+        await eventually(lambda: bool(log.texts()), within=10)
+        assert os.read(reader, 100) == b"data"
+    assert log.texts() == ["the file operation finished after the step was cancelled"]
 
 
 async def test_a_failure_after_a_second_cancellation_is_logged_and_never_reported(

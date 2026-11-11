@@ -9,8 +9,9 @@ import os
 import random
 import signal
 import sqlite3
+import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import closing
 from typing import Any
 
@@ -229,6 +230,118 @@ async def test_a_forced_cancel_ends_the_run_without_waiting_out_the_kill_grace(
     assert status is RunStatus.CANCELLED
     assert took < 2  # well before the 3-second kill grace
     assert await group_gone(pgid, within=1)  # the force sent SIGKILL at once
+
+
+def stubborn_workflow(load_workflow: Callable[..., Workflow], condition: str) -> Workflow:
+    """Return a workflow whose one step ignores SIGTERM, says "ready", and sleeps 30 seconds."""
+    return load_workflow(
+        f"""
+        steps:
+          - id: stubborn
+            if: {condition}
+            run: |
+              trap '' TERM
+              echo ready
+              sleep 30
+        """
+    )
+
+
+async def printed(engine: Engine, run_id: int, text: str, *, within: float = 10.0) -> None:
+    """Poll a run's stored standard output for the line `text`, failing after `within`."""
+    for _ in range(round(within / 0.05)):
+        if text in await engine.texts(run_id, stream=LogStream.STDOUT):
+            return
+        await asyncio.sleep(0.05)
+    pytest.fail(f"the run never printed {text!r}")
+
+
+async def force_at_once(harness: Manager, run_id: int) -> None:
+    """Cancel a run with the force flag, as `treadle cancel --force` does."""
+    await harness.manager.cancel(run_id, force=True)
+    await harness.manager.wait(run_id)
+
+
+async def force_after_a_cancel(harness: Manager, run_id: int) -> None:
+    """Cancel a run, which leaves its cleanup steps running, and then force the cancel."""
+    await harness.manager.cancel(run_id)
+    await asyncio.sleep(0.2)
+    await harness.manager.cancel(run_id, force=True)
+    await harness.manager.wait(run_id)
+
+
+async def force_a_shutdown(harness: Manager, run_id: int) -> None:
+    """Shut down, which forces the runs that are still active after a short grace."""
+    await harness.manager.shutdown(grace=0.3)
+
+
+@pytest.mark.parametrize(
+    ("condition", "force"),
+    [
+        pytest.param("success()", force_at_once, id="single-force"),
+        pytest.param("always()", force_after_a_cancel, id="cleanup-step-after-a-cancel"),
+        pytest.param("always()", force_a_shutdown, id="forced-shutdown"),
+    ],
+)
+async def test_a_forced_cancel_kills_a_running_step_that_ignores_sigterm_at_once(
+    engine: Engine,
+    load_workflow: Callable[..., Workflow],
+    condition: str,
+    force: Callable[[Manager, int], Awaitable[None]],
+) -> None:
+    engine = with_settings(engine, runs=dataclasses.replace(engine.settings.runs, kill_grace=30))
+    loop = asyncio.get_running_loop()
+
+    async with Manager(engine, stubborn_workflow(load_workflow, condition)) as harness:
+        run = await harness.submit()
+        settings = engine.settings
+        await wait_for(lambda: recorded_pgid(settings, run.id, "stubborn") is not None, within=10)
+        pgid = recorded_pgid(settings, run.id, "stubborn")
+        assert pgid is not None
+        await printed(engine, run.id, "ready")  # the shell ignores SIGTERM from here on
+        start = loop.time()
+        await force(harness, run.id)
+        took = loop.time() - start
+
+    assert took < 10  # a third of the 30-second kill grace
+    assert await group_gone(pgid, within=10)
+    detail = await engine.detail(run.id)
+    assert (detail.run.status, statuses(detail)) == (RunStatus.CANCELLED, {"stubborn": "cancelled"})
+
+
+async def test_a_forced_cancel_stops_waiting_for_a_file_operation_at_once(
+    engine: Engine, load_workflow: Callable[..., Workflow], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started, proceed = threading.Event(), threading.Event()
+
+    def stuck_append(target: Any, params: Any, rt: Any) -> tuple[int, bool]:
+        started.set()
+        proceed.wait(30)  # as an append to a FIFO that no process reads blocks
+        return 0, True
+
+    monkeypatch.setitem(file._HANDLERS, "append", stuck_append)  # type: ignore[index]
+    workflow = load_workflow(
+        """
+        steps:
+          - id: append
+            uses: file
+            with:
+              action: append
+              path: notes.txt
+              content: data
+        """
+    )
+    try:
+        async with Manager(engine, workflow) as harness:
+            run = await harness.submit()
+            await wait_for(started.is_set, within=10)
+            await harness.manager.cancel(run.id, force=True)
+            status = await asyncio.wait_for(harness.manager.wait(run.id), 10)
+    finally:
+        proceed.set()
+
+    assert status is RunStatus.CANCELLED
+    assert statuses(await engine.detail(run.id)) == {"append": "cancelled"}
 
 
 async def test_a_secret_printed_by_a_real_process_is_masked_in_storage(
@@ -458,6 +571,46 @@ async def test_a_forced_shutdown_kills_a_background_process_too(
             await harness.manager.shutdown(grace=0.3)
 
         assert await gone(pid)
+    finally:
+        if pid is not None and alive(pid):
+            os.kill(pid, signal.SIGKILL)
+
+
+async def test_a_forced_cancel_kills_a_background_process_that_ignores_sigterm_at_once(
+    engine: Engine, load_workflow: Callable[..., Workflow]
+) -> None:
+    engine = with_settings(engine, runs=dataclasses.replace(engine.settings.runs, kill_grace=30))
+    workflow = load_workflow(
+        """
+        steps:
+          - id: start
+            run: |
+              sh -c 'trap "" TERM; touch "$TREADLE_RUN_TMP/ready"; sleep 100' >/dev/null 2>&1 &
+              echo "$!" > "$TREADLE_RUN_TMP/child"
+          - id: hang
+            run: sleep 100
+        """
+    )
+    loop = asyncio.get_running_loop()
+    pid: int | None = None
+    try:
+        async with Manager(engine, workflow) as harness:
+            run = await harness.submit()
+            shared = engine.settings.tmp_dir / f"run-{run.id}" / "shared"
+            # The background process ignores SIGTERM from here on.
+            await wait_for((shared / "ready").exists, within=10)
+            await wait_for(lambda: recorded_pgid(engine.settings, run.id, "hang") is not None)
+            pid = int((shared / "child").read_text())
+            start = loop.time()
+            await harness.manager.cancel(run.id, force=True)
+            status = await harness.manager.wait(run.id)
+            took = loop.time() - start
+
+        assert status is RunStatus.CANCELLED
+        assert took < 10  # a third of the 30-second kill grace
+        assert await gone(pid, within=10)
+        texts = await engine.texts(run.id, stream=LogStream.SYSTEM)
+        assert "stopped the background processes of 1 step attempt" in texts
     finally:
         if pid is not None and alive(pid):
             os.kill(pid, signal.SIGKILL)

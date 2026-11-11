@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -32,12 +32,19 @@ class StepLog(Protocol):
         """Mask `value` in every later line of the run."""
 
 
+def _never_forced() -> bool:
+    """Return False: the default `StepRuntime.forced`, for a runtime that no run can force."""
+    return False
+
+
 @dataclass(frozen=True, slots=True)
 class StepRuntime:
     """Everything one step attempt may use.
 
     `env` is the complete process environment for the attempt. `attempt_dir` exists with mode
-    0700, and `output_path` (inside it) exists, is empty, and has mode 0600.
+    0700, and `output_path` (inside it) exists, is empty, and has mode 0600. `forced` returns
+    True once Treadle forces the cancellation of the attempt's run: a cancelled attempt then
+    stops its work at once, without the grace period that a cancel otherwise gives it.
     """
 
     run_id: int
@@ -58,6 +65,7 @@ class StepRuntime:
     log: StepLog
     processes: ProcessTracker
     http: httpx.AsyncClient
+    forced: Callable[[], bool] = _never_forced
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,8 +81,8 @@ class StepType(Protocol):
 
     A step type whose work a cancellation can't stop, such as a file operation in a thread,
     sets the class attribute `interruptible = False`. Its cancelled attempt waits for the work
-    to end, so a timeout is final: a retry would repeat work that may have finished. Without
-    the attribute, a step type is interruptible.
+    to end unless the cancellation is forced, so a timeout is final: a retry would repeat work
+    that may have finished. Without the attribute, a step type is interruptible.
     """
 
     @property
@@ -107,6 +115,8 @@ class StepType(Protocol):
         """Run one attempt with rendered, validated parameters.
 
         Raises StepError on failure, and re-raises `asyncio.CancelledError` after cleaning up.
+        Once `rt.forced()` is true, the cleanup must not wait, for example for a process to
+        exit after SIGTERM.
         """
 
 

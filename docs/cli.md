@@ -342,10 +342,10 @@ signal's number: 130 for Ctrl+C, 143 for `SIGTERM`, and 129 for `SIGHUP`.
   `user`, and `SIGTERM` or `SIGHUP` with the reason `shutdown`. The command exits once the
   run has ended.
 - **A second stop signal of any kind forces the cancellation.** Cleanup steps that haven't
-  started don't run. A step that is still stopping after the first signal gets `SIGKILL` at
-  once. A cleanup step that is running gets `SIGTERM`, and then `SIGKILL` after
-  `[runs] kill_grace`. When the command exits, it kills every step process that is still
-  left, so none outlives the command.
+  started don't run, and every running step gets `SIGKILL` at once, including a step that
+  is still stopping after the first signal and a cleanup step that is running. When the
+  command exits, it kills every step process that is still left, so none outlives the
+  command.
 - **While following a daemon's run**, a stop signal stops following, and the run keeps
   going:
 
@@ -520,7 +520,7 @@ and cleanup steps get the workflow's `cleanup_timeout` to finish.
 
 | Option | Effect |
 |---|---|
-| `--force` | Stops the run without waiting for cleanup steps. |
+| `--force` | Stops the run at once, without waiting for cleanup steps or for `[runs] kill_grace`. |
 | `--wait SECONDS` | How long to wait for the answer of the process that runs the run. The default is 5. With `0`, the command sends the request, prints `Cancel requested.`, and exits. |
 | `--json` | Prints `{"run_id", "status", "accepted", "forced"}`. With `--wait 0`, `accepted` is `null`. |
 
@@ -545,14 +545,16 @@ asks that process:
   128 plus the signal's number, such as 130 for Ctrl+C. When the process took the request
   first, the command reports its answer, and still exits with the signal's code.
 
-A forced cancel skips the cleanup steps that haven't started, and stops the running steps:
+A forced cancel skips the cleanup steps that haven't started, and stops every running step
+at once: each step's process group gets `SIGKILL` without waiting out `[runs] kill_grace`.
+That includes a step that is still stopping after a `treadle cancel` without `--force`, and
+a cleanup step that runs after an earlier cancel. Processes that earlier steps left running
+in the background get `SIGKILL` at once too.
 
-- A step that is already stopping, as after a `treadle cancel` without `--force`, gets
-  `SIGKILL` at once.
-- A step that the force stops first gets `SIGTERM`, and then `SIGKILL` after
-  `[runs] kill_grace`. That includes every running step after a single `--force`, and a
-  cleanup step that runs after an earlier cancel. A step that ignores `SIGTERM` keeps the
-  run going until then.
+A second cancel of the same run, such as a second `treadle cancel`, forces it, as `--force`
+does. A cancel that Treadle starts itself doesn't count: when a run is already cancelling
+because of its `timeout` or a replacement, the first `treadle cancel` without `--force`
+leaves its cleanup steps running.
 
 When no Treadle process is running, the command cancels a queued run in the database
 directly. A run that a crashed process left running then reports
@@ -774,7 +776,7 @@ level = "info"                  # debug, info, warning, or error
 | `server.secure_cookies` | Marks cookies `Secure`. Turn it on behind an HTTPS proxy. | `true` or `false` |
 | `server.session_ttl` | How long a dashboard sign-in lasts. | 5m–30d |
 | `runs.max_concurrent` | The most runs that are active at once, across workflows. | 1–64 |
-| `runs.kill_grace` | How long a stopped step's processes get between `SIGTERM` and `SIGKILL`. | 0s–60s |
+| `runs.kill_grace` | How long a stopped step's processes get between `SIGTERM` and `SIGKILL`. A forced cancel sends `SIGKILL` at once. | 0s–60s |
 | `runs.shutdown_grace` | How long cleanup steps may run when the daemon shuts down. | 1s–10m |
 | `retention.max_age` | Treadle deletes finished runs older than this. | 1h–3650d |
 | `retention.max_runs_per_workflow` | Each workflow keeps at most this many runs. | 1–100,000 |

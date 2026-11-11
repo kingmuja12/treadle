@@ -91,11 +91,11 @@ class FileStep:
         """Perform the action in a worker thread and return `path`, `bytes`, and `changed`.
 
         A thread can't be interrupted, so a cancelled step waits for the operation to end,
-        logs whether it finished, and re-raises; a retry never overlaps it. A second
-        cancellation stops the wait, and the operation's outcome is logged when it ends.
-        Path violations raise PathNotAllowedError. An existing destination without
-        `overwrite`, or a directory without `recursive`, raises StepConfigError. Other OS
-        errors raise a retryable StepError.
+        logs whether it finished, and re-raises; a retry never overlaps it. A forced cancel
+        doesn't wait, and a second cancellation stops the wait; the operation's outcome is
+        then logged when it ends. Path violations raise PathNotAllowedError. An existing
+        destination without `overwrite`, or a directory without `recursive`, raises
+        StepConfigError. Other OS errors raise a retryable StepError.
         """
         work = asyncio.create_task(asyncio.to_thread(_perform, params, rt))
         # asyncio.wait never cancels `work`. From Python 3.14 on, asyncio.shield would also
@@ -103,16 +103,27 @@ class FileStep:
         try:
             await asyncio.wait([work])
         except asyncio.CancelledError:
-            try:
-                await asyncio.wait([work])
-            except asyncio.CancelledError:
-                # Logging the outcome also retrieves the error, so the event loop never
-                # reports it as unretrieved.
-                work.add_done_callback(functools.partial(_log_late_outcome, rt))
-                raise
-            _log_late_outcome(rt, work)
+            await _wait_unless_forced(work, rt)
             raise
         return work.result()
+
+
+async def _wait_unless_forced(work: asyncio.Task[StepResult], rt: StepRuntime) -> None:
+    """Wait for the operation of a cancelled step, unless `rt.forced()`, and log how it ends.
+
+    A second cancellation stops the wait and is re-raised. An operation that is still going
+    then, or that a forced cancel doesn't wait for, has its outcome logged when it ends.
+    Logging the outcome also retrieves the error, so the event loop never reports it as
+    unretrieved.
+    """
+    try:
+        if not rt.forced():
+            await asyncio.wait([work])
+    finally:
+        if work.done():
+            _log_late_outcome(rt, work)
+        else:
+            work.add_done_callback(functools.partial(_log_late_outcome, rt))
 
 
 def _log_late_outcome(rt: StepRuntime, work: asyncio.Task[StepResult]) -> None:
