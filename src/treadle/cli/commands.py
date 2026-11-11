@@ -20,7 +20,7 @@ from datetime import datetime, tzinfo
 from enum import Enum
 from pathlib import Path
 from types import FrameType
-from typing import TYPE_CHECKING, Final, Literal, TypeAlias
+from typing import TYPE_CHECKING, Final, Literal, NoReturn, TypeAlias
 from zoneinfo import ZoneInfo
 
 from treadle import __version__
@@ -130,6 +130,8 @@ _WITHDRAWN: Final = error_json("expired", "the CLI stopped waiting for an answer
 # The signals that stop a command that runs a workflow or waits on the lock holder: Ctrl+C,
 # `kill` or a supervisor's stop, and a terminal that closes.
 _STOP_SIGNALS: Final = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+# Like `treadle serve`, a local run's process exits at once on the third stop signal.
+_EXIT_AT_SIGNAL: Final = 3
 # A write to a pipe whose reader left fails with EPIPE, and to a terminal that hung up, EIO.
 _CLOSED_OUTPUT: Final = frozenset({errno.EPIPE, errno.EIO})
 
@@ -890,11 +892,14 @@ class _Signals:
 
 
 class _RunStops(_Signals):
-    """Handles stop signals during a local run: the first cancels the run, the next forces it.
+    """Handles stop signals during a local run, and until the command ends.
 
-    Ctrl+C cancels it for the user. SIGTERM and SIGHUP cancel it with the reason `shutdown`,
-    because the process that runs it was told to stop. A signal that arrives before the run
-    exists takes effect as soon as `follow` names the run.
+    The first signal cancels the run, and the second forces it. Ctrl+C cancels it for the
+    user, and SIGTERM and SIGHUP with the reason `shutdown`, because the process that runs
+    it was told to stop. A signal that arrives before the run exists takes effect as soon as
+    `follow` names the run, and one that arrives after `stop_following` only counts. The
+    third signal of any kind ends the process at once, as `_exit_at_once` describes, and so
+    does every signal after `runner_closed`.
     """
 
     def __init__(self, runner: LocalRunner, out: Output) -> None:
@@ -902,12 +907,17 @@ class _RunStops(_Signals):
         self._runner = runner
         self._out = out
         self._run_id: int | None = None
+        self._closed = False
         self._cancels: set[asyncio.Task[CancelOutcome]] = set()
 
     def __call__(self, signum: int) -> None:
-        """Record a stop signal and cancel the run, once there is one."""
+        """Record a stop signal: cancel or force the run, or end the process at once."""
         super().__call__(signum)
-        if self._run_id is not None:
+        if len(self.received) >= _EXIT_AT_SIGNAL:
+            self._exit_at_once(ExitCode.INTERRUPTED)
+        elif self._closed:
+            self._exit_at_once(self.exit_code())
+        elif self._run_id is not None:
             self._cancel(self._run_id, first=len(self.received) == 1)
 
     def follow(self, run_id: int) -> None:
@@ -915,6 +925,22 @@ class _RunStops(_Signals):
         self._run_id = run_id
         if self.received:
             self._cancel(run_id, first=True)
+
+    def stop_following(self) -> None:
+        """Cancel nothing on later signals, because the run ended or isn't followed any more.
+
+        Those signals still count, so the third still ends the process at once.
+        """
+        self._run_id = None
+
+    def runner_closed(self) -> None:
+        """End the process at once on every later signal, because the runner has closed.
+
+        Only the wait for worker threads is left then, such as for a `file` operation that a
+        forced cancel left running. So the process exits with the code that the command
+        would return, 128 plus the first signal's number, or with 130 on a third signal.
+        """
+        self._closed = True
 
     async def settled(self) -> None:
         """Wait until the run manager answered every cancel that a signal requested."""
@@ -928,6 +954,19 @@ class _RunStops(_Signals):
         force = len(self.received) > 1
         cancel = self._runner.cancel(run_id, force=force, reason=reason)
         self._cancels.add(asyncio.get_running_loop().create_task(cancel))
+
+    def _exit_at_once(self, code: int) -> NoReturn:
+        """Kill every process group that the steps still track, then exit with `code` at once.
+
+        Nothing else runs first: not the run's cleanup steps, closing the runner, or a file
+        operation that waits in a worker thread. Like every handler that `_on_stop_signals`
+        installs, this one runs on the event loop between callbacks, so no line of output
+        is cut short, and SQLite rolls back a store write that hasn't committed. As after a
+        third signal to `treadle serve`, the next lock holder marks a run that hadn't ended
+        as interrupted.
+        """
+        self._runner.kill_processes()
+        os._exit(code)
 
 
 def _cancelling(run_id: int, signum: int) -> str:
@@ -998,7 +1037,13 @@ def _maintaining(holder: LockHolder, settings: Settings) -> str:
 async def _run_here(
     args: argparse.Namespace, ctx: CliContext, settings: Settings, inputs: Mapping[str, str]
 ) -> int:
-    """Run the workflow in this process, which holds the lock as `run`, and follow the run."""
+    """Run the workflow in this process, which holds the lock as `run`, and follow the run.
+
+    After a stop signal, the command exits 128 plus the first signal's number: 130 after
+    Ctrl+C. The stop-signal handlers stay until `_finish_here` is done, so a third signal
+    ends the process at once even while the runner closes, and any signal does once only a
+    file operation that a forced cancel left running keeps the process from exiting.
+    """
     # Imported here: the runner pulls in the engine and the HTTP client, which the read-only
     # commands don't need.
     from treadle.runner import LocalRunner
@@ -1010,27 +1055,37 @@ async def _run_here(
             # The handlers come before the run, so no stop signal can end the process with
             # the run still going.
             with _on_stop_signals(stops):
-                if args.rerun is not None:
-                    run_id = await resolve_run_ref(args.rerun, runner.store)
-                    submission = await runner.start_rerun(run_id)
-                else:
-                    submission = await runner.start(args.workflow, inputs)
-                run = _created(submission)
-                return await _follow_here(runner, run.id, args, ctx.out, stops)
+                try:
+                    run_id = await _start_here(runner, args, inputs)
+                    code = await _follow_here(runner, run_id, args, ctx.out, stops)
+                finally:
+                    await _finish_here(runner, stops)
+                return stops.exit_code() if stops.received else code
+
+
+async def _start_here(
+    runner: LocalRunner, args: argparse.Namespace, inputs: Mapping[str, str]
+) -> int:
+    """Start the run, or the re-run, that the arguments ask for, and return its ID."""
+    if args.rerun is not None:
+        original = await resolve_run_ref(args.rerun, runner.store)
+        submission = await runner.start_rerun(original)
+    else:
+        submission = await runner.start(args.workflow, inputs)
+    return _created(submission).id
 
 
 async def _follow_here(
     runner: LocalRunner, run_id: int, args: argparse.Namespace, out: Output, stops: _RunStops
 ) -> int:
-    """Follow a run in this process until it ends, while `stops` handles stop signals.
+    """Follow a run in this process until it ends, and return the run's exit code.
 
-    After a stop signal the command still waits for the run to end, so cleanup steps run,
-    and then exits 128 plus the signal's number: 130 after Ctrl+C. When the reader of the
-    output goes away, as with `treadle run X | head -1`, the run goes on without output, as
-    a daemon's run would, and the command exits 1 once it ends.
+    `stops` cancels the run on a stop signal, and this still waits for the run to end, so
+    cleanup steps run. When the reader of the output goes away, as with
+    `treadle run X | head -1`, the run goes on without output, as a daemon's run would, and
+    the code is 1 once it ends.
     """
     stops.follow(run_id)
-    status: RunStatus | None = None
     try:
         run = await follow_run(
             runner.store,
@@ -1040,16 +1095,30 @@ async def _follow_here(
             json_lines=args.json,
             poll=_FOLLOW_POLL,
         )
-        status = run.status
     except OSError as exc:
         if not _closed_output(exc):
             raise
         _discard(sys.stdout)
         await runner.wait(run_id)
+        return ExitCode.FAILURE
+    return exit_code_for(run.status)
+
+
+async def _finish_here(runner: LocalRunner, stops: _RunStops) -> None:
+    """Close the runner, then wait for the file operations that cancelled steps left running.
+
+    A `file` step runs its operation in a worker thread that no cancel can interrupt, and
+    after a forced cancel the step ends without waiting for it. The process still doesn't
+    exit before such a thread ends. `asyncio.run` would wait for it only after the
+    command's coroutine returns, once no stop-signal handler is left, so the command waits
+    here, where any stop signal ends the process at once. This shuts down the event loop's
+    default executor, so it must be the last thing that the command does on its loop.
+    """
+    stops.stop_following()
     await stops.settled()
-    if stops.received:
-        return stops.exit_code()
-    return ExitCode.FAILURE if status is None else exit_code_for(status)
+    await runner.aclose()
+    stops.runner_closed()
+    await asyncio.get_running_loop().shutdown_default_executor()
 
 
 async def _run_in_daemon(

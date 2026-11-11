@@ -141,6 +141,48 @@ async def test_a_forced_cancel_leaves_no_process_behind_once_the_runner_closes(
     assert surviving_process_groups(settings.db_path) == []
 
 
+async def test_kill_processes_sends_sigkill_to_the_groups_that_steps_track(
+    daemon_project: ProjectFactory,
+) -> None:
+    daemon_project.write_workflow("stubborn", STUBBORN)
+    daemon_project.write_config('timezone = "UTC"\n[runs]\nkill_grace = "30s"\n')
+    settings = daemon_project.settings()
+
+    async with LocalRunner(settings) as runner:
+        submission = await runner.start("stubborn", {})
+        assert submission.run is not None
+        run_id = submission.run.id
+        await eventually((daemon_project.root / "stubborn.pid").exists, within=20)
+        killed = runner.kill_processes()
+        status = await asyncio.wait_for(runner.wait(run_id), 20)
+        detail = await runner.store.get_run(run_id)
+    after_closing = runner.kill_processes()
+
+    # The step ignores SIGTERM, but no cancel was needed: SIGKILL ended its shell at once.
+    assert killed == 1
+    assert status is RunStatus.FAILED
+    assert detail is not None
+    assert detail.steps[0].error == "exit code 137"
+    assert after_closing == 0
+    assert surviving_process_groups(settings.db_path) == []
+
+
+async def test_closing_inside_the_block_frees_the_lock_and_the_block_end_does_nothing(
+    daemon_project: ProjectFactory,
+) -> None:
+    settings = daemon_project.settings()
+
+    async with LocalRunner(settings) as runner:
+        await runner.aclose()
+        holder = InstanceLock.probe(settings.state_dir)
+        await runner.aclose()
+
+    assert holder is None
+    assert not settings.holder_path.exists()
+    with pytest.raises(RuntimeError, match="isn't open"):
+        _ = runner.store
+
+
 async def test_a_tracked_group_that_no_step_forgets_delays_closing_only_briefly(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

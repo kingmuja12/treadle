@@ -11,6 +11,7 @@ import re
 import signal
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import NoReturn, cast
 
 import pytest
 from tests.support.project import ProjectFactory
@@ -27,9 +28,13 @@ from tests.unit.cli.helpers import (
 )
 from tests.unit.store.helpers import T0, Runs
 
+from treadle import runner as runner_module
 from treadle.cli import commands
 from treadle.cli.main import main
-from treadle.models import RunReason, RunStatus
+from treadle.cli.output import Output
+from treadle.models import CancelOutcome, CancelReason, RunReason, RunStatus
+from treadle.runner import LocalRunner
+from treadle.steps.procs import ProcessRegistry
 from treadle.types import ExitCode
 
 _DURATION = r"\d+(\.\d+)?m?s"
@@ -382,6 +387,244 @@ def test_a_hung_up_terminal_doesnt_stop_the_cancellation(
     run = read_store(project.settings(), lambda repo: repo.get_run(1))
     assert run is not None
     assert (run.status, run.reason) == (RunStatus.CANCELLED, RunReason.SHUTDOWN)
+
+
+def test_stop_signals_are_handled_until_the_runner_has_closed(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("greet", GREET)
+    holder = project.settings().holder_path
+    held_when_removed: list[bool] = []
+
+    @contextlib.contextmanager
+    def installed(callback: Callable[[int], None]) -> Iterator[None]:
+        yield
+        held_when_removed.append(holder.exists())
+
+    monkeypatch.setattr(commands, "_on_stop_signals", installed)
+
+    result = cli("run", "greet")
+
+    assert result.code == ExitCode.OK
+    # The handlers go only once the runner has closed and released the lock, so a third
+    # signal still ends the process while it closes, and while it waits for a file
+    # operation that a forced cancel left running.
+    assert held_when_removed == [False]
+
+
+def test_a_stop_signal_while_the_runner_closes_only_sets_the_exit_code(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("greet", GREET)
+    handlers: list[Callable[[int], None]] = []
+    kill_leftovers = runner_module._kill_leftovers
+
+    @contextlib.contextmanager
+    def installed(callback: Callable[[int], None]) -> Iterator[None]:
+        handlers.append(callback)
+        yield
+
+    async def signalled_while_closing(processes: ProcessRegistry) -> None:
+        handlers[0](signal.SIGTERM)
+        await kill_leftovers(processes)
+
+    monkeypatch.setattr(commands, "_on_stop_signals", installed)
+    monkeypatch.setattr(runner_module, "_kill_leftovers", signalled_while_closing)
+
+    result = cli("run", "greet")
+
+    assert result.code == 128 + signal.SIGTERM
+    assert result.err == ""  # the run had ended, so there was nothing to cancel
+    assert re.fullmatch(rf"Run #1 succeeded in {_DURATION}\.", result.out.splitlines()[-1])
+
+
+class _Exited(Exception):
+    """What the stand-in for `os._exit` raises, so that a test sees the exit and its code."""
+
+
+def _exit_by_raising(code: int) -> NoReturn:
+    raise _Exited(code)
+
+
+class _RecordingRunner:
+    """The part of `LocalRunner` that `_RunStops` uses, recording each call in order."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    async def cancel(
+        self, run_id: int, *, force: bool = False, reason: CancelReason = CancelReason.USER
+    ) -> CancelOutcome:
+        self.calls.append(("cancel", run_id, force, reason))
+        return CancelOutcome(run_id, RunStatus.RUNNING, accepted=True, forced=force)
+
+    def kill_processes(self) -> int:
+        self.calls.append(("kill",))
+        return 1
+
+
+@pytest.fixture
+def recording_runner(monkeypatch: pytest.MonkeyPatch) -> _RecordingRunner:
+    """A runner that records its calls; meanwhile `os._exit` raises _Exited instead of exiting."""
+    monkeypatch.setattr(os, "_exit", _exit_by_raising)
+    return _RecordingRunner()
+
+
+def _stops(runner: _RecordingRunner, err: io.StringIO) -> commands._RunStops:
+    """The stop-signal handler of a local run, with its messages going to `err`."""
+    return commands._RunStops(cast(LocalRunner, runner), Output(io.StringIO(), err, color=False))
+
+
+async def test_a_third_ctrl_c_kills_the_step_processes_and_exits_130_at_once(
+    recording_runner: _RecordingRunner,
+) -> None:
+    err = io.StringIO()
+    stops = _stops(recording_runner, err)
+    stops.follow(4)
+
+    stops(signal.SIGINT)
+    stops(signal.SIGINT)
+    await stops.settled()
+    with pytest.raises(_Exited) as exited:
+        stops(signal.SIGINT)
+
+    assert exited.value.args == (ExitCode.INTERRUPTED,)
+    assert recording_runner.calls == [
+        ("cancel", 4, False, CancelReason.USER),
+        ("cancel", 4, True, CancelReason.USER),
+        ("kill",),
+    ]
+    assert err.getvalue() == "Cancelling run #4 (press Ctrl+C again to force)\n"
+
+
+@pytest.mark.parametrize(
+    "numbers",
+    [
+        (signal.SIGTERM, signal.SIGTERM, signal.SIGTERM),
+        (signal.SIGHUP, signal.SIGINT, signal.SIGTERM),
+    ],
+)
+async def test_the_third_stop_signal_of_any_kind_exits_130(
+    recording_runner: _RecordingRunner, numbers: tuple[signal.Signals, ...]
+) -> None:
+    stops = _stops(recording_runner, io.StringIO())
+    stops.follow(4)
+    first, second, third = numbers
+
+    stops(first)
+    stops(second)
+    await stops.settled()
+    with pytest.raises(_Exited) as exited:
+        stops(third)
+
+    assert exited.value.args == (ExitCode.INTERRUPTED,)
+    assert recording_runner.calls == [
+        ("cancel", 4, False, CancelReason.SHUTDOWN),
+        ("cancel", 4, True, CancelReason.SHUTDOWN),
+        ("kill",),
+    ]
+
+
+async def test_three_stop_signals_before_the_run_exists_exit_without_cancelling(
+    recording_runner: _RecordingRunner,
+) -> None:
+    err = io.StringIO()
+    stops = _stops(recording_runner, err)
+
+    stops(signal.SIGINT)
+    stops(signal.SIGINT)
+    with pytest.raises(_Exited) as exited:
+        stops(signal.SIGINT)
+
+    assert exited.value.args == (ExitCode.INTERRUPTED,)
+    assert recording_runner.calls == [("kill",)]
+    assert err.getvalue() == ""
+
+
+async def test_after_following_ends_stop_signals_only_count_toward_the_third(
+    recording_runner: _RecordingRunner,
+) -> None:
+    err = io.StringIO()
+    stops = _stops(recording_runner, err)
+    stops.follow(4)
+    stops.stop_following()
+
+    stops(signal.SIGTERM)
+    stops(signal.SIGINT)
+    await stops.settled()
+    counted = (list(recording_runner.calls), stops.exit_code())
+    with pytest.raises(_Exited) as exited:
+        stops(signal.SIGINT)
+
+    assert counted == ([], 128 + signal.SIGTERM)
+    assert exited.value.args == (ExitCode.INTERRUPTED,)
+    assert recording_runner.calls == [("kill",)]
+    assert err.getvalue() == ""
+
+
+@pytest.mark.parametrize(
+    "signum",
+    [signal.SIGTERM, signal.SIGHUP, signal.SIGINT],
+    ids=["SIGTERM", "SIGHUP", "SIGINT"],
+)
+async def test_once_the_runner_has_closed_one_stop_signal_exits_at_once(
+    recording_runner: _RecordingRunner, signum: signal.Signals
+) -> None:
+    err = io.StringIO()
+    stops = _stops(recording_runner, err)
+    stops.follow(4)
+    stops.stop_following()
+    stops.runner_closed()
+
+    with pytest.raises(_Exited) as exited:
+        stops(signum)
+
+    # Only the wait for a worker thread, such as a stuck file operation's, was left.
+    assert exited.value.args == (128 + signum,)
+    assert recording_runner.calls == [("kill",)]
+    assert err.getvalue() == ""
+
+
+async def test_a_stop_signal_after_the_runner_has_closed_exits_with_the_first_signals_code(
+    recording_runner: _RecordingRunner,
+) -> None:
+    stops = _stops(recording_runner, io.StringIO())
+    stops.follow(4)
+    stops(signal.SIGINT)
+    await stops.settled()
+    stops.stop_following()
+    stops.runner_closed()
+
+    with pytest.raises(_Exited) as exited:
+        stops(signal.SIGTERM)
+
+    assert exited.value.args == (128 + signal.SIGINT,)
+    assert recording_runner.calls == [("cancel", 4, False, CancelReason.USER), ("kill",)]
+
+
+def test_a_stop_signal_after_the_runner_has_closed_ends_the_command_at_once(
+    cli: Cli, project: ProjectFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project.write_workflow("greet", GREET)
+    exits: list[object] = []
+
+    @contextlib.contextmanager
+    def installed(callback: Callable[[int], None]) -> Iterator[None]:
+        yield
+        # The latest moment that the handler sees a signal: the runner has closed, and the
+        # command waited for its worker threads, as it waits for a stuck file operation.
+        try:
+            callback(signal.SIGTERM)
+        except _Exited as exited:
+            exits.append(exited.args[0])
+
+    monkeypatch.setattr(commands, "_on_stop_signals", installed)
+    monkeypatch.setattr(os, "_exit", _exit_by_raising)
+
+    result = cli("run", "greet")
+
+    assert result.code == ExitCode.OK
+    assert exits == [128 + signal.SIGTERM]
 
 
 class _ReaderLeaves(io.StringIO):

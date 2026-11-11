@@ -382,8 +382,9 @@ Each skipped step records one reason:
   `file` attempt ends `timed_out` without a retry. When Treadle forces the cancellation, the
   attempt stops waiting, and the operation may still finish after the step ends. If the
   operation ends before the run does, the step's log still says whether it finished or
-  failed. The Treadle process that runs the step waits for the operation before it exits,
-  unless a third signal stops `treadle serve`.
+  failed. The Treadle process that runs the step waits for the operation before it exits.
+  While `treadle run` waits for it, a stop signal ends the command at once, as
+  [Stop signals](cli.md#stop-signals) describes.
 - A process that a step starts in the background, such as `server >/dev/null 2>&1 &`, keeps
   running for the later steps of the run, and the step's log says so. When the run ends,
   whether it succeeded, failed, or was cancelled, Treadle stops such processes: `SIGTERM`,

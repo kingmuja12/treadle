@@ -293,7 +293,7 @@ With `--json`, each line is one event:
 | `{"event": "run_created", "run": Run}` | First. |
 | `{"event": "step", "step": Step}` | When a step's status or attempt count changes. |
 | `{"event": "log", "line": Log}` | For each log line, with `-v`. |
-| `{"event": "run_finished", "run": Run, "exit_code": 1}` | Last. |
+| `{"event": "run_finished", "run": Run, "exit_code": 1}` | Last. A third stop signal that ends the command before the run ends leaves it out. |
 
 ### Where the run happens
 
@@ -333,7 +333,8 @@ event.
 
 Ctrl+C sends `SIGINT`. `treadle run` handles `SIGTERM`, and the `SIGHUP` that a closing
 terminal sends, the same way. After a stop signal, the command exits 128 plus the first
-signal's number: 130 for Ctrl+C, 143 for `SIGTERM`, and 129 for `SIGHUP`.
+signal's number: 130 for Ctrl+C, 143 for `SIGTERM`, and 129 for `SIGHUP`. After a third
+stop signal during a run in this terminal, the command always exits 130.
 
 - **During a run in this terminal**, the first stop signal cancels the run and prints
   `Cancelling run #19 (press Ctrl+C again to force)`, or, for another signal, a line that
@@ -346,6 +347,13 @@ signal's number: 130 for Ctrl+C, 143 for `SIGTERM`, and 129 for `SIGHUP`.
   is still stopping after the first signal and a cleanup step that is running. When the
   command exits, it kills every step process that is still left, so none outlives the
   command.
+- **A third stop signal of any kind ends the command at once**, with exit code 130. The
+  command kills every step process that is still left, and doesn't wait for the run or its
+  cleanup steps. A run that hadn't ended stays `running` until the next `treadle run`,
+  `treadle cancel`, or `treadle serve` marks it interrupted.
+- **After the run has ended**, a stop signal cancels nothing. While the command waits for a
+  `file` operation that a forced cancel left running, such as an `append` to a FIFO that
+  nothing reads, a stop signal ends the command at once.
 - **While following a daemon's run**, a stop signal stops following, and the run keeps
   going:
 
@@ -362,7 +370,7 @@ signal's number: 130 for Ctrl+C, 143 for `SIGTERM`, and 129 for `SIGHUP`.
   `took the request but didn't answer` error.
 
 After the terminal hangs up, the command writes nothing more, and still exits with the
-signal's code.
+signal's code, or with 130 after a third stop signal.
 
 ### Exit codes of `treadle run`
 
@@ -378,7 +386,7 @@ signal's code.
 | 7 | The concurrency policy skipped the run. |
 | 8 | Busy: another `treadle run` holds the state directory, the daemon didn't answer or is shutting down, or the daemon stopped while the command followed its run. |
 | 129 | Stopped by `SIGHUP`, as when the terminal closes. |
-| 130 | Stopped with Ctrl+C. |
+| 130 | Stopped with Ctrl+C, or by a third stop signal of any kind. |
 | 143 | Stopped by `SIGTERM`. |
 
 Before a run in this terminal starts, Treadle recovers what a crashed Treadle process left
@@ -713,7 +721,7 @@ treadle 0.1.0 (Python 3.12.13, darwin, SQLite 3.50.4, schema 1)
 | 7 | The concurrency policy skipped the run. |
 | 8 | Busy: the state directory is in use, the port is in use, the daemon didn't respond, or the process that ran a followed run stopped. |
 | 129 | `treadle run` or `treadle cancel` stopped by `SIGHUP`, as when the terminal closes. |
-| 130 | Interrupted with Ctrl+C, or `treadle serve` stopped by a third signal. |
+| 130 | Interrupted with Ctrl+C, or `treadle run` or `treadle serve` stopped by a third signal. |
 | 143 | `treadle run` or `treadle cancel` stopped by `SIGTERM`. |
 
 ## Configuration file

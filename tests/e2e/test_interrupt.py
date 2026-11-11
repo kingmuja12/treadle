@@ -1,17 +1,20 @@
 """Stop signals, forced cancels, closed pipes, and lost daemons while `treadle run` follows a run.
 
-Every test checks that no step process group outlives the command, before the fixture's
-teardown kills whatever is left.
+A third stop signal ends the command at once, even while a file operation holds it up. Every
+test checks that no step process group outlives the command, before the fixture's teardown
+kills whatever is left.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import select
 import signal
+import sqlite3
 import subprocess
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 
 import pytest
@@ -19,12 +22,16 @@ from tests.e2e.conftest import Treadle, start_treadle
 from tests.integration.daemon.conftest import STUBBORN
 from tests.integration.daemon.helpers import (
     Daemon,
+    child_environ,
     eventually,
     kill_group,
     kill_unfinished_steps,
+    recorded_process_groups,
     surviving_process_groups,
 )
 from tests.support.project import ProjectFactory
+
+from treadle.lock import InstanceLock
 
 # The step waits until it's cancelled; the cleanup step runs because of always().
 SLOW = """\
@@ -47,6 +54,38 @@ steps:
     run: sleep 1
   - id: three
     run: echo three
+"""
+
+# The step appends to a FIFO that nothing reads, so its worker thread waits in open() for a
+# reader, and no cancel can interrupt it.
+STUCK = """\
+steps:
+  - id: append
+    uses: file
+    with:
+      action: append
+      path: pipe
+      content: hello
+"""
+
+# The step leaves a process in the background that survives SIGTERM and notes each one, so
+# the end of the run waits out `[runs] kill_grace` for it while the run tracks its group.
+# The step ends only once the process has set its trap, which SIGTERM could otherwise beat.
+LINGER = """\
+steps:
+  - id: start
+    run: |
+      cd "$TREADLE_PROJECT_DIR"
+      sh -c 'trap "touch got-term" TERM; touch ready; while :; do sleep 1; done' >/dev/null 2>&1 &
+      while [ ! -e ready ]; do sleep 0.1; done
+"""
+
+QUICK = """\
+steps:
+  - id: note
+    uses: log
+    with:
+      message: quick
 """
 
 
@@ -88,6 +127,57 @@ def _run_json(project: ProjectFactory, treadle: Treadle, run_id: int) -> dict[st
 
 def _survivors(project: ProjectFactory) -> list[int]:
     return surviving_process_groups(project.settings().db_path)
+
+
+def _start_logged(
+    script: Path, args: Sequence[str], *, cwd: Path, out: Path, err: Path
+) -> subprocess.Popen[str]:
+    """Start `treadle ARGS...` in its own process group, with its output in `out` and `err`.
+
+    A test polls the files for the line that each stage prints, however the writes split.
+    """
+    with out.open("wb") as stdout, err.open("wb") as stderr:
+        return subprocess.Popen(
+            [str(script), *args],
+            cwd=cwd,
+            env=child_environ({"TZ": "UTC"}),
+            stdout=stdout,
+            stderr=stderr,
+            text=True,
+            start_new_session=True,
+        )
+
+
+def _printed(path: Path, text: str) -> None:
+    """Wait until the output in `path` holds `text`."""
+    eventually(lambda: text in path.read_text(encoding="utf-8"))
+
+
+def _attempt_status(db_path: Path, step_id: str) -> str | None:
+    """Return the status of run 1's last attempt of `step_id`, or None before it's stored."""
+    if not db_path.exists():
+        return None
+    conn = sqlite3.connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT status FROM step_attempts WHERE run_id = 1 AND step_id = ? "
+            "ORDER BY attempt DESC LIMIT 1",
+            (step_id,),
+        ).fetchone()
+    except sqlite3.Error:  # the schema isn't there yet
+        return None
+    finally:
+        conn.close()
+    return None if row is None else str(row[0])
+
+
+def _drained(fifo: Path) -> bytes:
+    """Read what a FIFO holds without waiting for a writer: b"" when none has it open."""
+    fd = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        return os.read(fd, 1024)
+    finally:
+        os.close(fd)
 
 
 def test_ctrl_c_cancels_a_local_run_and_waits_for_its_cleanup(
@@ -166,6 +256,120 @@ def test_a_second_stop_signal_forces_the_run_and_kills_its_processes(
     # The step ignores SIGTERM, yet nothing of it outlives the command.
     assert _survivors(project) == []
     assert _run_json(project, treadle, 1)["status"] == "cancelled"
+
+
+def test_a_third_ctrl_c_ends_a_run_whose_file_operation_is_stuck(
+    project: ProjectFactory,
+    treadle_script: Path,
+    treadle: Treadle,
+    interrupted: list[subprocess.Popen[str]],
+    tmp_path: Path,
+) -> None:
+    project.write_workflow("stuck", STUCK)
+    fifo = project.root / "pipe"
+    os.mkfifo(fifo)
+    out, err = tmp_path / "out.txt", tmp_path / "err.txt"
+    cli = _start_logged(treadle_script, ["run", "stuck"], cwd=project.root, out=out, err=err)
+    interrupted.append(cli)
+    eventually(lambda: _attempt_status(project.settings().db_path, "append") == "running")
+
+    cli.send_signal(signal.SIGINT)
+    _printed(err, "Cancelling run #1 (press Ctrl+C again to force)\n")
+    cli.send_signal(signal.SIGINT)
+    # The forced run ended, but the operation's thread still waits for a reader of the FIFO.
+    _printed(out, "Run #1 cancelled (user) in ")
+    cli.send_signal(signal.SIGINT)
+    code = cli.wait(timeout=20)
+
+    assert code == 130
+    assert err.read_text(encoding="utf-8") == "Cancelling run #1 (press Ctrl+C again to force)\n"
+    run = _run_json(project, treadle, 1)
+    assert (run["status"], run["reason"]) == ("cancelled", "user")
+    assert [step["status"] for step in run["steps"]] == ["cancelled"]
+    # Nothing outlives the command: no step process, and no thread that waits to write.
+    assert _survivors(project) == []
+    assert _drained(fifo) == b""
+    assert InstanceLock.probe(project.settings().state_dir) is None
+
+
+def test_one_sigterm_ends_a_command_that_only_waits_for_a_stuck_file_operation(
+    project: ProjectFactory,
+    treadle_script: Path,
+    treadle: Treadle,
+    interrupted: list[subprocess.Popen[str]],
+    tmp_path: Path,
+) -> None:
+    project.write_workflow("stuck", STUCK)
+    fifo = project.root / "pipe"
+    os.mkfifo(fifo)
+    state_dir = project.settings().state_dir
+    out, err = tmp_path / "out.txt", tmp_path / "err.txt"
+    cli = _start_logged(treadle_script, ["run", "stuck"], cwd=project.root, out=out, err=err)
+    interrupted.append(cli)
+    eventually(lambda: _attempt_status(project.settings().db_path, "append") == "running")
+
+    # Another terminal cancels the run and then forces it, so the run ends while the
+    # operation's thread still waits for a reader of the FIFO.
+    first = treadle("cancel", "1", cwd=project.root)
+    forced = treadle("cancel", "1", "--force", cwd=project.root)
+    _printed(out, "Run #1 cancelled (user) in ")
+    # The command released the lock as its runner closed, so only the thread holds it up.
+    eventually(lambda: InstanceLock.probe(state_dir) is None)
+    cli.send_signal(signal.SIGTERM)  # as `kill`, `systemctl stop`, or `docker stop` sends it
+    code = cli.wait(timeout=20)
+
+    assert (first.returncode, forced.returncode) == (0, 0)
+    assert code == 128 + signal.SIGTERM
+    assert err.read_text(encoding="utf-8") == ""  # there was no run left to cancel
+    run = _run_json(project, treadle, 1)
+    assert (run["status"], run["reason"]) == ("cancelled", "user")
+    assert _survivors(project) == []
+    assert _drained(fifo) == b""  # no thread is left to write to it
+
+
+def test_a_third_stop_signal_kills_what_the_run_tracks_and_leaves_the_run_to_recovery(
+    project: ProjectFactory,
+    treadle_script: Path,
+    treadle: Treadle,
+    interrupted: list[subprocess.Popen[str]],
+    tmp_path: Path,
+) -> None:
+    project.write_config('timezone = "UTC"\n[runs]\nkill_grace = "60s"\n')
+    project.write_workflow("linger", LINGER)
+    project.write_workflow("quick", QUICK)
+    settings = project.settings()
+    out, err = tmp_path / "out.txt", tmp_path / "err.txt"
+    cli = _start_logged(treadle_script, ["run", "linger"], cwd=project.root, out=out, err=err)
+    interrupted.append(cli)
+    try:
+        # The step ended, and the end of the run sent SIGTERM to the process that it left.
+        eventually((project.root / "got-term").exists)
+        cli.send_signal(signal.SIGINT)
+        _printed(err, "Cancelling run #1 (press Ctrl+C again to force)\n")
+        # An ending run takes no cancel, so no output shows the next signal. Signals of two
+        # kinds can't merge into one delivery, as two SIGINTs sent together can.
+        cli.send_signal(signal.SIGTERM)
+        cli.send_signal(signal.SIGHUP)
+        code = cli.wait(timeout=20)
+        left = _survivors(project)
+    finally:
+        for pgid in recorded_process_groups(settings.db_path):
+            kill_group(pgid)
+    left_behind = _run_json(project, treadle, 1)
+    after = treadle("run", "quick", cwd=project.root)
+    recovered = _run_json(project, treadle, 1)
+
+    assert code == 130  # at once, long before the 60 seconds of kill grace end
+    assert err.read_text(encoding="utf-8") == "Cancelling run #1 (press Ctrl+C again to force)\n"
+    assert left == []
+    assert left_behind["status"] == "running"  # until the next lock holder recovers it
+    assert (after.returncode, after.stderr) == (
+        0,
+        "warning: run=1 was interrupted: the Treadle process stopped while it ran\n",
+    )
+    assert (recovered["status"], recovered["reason"]) == ("interrupted", "executor_stopped")
+    assert [step["status"] for step in recovered["steps"]] == ["succeeded"]
+    assert list(settings.tmp_dir.iterdir()) == []
 
 
 def test_cancel_then_cancel_force_from_another_terminal_stops_the_run_at_once(

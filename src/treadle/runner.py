@@ -94,6 +94,8 @@ class LocalRunner:
         self._stack: contextlib.AsyncExitStack | None = None
         self._store: AsyncStore | None = None
         self._manager: RunManager | None = None
+        # The process groups that the steps of every run track.
+        self._processes = ProcessRegistry()
         # The masker for log records, such as the CLI's; it follows the loaded secrets.
         self._log_masker = _MaskerCache(self._snapshot, self._hidden_env)
 
@@ -115,16 +117,30 @@ class LocalRunner:
         return self
 
     async def __aexit__(self, *exc: object) -> None:
+        """Close the runner, as `aclose` does."""
+        await self.aclose()
+
+    async def aclose(self) -> None:
         """Stop the runs, run a bounded retention pass, close the store, and release the lock.
 
         A run that is still active gets the `shutdown` cancel reason and `[runs]
         shutdown_grace` to finish. Process groups that a forced cancel left behind are
-        killed, so none outlives this process.
+        killed, so none outlives this process. Closing a runner that isn't open does
+        nothing, so the end of an `async with` block after `aclose` does nothing either.
         """
         stack, self._stack = self._stack, None
         self._store = self._manager = None
         if stack is not None:
             await stack.aclose()
+
+    def kill_processes(self) -> int:
+        """Send SIGKILL to every process group that the steps of the runs still track.
+
+        Returns how many groups got the signal. It's for a process that exits without
+        closing the runner, as `treadle run` does after a third stop signal, so that no
+        process that a step started outlives it. It waits for nothing and stores nothing.
+        """
+        return self._processes.kill_all()
 
     @property
     def store(self) -> AsyncStore:
@@ -204,7 +220,6 @@ class LocalRunner:
         self._registry = registry
         http = shared_client()
         stack.push_async_callback(http.aclose)
-        processes = ProcessRegistry()
         manager = _run_manager(
             settings,
             store,
@@ -215,12 +230,12 @@ class LocalRunner:
             clock=clock,
             rng=self._rng,
             http=http,
-            processes=processes,
+            processes=self._processes,
         )
         stack.push_async_callback(self._prune, store, registry)
         actor = asyncio.create_task(manager.run(), name="treadle-runs")
         stack.push_async_callback(
-            _stop_manager, manager, actor, settings.runs.shutdown_grace, processes
+            _stop_manager, manager, actor, settings.runs.shutdown_grace, self._processes
         )
         poller = ControlPoller(store=store, control=manager, clock=clock, accept_runs=False)
         control = asyncio.create_task(poller.run(), name="treadle-control")
